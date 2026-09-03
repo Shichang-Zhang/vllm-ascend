@@ -368,6 +368,72 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
         self.assertIs(result[3], host_v)
         allocate_host.assert_called_once_with([128, 64], 32)
 
+    def test_manager_prepares_mooncake_host_pool(self):
+        vllm_config, kv_cache_config, offload_config = self._make_manager_init_inputs()
+        offload_config.host_backend = "mooncake"
+        planned_pool_size = 4096
+        allocator = MagicMock()
+        tp_group = SimpleNamespace(barrier=MagicMock())
+
+        with (
+            patch.object(manager_module, "get_tensor_model_parallel_rank", return_value=1),
+            patch.object(manager_module, "get_tensor_model_parallel_world_size", return_value=2),
+            patch.object(manager_module, "get_tp_group", return_value=tp_group),
+            patch.object(
+                manager_module,
+                "get_sparse_kv_offload_cpu_pool_size_bytes",
+                return_value=planned_pool_size,
+            ),
+            patch.object(
+                manager_module.MooncakeHostPool,
+                "allocate",
+                return_value=allocator,
+            ) as allocate_pool,
+            patch.object(manager_module.torch, "zeros", return_value=MagicMock()),
+            patch.object(manager_module.torch, "empty", return_value=MagicMock()),
+            patch.object(manager_module, "_sparse_kv_ops", return_value=MagicMock()),
+        ):
+            manager = SparseKVOffloadManager(vllm_config, kv_cache_config, offload_config)
+            manager.prepare_host_kv_allocation(device_id=7, dp_rank=3)
+
+        self.assertIs(manager._host_kv_allocator, allocator)
+        self.assertTrue(manager._host_allocation_prepared)
+        allocate_pool.assert_called_once()
+        call = allocate_pool.call_args
+        self.assertEqual(call.kwargs["size_bytes"], planned_pool_size)
+        self.assertEqual(call.kwargs["alignment"], manager_module._CPU_CACHE_ALIGNMENT)
+        topology = call.kwargs["topology"]
+        self.assertEqual(topology.tp_rank, 1)
+        self.assertEqual(topology.tp_size, 2)
+        self.assertEqual(topology.owner_rank, 0)
+        self.assertEqual(topology.device_id, 7)
+        self.assertEqual(topology.dp_rank, 3)
+        self.assertIs(topology.tp_group, tp_group)
+        tp_group.barrier.assert_not_called()
+
+    def test_failed_mooncake_prepare_remains_retryable(self):
+        manager = object.__new__(SparseKVOffloadManager)
+        manager.host_backend = "mooncake"
+        manager._host_allocation_prepared = False
+        manager._host_kv_allocator = None
+        manager.host_pool_size_bytes = 4096
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.tp_group = MagicMock()
+
+        with (
+            patch.object(
+                manager_module.MooncakeHostPool,
+                "allocate",
+                side_effect=RuntimeError("allocation failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "allocation failed"),
+        ):
+            manager.prepare_host_kv_allocation(device_id=0, dp_rank=0)
+
+        self.assertFalse(manager._host_allocation_prepared)
+        self.assertIsNone(manager._host_kv_allocator)
+
     def test_manager_close_releases_host_allocator_once(self):
         manager = object.__new__(SparseKVOffloadManager)
         allocator = MagicMock()

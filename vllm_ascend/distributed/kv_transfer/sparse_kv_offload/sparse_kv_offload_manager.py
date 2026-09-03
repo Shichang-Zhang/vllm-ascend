@@ -33,6 +33,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import (
     HostMemoryRegion,
+    HostPoolTopology,
     MooncakeHostPool,
     allocate_mooncake_host_region,
 )
@@ -518,6 +519,11 @@ class SparseKVOffloadManager:
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
         self.use_fused_overlap = sparse_kv_offload_config.use_fused_overlap
+        self.host_backend = getattr(
+            sparse_kv_offload_config,
+            "host_backend",
+            "memfabric",
+        )
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -592,9 +598,39 @@ class SparseKVOffloadManager:
         if self._host_allocation_prepared:
             return
 
-        # dp_rank is part of the backend-neutral contract. The existing
-        # MemFabric allocator does not need it.
-        del dp_rank
+        if self.host_backend == "mooncake":
+            topology = HostPoolTopology(
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                owner_rank=0,
+                device_id=device_id,
+                dp_rank=dp_rank,
+                tp_group=self.tp_group,
+            )
+            allocator = MooncakeHostPool.allocate(
+                size_bytes=self.host_pool_size_bytes,
+                alignment=_CPU_CACHE_ALIGNMENT,
+                topology=topology,
+            )
+            self._host_kv_allocator = allocator
+            self._host_allocation_prepared = True
+            logger.info(
+                "Sparse KV offload selected Mooncake Host backend: "
+                "pool=%.2f GiB, tp=%s/%s, dp=%s, owner=%s.",
+                self.host_pool_size_bytes / (1 << 30),
+                self.tp_rank,
+                self.tp_size,
+                dp_rank,
+                topology.owner_rank,
+            )
+            return
+
+        if self.host_backend != "memfabric":
+            raise ValueError(
+                "Unsupported sparse KV offload Host backend: "
+                f"{self.host_backend!r}"
+            )
+
         config = offload.OffloadConfig()
         config.device_id = device_id
         config.reserve_size = self.host_pool_size_bytes
