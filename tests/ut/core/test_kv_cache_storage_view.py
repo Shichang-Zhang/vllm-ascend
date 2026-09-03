@@ -5,11 +5,15 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
+    KVCacheAddressingLayout,
+    get_kv_cache_group_layout,
     get_storage_cp_world_size,
     kv_cache_spec_uses_unified_host_view,
 )
 from vllm_ascend.utils import (
     enable_sfa_dcp_replicated_indexer,
+    fused_sfa_host_offload_decode_enabled,
+    is_pd_decode_kv_consumer,
     kv_offload_decode_enabled,
 )
 
@@ -109,22 +113,71 @@ def test_kv_offload_decode_enabled_reads_additional_config():
     assert kv_offload_decode_enabled(off) is False
 
 
-def test_replicated_indexer_disabled_when_decode_offload_enabled(monkeypatch):
-    monkeypatch.setattr("vllm_ascend.utils.model_uses_sfa_sparse", lambda cfg: True)
-    common = dict(
+def _sfa_dcp_cfg(*, offload: bool, consumer: bool, kv_role: str | None = None):
+    flags = dict(
+        is_kv_consumer=consumer,
+        is_kv_producer=not consumer,
+    )
+    if kv_role is not None:
+        flags["kv_role"] = kv_role
+    return SimpleNamespace(
+        additional_config={"kv_offload_decode_config": {"enabled": offload}},
+        kv_transfer_config=SimpleNamespace(**flags),
         model_config=object(),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=8,
             prefill_context_parallel_size=1,
         ),
     )
-    offload = SimpleNamespace(
+
+
+def test_replicated_indexer_off_only_for_decode_consumer_offload_sfa(monkeypatch):
+    monkeypatch.setattr("vllm_ascend.utils.model_uses_sfa_sparse", lambda cfg: True)
+    decode = _sfa_dcp_cfg(offload=True, consumer=True, kv_role="kv_consumer")
+    prefill = _sfa_dcp_cfg(offload=True, consumer=False, kv_role="kv_producer")
+    decode_no_offload = _sfa_dcp_cfg(offload=False, consumer=True, kv_role="kv_consumer")
+
+    assert is_pd_decode_kv_consumer(decode) is True
+    assert fused_sfa_host_offload_decode_enabled(decode) is True
+    assert enable_sfa_dcp_replicated_indexer(decode) is False
+
+    assert is_pd_decode_kv_consumer(prefill) is False
+    assert fused_sfa_host_offload_decode_enabled(prefill) is False
+    assert enable_sfa_dcp_replicated_indexer(prefill) is True
+
+    assert fused_sfa_host_offload_decode_enabled(decode_no_offload) is False
+    assert enable_sfa_dcp_replicated_indexer(decode_no_offload) is True
+
+
+def test_offload_config_alone_does_not_disable_replicated_indexer(monkeypatch):
+    monkeypatch.setattr("vllm_ascend.utils.model_uses_sfa_sparse", lambda cfg: True)
+    cfg = SimpleNamespace(
         additional_config={"kv_offload_decode_config": {"enabled": True}},
-        **common,
+        kv_transfer_config=None,
+        model_config=object(),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+        ),
     )
-    no_offload = SimpleNamespace(
-        additional_config={"kv_offload_decode_config": {"enabled": False}},
-        **common,
+    assert kv_offload_decode_enabled(cfg) is True
+    assert fused_sfa_host_offload_decode_enabled(cfg) is False
+    assert enable_sfa_dcp_replicated_indexer(cfg) is True
+
+
+def test_group_layout_host_main_and_indexer_sibling() -> None:
+    host = SimpleNamespace(
+        kv_cache_spec=SimpleNamespace(
+            store_on_host=False,
+            kv_cache_specs={"main": SimpleNamespace(store_on_host=True, block_size=128)},
+        )
     )
-    assert enable_sfa_dcp_replicated_indexer(offload) is False
-    assert enable_sfa_dcp_replicated_indexer(no_offload) is True
+    indexer = SimpleNamespace(kv_cache_spec=SimpleNamespace(store_on_host=False, block_size=128))
+    assert get_kv_cache_group_layout(host) is KVCacheAddressingLayout.UNIFIED_HOST_MAIN
+    assert (
+        get_kv_cache_group_layout(indexer, scheduler_uses_unified_pages=True)
+        is KVCacheAddressingLayout.GLOBAL_LOGICAL_INDEXER
+    )
+    assert get_kv_cache_group_layout(indexer) is KVCacheAddressingLayout.DEVICE_LOCAL_CP
+    assert get_storage_cp_world_size(indexer.kv_cache_spec, 8, scheduler_uses_unified_pages=True) == 1
+    assert get_storage_cp_world_size(indexer.kv_cache_spec, 8) == 8

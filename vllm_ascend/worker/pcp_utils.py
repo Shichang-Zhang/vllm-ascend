@@ -1941,7 +1941,13 @@ class PCPManager:
         attn_metadata_builder: Any | None = None,
     ) -> None:
         """Update per-draft-step CP seq-len metadata after metadata build."""
-        if getattr(attn_metadata_builder, "uses_unified_main_kv_view", False):
+        layout = getattr(attn_metadata_builder, "kv_addressing_layout", None)
+        if layout is not None:
+            from vllm_ascend.core.kv_cache_interface import KVCacheAddressingLayout
+
+            if layout is KVCacheAddressingLayout.UNIFIED_HOST_MAIN:
+                return
+        elif getattr(attn_metadata_builder, "uses_unified_main_kv_view", False):
             return
 
         is_mla = PCPManager._is_mla_kv_cache_spec(kv_cache_spec)

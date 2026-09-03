@@ -30,8 +30,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend.core.kv_cache_interface import kv_cache_spec_uses_unified_host_view
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
-from vllm_ascend.patch.platform.patch_kv_cache_utils import _kv_spec_store_on_host
 from vllm_ascend.utils import vllm_version_is
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -152,7 +152,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # Host pages stay spec.block_size even if a manager multiplied dcp.
         for i, mgr in enumerate(self.single_type_managers):
             spec = self.kv_cache_config.kv_cache_groups[i].kv_cache_spec
-            if not _kv_spec_store_on_host(spec):
+            if not kv_cache_spec_uses_unified_host_view(spec):
                 continue
             page = int(getattr(spec, "block_size", 0) or 0)
             if page <= 0:
@@ -193,7 +193,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # scheduler also uses that unscaled page (Decode host offload), device
         # Indexer rows must match or Hybrid asserts
         # ``scheduler_block_size % effective == 0`` fail at EngineCore init.
-        if not _kv_spec_store_on_host(kv_cache_spec) and cp > 1:
+        if not kv_cache_spec_uses_unified_host_view(kv_cache_spec) and cp > 1:
             scaled = block_size * cp
             sched = getattr(self, "scheduler_block_size", None)
             if sched is None or sched % scaled == 0:
@@ -299,7 +299,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             target_block_size = kv_cache_spec.block_size
             if (
                 not isinstance(kv_cache_spec, MambaSpec)
-                and not _kv_spec_store_on_host(kv_cache_spec)
+                and not kv_cache_spec_uses_unified_host_view(kv_cache_spec)
                 and self.dcp_world_size * self.pcp_world_size > 1
             ):
                 target_block_size *= self.dcp_world_size * self.pcp_world_size
@@ -395,7 +395,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             target_block_size = kv_cache_spec.block_size
             if (
                 not isinstance(kv_cache_spec, MambaSpec)
-                and not _kv_spec_store_on_host(kv_cache_spec)
+                and not kv_cache_spec_uses_unified_host_view(kv_cache_spec)
                 and self.dcp_world_size * self.pcp_world_size > 1
             ):
                 target_block_size *= self.dcp_world_size * self.pcp_world_size

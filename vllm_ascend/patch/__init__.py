@@ -158,13 +158,16 @@
 #    How：
 #       Monkey-patch resolve_kv_cache_block_sizes to handle the multiple-groups
 #       + CP case by returning lcm(block_sizes) * dcp * pcp as scheduler_block_size
-#       instead of raising ValueError. Host-resident Main (store_on_host) keeps
-#       the unscaled LCM so Decode DCP>1 still allocates DCP=1 Host pages.
+#       instead of raising ValueError. Host-resident Main (store_on_host / 015-016
+#       UNIFIED_HOST_MAIN) keeps the unscaled LCM so Decode DCP>1 still allocates
+#       DCP=1 Host pages. Host detection and storage CP live in
+#       vllm_ascend.core.kv_cache_interface; this file only assigns the vLLM hook.
 #    Related PR (if no, explain why):
-#       vLLM PR #40860 ([Feat] DeepSeek V4 Rebased).
+#       vLLM PR #40860 ([Feat] DeepSeek V4 Rebased). 015/016 Host layout.
 #    Future Plan:
 #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
-#       non-CUDA backends, or exposes a platform hook for this behavior.
+#       non-CUDA backends, or exposes a platform hook for scheduler block size
+#       and storage addressing. Do not grow Host/Indexer logic in this file.
 #
 # ** 8. File: platform/patch_mamba_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

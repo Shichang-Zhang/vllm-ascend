@@ -9,9 +9,10 @@ from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 from vllm_ascend.core.kv_cache_interface import (
+    KVCacheAddressingLayout,
+    get_kv_cache_group_layout,
     get_storage_cp_world_size,
     kv_cache_groups_share_unified_scheduler_pages,
-    kv_cache_spec_uses_unified_host_view,
 )
 from vllm_ascend.utils import vllm_version_is
 
@@ -29,6 +30,7 @@ class BlockTable:
         cp_kv_cache_interleave_size: int = 1,
         num_speculative_tokens: int = 0,
         kv_cache_group: KVCacheGroupSpec = None,
+        addressing_layout: KVCacheAddressingLayout | None = None,
         unified_logical_view: bool = False,
     ):
         self.max_num_reqs = max_num_reqs
@@ -108,16 +110,14 @@ class BlockTable:
 
         self.kernel_sizes = kernel_sizes
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
-        host_view = False
-        if kv_cache_group is not None and hasattr(kv_cache_group, "kv_cache_spec"):
-            host_view = kv_cache_spec_uses_unified_host_view(kv_cache_group.kv_cache_spec)
-        self.uses_unified_host_view = host_view or unified_logical_view
-        if host_view:
-            self.storage_layout = "unified_host"
-        elif unified_logical_view:
-            self.storage_layout = "unified_logical"
-        else:
-            self.storage_layout = "device_local_cp"
+        if addressing_layout is None:
+            addressing_layout = get_kv_cache_group_layout(
+                kv_cache_group,
+                scheduler_uses_unified_pages=unified_logical_view,
+            )
+        self.addressing_layout = addressing_layout
+        self.uses_unified_host_view = addressing_layout is not KVCacheAddressingLayout.DEVICE_LOCAL_CP
+        self.storage_layout = addressing_layout.value
 
     def append_row(
         self,
@@ -427,11 +427,11 @@ class MultiGroupBlockTable:
                 f"kernel_sizes length ({len(kernel_sizes)}) must match block_sizes length ({len(block_sizes)})"
             )
 
-        unified_logical = kv_cache_groups_share_unified_scheduler_pages(kv_cache_groups)
+        unified_pages = kv_cache_groups_share_unified_scheduler_pages(kv_cache_groups)
         if max_num_blocks is None:
             # Device-local DCP ranks store max_model_len/runtime_cp tokens.
-            # Unified Host groups keep global pages: storage_cp=1. Sibling
-            # Indexer groups share those scheduler ids, so they also use 1.
+            # UNIFIED_HOST_MAIN keeps global pages: storage_cp=1. Indexer
+            # siblings share those scheduler ids (GLOBAL_LOGICAL_INDEXER).
             runtime_cp = get_total_cp_world_size()
             if kv_cache_groups is not None:
                 max_num_blocks = []
@@ -439,7 +439,7 @@ class MultiGroupBlockTable:
                     storage_cp = get_storage_cp_world_size(
                         group.kv_cache_spec,
                         runtime_cp,
-                        scheduler_uses_unified_pages=unified_logical,
+                        scheduler_uses_unified_pages=unified_pages,
                     )
                     max_num_blocks.append(cdiv(max_model_len, block_size * storage_cp))
             else:
@@ -464,7 +464,10 @@ class MultiGroupBlockTable:
                     cp_kv_cache_interleave_size,
                     num_speculative_tokens,
                     kv_cache_group,
-                    unified_logical,
+                    get_kv_cache_group_layout(
+                        kv_cache_group,
+                        scheduler_uses_unified_pages=unified_pages,
+                    ),
                 )
                 for block_size, kernel_size_list, max_num_blocks_per_req, kv_cache_group in zip(
                     block_sizes, kernel_sizes, max_num_blocks, kv_cache_groups

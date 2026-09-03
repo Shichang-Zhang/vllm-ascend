@@ -351,7 +351,7 @@ class TestUnifiedHostBlockTable(TestBlockTableComputeSlotMapping):
         msg = str(ctx.exception)
         self.assertIn("need=129", msg)
         self.assertIn("capacity=128", msg)
-        self.assertIn("layout=unified_host", msg)
+        self.assertIn("layout=UNIFIED_HOST_MAIN", msg)
 
     def test_global_slot_position_2060_same_on_all_dcp_ranks(self):
         ids = list(range(20))
@@ -396,7 +396,7 @@ class TestUnifiedHostBlockTable(TestBlockTableComputeSlotMapping):
             unified_logical_view=True,
         )
         self.assertTrue(table.uses_unified_host_view)
-        self.assertEqual(table.storage_layout, "unified_logical")
+        self.assertEqual(table.storage_layout, "GLOBAL_LOGICAL_INDEXER")
         table.add_row(list(range(129)), 0)
         self.assertEqual(int(table.num_blocks_per_row[0]), 129)
         table.compute_slot_mapping_draft(np.array([0], dtype=np.int32), np.array([2060], dtype=np.int32))

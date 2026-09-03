@@ -112,9 +112,9 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import (
+    get_kv_cache_group_layout,
     get_storage_cp_world_size,
     kv_cache_groups_share_unified_scheduler_pages,
-    kv_cache_spec_uses_unified_host_view,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -322,10 +322,10 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.group_len = self._make_buffer(
             vllm_config.scheduler_config.max_num_batched_tokens , dtype=torch.int32
-        )        
+        )
         self.group_key_idx = self._make_buffer(
            vllm_config.scheduler_config.max_num_batched_tokens , dtype=torch.int32
-        )        
+        )
         self.group_key_cache_idx = self._make_buffer(
             vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.int32
         )
@@ -450,11 +450,11 @@ class NPUModelRunner(GPUModelRunner):
             self.input_ids = self._make_buffer(max_buffer_num_tokens, dtype=torch.int32)
             self.positions = torch.zeros(
                 max_buffer_num_tokens, dtype=torch.int64, device=self.device)
-            
+
         self.sfa_dcp_replicated_indexer_size = 1
         if enable_sfa_dcp_replicated_indexer():
             self.sfa_dcp_replicated_indexer_size = self.dcp_size
-            
+
         # Create a CPU numpy buffer for positions computation when
         # self.positions is a plain tensor (non-CpuGpuBuffer case).
         self._positions_cpu_buf = torch.zeros(
@@ -1159,7 +1159,7 @@ class NPUModelRunner(GPUModelRunner):
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
-        
+
         self.discard_request_mask.np[:num_reqs] = discard_requests_mask
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
@@ -1679,7 +1679,7 @@ class NPUModelRunner(GPUModelRunner):
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
         default_stream = torch.npu.current_stream()
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream): 
+        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):
             self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
@@ -2034,7 +2034,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-       
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -2064,9 +2064,9 @@ class NPUModelRunner(GPUModelRunner):
             and self.num_spec_tokens
             and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
-            # NOTE: This branch specifically triggers a deepcopy during the prefill phase 
-            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios. 
-            # It does not affect other use cases. This is a temporary workaround and 
+            # NOTE: This branch specifically triggers a deepcopy during the prefill phase
+            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios.
+            # It does not affect other use cases. This is a temporary workaround and
             # will be removed once upstream vLLM provides native support for PCP + MM.
             self.pcp_size > 1 and self.supports_mm_inputs and get_pp_group().is_first_rank
             and not self.model_config.is_encoder_decoder
@@ -2656,7 +2656,7 @@ class NPUModelRunner(GPUModelRunner):
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
             return model_runner_output
-        
+
         # Async path: produce a device-side snapshot that the async
         # copy stream can D2H later. Both tensors must be private
         # clones because:
@@ -3440,7 +3440,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer 
+                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer
                     | AscendDSparkProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
@@ -3604,10 +3604,10 @@ class NPUModelRunner(GPUModelRunner):
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
-        
+
         if self.dynamic_eplb:
             self.update_eplb_heat_collection_status(num_tokens_padded)
-        
+
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
@@ -4007,7 +4007,7 @@ class NPUModelRunner(GPUModelRunner):
             and mm_config is not None
             and mm_config.is_multimodal_pruning_enabled()
         ) # type: bool
-        
+
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
@@ -5209,17 +5209,15 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_uses_unified_pages=unified_pages,
             )
             max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * storage_cp)
-            if kv_cache_spec_uses_unified_host_view(kv_cache_group.kv_cache_spec):
-                layout = "unified_host"
-            elif unified_pages:
-                layout = "unified_logical"
-            else:
-                layout = "device_local_cp"
+            layout = get_kv_cache_group_layout(
+                kv_cache_group,
+                scheduler_uses_unified_pages=unified_pages,
+            )
             logger.info(
-                "group=%s layout=%s runtime_cp=%s storage_cp=%s page_tokens=%s "
+                "KVLAYOUT group=%s layout=%s runtime_cp=%s storage_cp=%s page_tokens=%s "
                 "max_model_len=%s table_cols=%s",
                 i,
-                layout,
+                layout.value,
                 runtime_cp,
                 storage_cp,
                 block_sizes[i],
@@ -5229,7 +5227,7 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
                     max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
-                ) 
+                )
 
                 max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
                 max_num_blocks_per_req += kv_cache_group.kv_cache_spec.num_speculative_blocks

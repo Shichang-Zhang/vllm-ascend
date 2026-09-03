@@ -38,6 +38,7 @@ from vllm.logger import logger
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.core.kv_cache_interface import KVCacheAddressingLayout
 from vllm_ascend.attention.fused_overlap_debug import dump_op_inputs, dump_op_output
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
@@ -93,6 +94,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
     """Fills the offload-specific SFA metadata (decode split + request ids)."""
 
     uses_unified_main_kv_view = True
+    kv_addressing_layout = KVCacheAddressingLayout.UNIFIED_HOST_MAIN
 
     def __init__(
         self,

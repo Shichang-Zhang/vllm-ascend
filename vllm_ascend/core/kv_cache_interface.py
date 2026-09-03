@@ -3,6 +3,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 
 import torch
 from typing_extensions import Self
@@ -246,6 +247,55 @@ def kv_cache_groups_share_unified_scheduler_pages(groups) -> bool:
     return any(kv_cache_spec_uses_unified_host_view(getattr(g, "kv_cache_spec", None)) for g in groups)
 
 
+class KVCacheAddressingLayout(str, Enum):
+    """Block-id / slot addressing domain for one KV cache group.
+
+    Runtime DCP/PCP process groups stay unchanged. Only page ids and storage
+    offsets follow this layout. DSA-CP is still unsupported.
+    """
+
+    DEVICE_LOCAL_CP = "DEVICE_LOCAL_CP"
+    UNIFIED_HOST_MAIN = "UNIFIED_HOST_MAIN"
+    GLOBAL_LOGICAL_INDEXER = "GLOBAL_LOGICAL_INDEXER"
+
+
+def _kv_cache_spec_from_group_or_spec(group_or_spec) -> KVCacheSpec | None:
+    if group_or_spec is None:
+        return None
+    return getattr(group_or_spec, "kv_cache_spec", group_or_spec)
+
+
+def _spec_is_sfa_indexer(kv_cache_spec: KVCacheSpec | None) -> bool:
+    if kv_cache_spec is None:
+        return False
+    if isinstance(kv_cache_spec, AscendSFAIndexerCacheSpec):
+        return True
+    nested = getattr(kv_cache_spec, "kv_cache_specs", None)
+    if isinstance(nested, Mapping):
+        return any(_spec_is_sfa_indexer(spec) for spec in nested.values())
+    if isinstance(nested, (list, tuple)):
+        return any(_spec_is_sfa_indexer(spec) for spec in nested)
+    return False
+
+
+def get_kv_cache_group_layout(
+    group_or_spec,
+    *,
+    scheduler_uses_unified_pages: bool = False,
+) -> KVCacheAddressingLayout:
+    """Addressing layout for one group. Does not scan additional_config."""
+    spec = _kv_cache_spec_from_group_or_spec(group_or_spec)
+    if kv_cache_spec_uses_unified_host_view(spec):
+        return KVCacheAddressingLayout.UNIFIED_HOST_MAIN
+    if scheduler_uses_unified_pages and _spec_is_sfa_indexer(spec):
+        return KVCacheAddressingLayout.GLOBAL_LOGICAL_INDEXER
+    if scheduler_uses_unified_pages:
+        # 015 allocated global ids to every sibling of Host. Keep that table
+        # width so a non-Indexer sibling cannot shrink to DCP-local columns.
+        return KVCacheAddressingLayout.GLOBAL_LOGICAL_INDEXER
+    return KVCacheAddressingLayout.DEVICE_LOCAL_CP
+
+
 def get_storage_cp_world_size(
     kv_cache_spec: KVCacheSpec | None,
     runtime_cp_world_size: int,
@@ -254,16 +304,19 @@ def get_storage_cp_world_size(
 ) -> int:
     """CP size for block-id / slot addressing, not the process group.
 
-    Unified Host groups always use 1. When the scheduler already emits global
-    Host pages, sibling device-local groups (SFA Indexer) also use 1 so their
-    BlockTable can hold ``cdiv(seq_len, page)`` ids. Isolated device-local
-    groups keep runtime CP. Never derive this from node device count.
+    UNIFIED_HOST_MAIN and GLOBAL_LOGICAL_INDEXER use storage CP=1. Isolated
+    DEVICE_LOCAL_CP groups keep runtime CP. Never derive this from node device
+    count.
     """
     if runtime_cp_world_size < 1:
         raise ValueError(f"runtime_cp_world_size must be >= 1, got {runtime_cp_world_size}")
-    if kv_cache_spec_uses_unified_host_view(kv_cache_spec) or scheduler_uses_unified_pages:
-        return 1
-    return runtime_cp_world_size
+    layout = get_kv_cache_group_layout(
+        kv_cache_spec,
+        scheduler_uses_unified_pages=scheduler_uses_unified_pages,
+    )
+    if layout is KVCacheAddressingLayout.DEVICE_LOCAL_CP:
+        return runtime_cp_world_size
+    return 1
 
 
 def register_ascend_kv_cache_specs() -> None:
