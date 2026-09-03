@@ -8,6 +8,11 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
+from vllm_ascend.core.kv_cache_interface import (
+    get_storage_cp_world_size,
+    kv_cache_groups_share_unified_scheduler_pages,
+    kv_cache_spec_uses_unified_host_view,
+)
 from vllm_ascend.utils import vllm_version_is
 
 
@@ -24,6 +29,7 @@ class BlockTable:
         cp_kv_cache_interleave_size: int = 1,
         num_speculative_tokens: int = 0,
         kv_cache_group: KVCacheGroupSpec = None,
+        unified_logical_view: bool = False,
     ):
         self.max_num_reqs = max_num_reqs
         self.pcp_world_size = get_pcp_group().world_size
@@ -102,6 +108,16 @@ class BlockTable:
 
         self.kernel_sizes = kernel_sizes
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+        host_view = False
+        if kv_cache_group is not None and hasattr(kv_cache_group, "kv_cache_spec"):
+            host_view = kv_cache_spec_uses_unified_host_view(kv_cache_group.kv_cache_spec)
+        self.uses_unified_host_view = host_view or unified_logical_view
+        if host_view:
+            self.storage_layout = "unified_host"
+        elif unified_logical_view:
+            self.storage_layout = "unified_logical"
+        else:
+            self.storage_layout = "device_local_cp"
 
     def append_row(
         self,
@@ -116,6 +132,15 @@ class BlockTable:
 
         num_blocks = len(block_ids)
         start = self.num_blocks_per_row[row_idx]
+        capacity = int(self.block_table.np.shape[1])
+        need = int(start + num_blocks)
+        if need > capacity:
+            raise ValueError(
+                "BlockTable row capacity exceeded: "
+                f"need={need} capacity={capacity} layout={self.storage_layout} "
+                f"block_size={self.block_size} runtime_dcp={self.dcp_world_size} "
+                f"runtime_pcp={self.pcp_world_size}"
+            )
 
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
         self.num_blocks_per_row[row_idx] += num_blocks
@@ -152,7 +177,14 @@ class BlockTable:
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-        if self.dcp_world_size * self.pcp_world_size > 1:
+        if self.uses_unified_host_view:
+            req_indices = torch.repeat_interleave(
+                torch.arange(num_reqs, dtype=torch.int32, device=query_start_loc.device),
+                query_start_loc[1:] - query_start_loc[:-1],
+                output_size=num_tokens,
+            )
+            self._compute_unified_host_slot_mapping(req_indices, positions)
+        elif self.dcp_world_size * self.pcp_world_size > 1:
             req_indices = torch.repeat_interleave(
                 torch.arange(num_reqs, dtype=torch.int32, device=query_start_loc.device),
                 query_start_loc[1:] - query_start_loc[:-1],
@@ -199,7 +231,9 @@ class BlockTable:
         # here because M (max_model_len) is not necessarily divisible by
         # block_size.
 
-        if self.dcp_world_size * self.pcp_world_size > 1:
+        if self.uses_unified_host_view:
+            self._compute_unified_host_slot_mapping(req_indices, positions)
+        elif self.dcp_world_size * self.pcp_world_size > 1:
             if not isinstance(req_indices, torch.Tensor):
                 req_indices = torch.from_numpy(req_indices)
             if not isinstance(positions, torch.Tensor):
@@ -236,6 +270,46 @@ class BlockTable:
                 out=self.slot_mapping.np[: req_indices.shape[0]],
             )
             self.slot_mapping.copy_to_gpu(req_indices.shape[0])
+
+    def _compute_unified_host_slot_mapping(
+        self,
+        req_indices: np.ndarray | torch.Tensor,
+        positions: np.ndarray | torch.Tensor,
+    ) -> None:
+        """Global Host slots: position // block_size, no DCP owner mask."""
+        n = int(positions.shape[0])
+        stride = self.max_num_blocks_per_req * self.blocks_per_phys_block
+        use_torch = isinstance(req_indices, torch.Tensor) or isinstance(positions, torch.Tensor)
+        if use_torch:
+            if not isinstance(req_indices, torch.Tensor):
+                req_indices = torch.as_tensor(req_indices, dtype=torch.int64)
+            if not isinstance(positions, torch.Tensor):
+                positions = torch.as_tensor(positions, dtype=torch.int64)
+            req_indices = req_indices.to(dtype=torch.int64)
+            positions = positions.to(dtype=torch.int64)
+            block_idx = positions // self.block_size
+            block_offset = positions % self.block_size
+            table_idx = req_indices * stride + block_idx
+            if req_indices.device.type != "cpu":
+                block_numbers = self.block_table.gpu.flatten()[table_idx]
+                self.slot_mapping.gpu[:n] = block_numbers * self.block_size + block_offset
+            else:
+                block_numbers = self.block_table.cpu.flatten()[table_idx]
+                self.slot_mapping.cpu[:n] = block_numbers * self.block_size + block_offset
+                self.slot_mapping.copy_to_gpu(n)
+            return
+        req_indices_np = np.asarray(req_indices)
+        positions_np = np.asarray(positions)
+        block_idx = positions_np // self.block_size
+        block_offset = positions_np % self.block_size
+        table_idx = req_indices_np * stride + block_idx
+        block_numbers = self.block_table.np.ravel()[table_idx]
+        np.add(
+            block_numbers * self.block_size,
+            block_offset,
+            out=self.slot_mapping.np[:n],
+        )
+        self.slot_mapping.copy_to_gpu(n)
 
     def _compute_pcp_dcp_slot_mapping(
         self,
@@ -353,13 +427,23 @@ class MultiGroupBlockTable:
                 f"kernel_sizes length ({len(kernel_sizes)}) must match block_sizes length ({len(block_sizes)})"
             )
 
+        unified_logical = kv_cache_groups_share_unified_scheduler_pages(kv_cache_groups)
         if max_num_blocks is None:
-            # Note(hc): each dcp rank only store
-            # (max_model_len//dcp_world_size) tokens in kvcache,
-            # so the block_size which used for calc max_num_blocks_per_req
-            # must be multiplied by dcp_world_size.
-            total_cp_world_size = get_total_cp_world_size()
-            max_num_blocks = [cdiv(max_model_len, block_size * total_cp_world_size) for block_size in block_sizes]
+            # Device-local DCP ranks store max_model_len/runtime_cp tokens.
+            # Unified Host groups keep global pages: storage_cp=1. Sibling
+            # Indexer groups share those scheduler ids, so they also use 1.
+            runtime_cp = get_total_cp_world_size()
+            if kv_cache_groups is not None:
+                max_num_blocks = []
+                for block_size, group in zip(block_sizes, kv_cache_groups):
+                    storage_cp = get_storage_cp_world_size(
+                        group.kv_cache_spec,
+                        runtime_cp,
+                        scheduler_uses_unified_pages=unified_logical,
+                    )
+                    max_num_blocks.append(cdiv(max_model_len, block_size * storage_cp))
+            else:
+                max_num_blocks = [cdiv(max_model_len, block_size * runtime_cp) for block_size in block_sizes]
 
         if len(max_num_blocks) != len(block_sizes):
             raise ValueError(
@@ -380,6 +464,7 @@ class MultiGroupBlockTable:
                     cp_kv_cache_interleave_size,
                     num_speculative_tokens,
                     kv_cache_group,
+                    unified_logical,
                 )
                 for block_size, kernel_size_list, max_num_blocks_per_req, kv_cache_group in zip(
                     block_sizes, kernel_sizes, max_num_blocks, kv_cache_groups

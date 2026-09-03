@@ -158,7 +158,8 @@
 #    How：
 #       Monkey-patch resolve_kv_cache_block_sizes to handle the multiple-groups
 #       + CP case by returning lcm(block_sizes) * dcp * pcp as scheduler_block_size
-#       instead of raising ValueError.
+#       instead of raising ValueError. Host-resident Main (store_on_host) keeps
+#       the unscaled LCM so Decode DCP>1 still allocates DCP=1 Host pages.
 #    Related PR (if no, explain why):
 #       vLLM PR #40860 ([Feat] DeepSeek V4 Rebased).
 #    Future Plan:

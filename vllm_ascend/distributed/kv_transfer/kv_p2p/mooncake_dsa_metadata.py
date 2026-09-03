@@ -67,12 +67,21 @@ class RemoteEndpoint:
         _require_nonempty_string("remote_engine_id", self.remote_engine_id)
 
 
+def _require_positive_integer(name: str, value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteSource:
     remote_request_id: str
     endpoints_by_prefill_rank: tuple[RemoteEndpoint, ...]
     indexer_block_ids: tuple[int, ...]
     main_block_ids: tuple[int, ...]
+    remote_dcp_size: int = 1
+    remote_pcp_size: int = 1
 
     def __post_init__(self) -> None:
         _require_nonempty_string(
@@ -102,6 +111,8 @@ class RemoteSource:
             "main_block_ids",
             _normalize_block_ids("main_block_ids", self.main_block_ids),
         )
+        _require_positive_integer("remote_dcp_size", self.remote_dcp_size)
+        _require_positive_integer("remote_pcp_size", self.remote_pcp_size)
 
 
 @dataclass(frozen=True, slots=True)

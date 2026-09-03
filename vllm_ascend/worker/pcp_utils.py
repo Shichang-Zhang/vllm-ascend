@@ -1941,8 +1941,11 @@ class PCPManager:
         attn_metadata_builder: Any | None = None,
     ) -> None:
         """Update per-draft-step CP seq-len metadata after metadata build."""
-        is_mla = self._is_mla_kv_cache_spec(kv_cache_spec)
-        is_sfa_dcp = self._is_sfa_dcp_metadata_builder(attn_metadata_builder)
+        if getattr(attn_metadata_builder, "uses_unified_main_kv_view", False):
+            return
+
+        is_mla = PCPManager._is_mla_kv_cache_spec(kv_cache_spec)
+        is_sfa_dcp = PCPManager._is_sfa_dcp_metadata_builder(attn_metadata_builder)
         seq_lens_for_cp = seq_lens
         if not is_mla and seq_lens_cpu is not None:
             seq_lens_for_cp = seq_lens_cpu
@@ -1955,9 +1958,13 @@ class PCPManager:
         )
         cp_seq_len = num_computed_tokens_of_pcp_dcp[:, self.pcp_world_rank, self.dcp_world_rank]
 
-        if is_sfa_dcp:
-            dcp_context = attn_metadata.dcp_context
-            assert dcp_context is not None
+        dcp_context = getattr(attn_metadata, "dcp_context", None)
+        if is_sfa_dcp or dcp_context is not None:
+            if dcp_context is None:
+                raise RuntimeError(
+                    "SFA DCP draft metadata is missing dcp_context; "
+                    "refusing to skip CP-local seq_len rewrite"
+                )
             dcp_seq_lens = dcp_context.seq_lens
             sfa_cp_seq_len = cp_seq_len.to(
                 device=dcp_seq_lens.device,
@@ -1966,10 +1973,22 @@ class PCPManager:
             )
             dcp_seq_lens[: sfa_cp_seq_len.shape[0]].copy_(sfa_cp_seq_len, non_blocking=True)
             dcp_seq_lens[sfa_cp_seq_len.shape[0] :].fill_(0)
-        elif is_mla:
-            attn_metadata.decode.cp_seq_len = cp_seq_len
-        else:
-            attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
+            return
+
+        decode = getattr(attn_metadata, "decode", None)
+        if decode is not None:
+            decode.cp_seq_len = cp_seq_len
+            return
+
+        decode_meta = getattr(attn_metadata, "decode_meta", None)
+        if decode_meta is not None:
+            decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
+            return
+
+        raise RuntimeError(
+            f"Unknown spec-decode CP metadata layout: type={type(attn_metadata)!r} "
+            f"builder={type(attn_metadata_builder)!r}"
+        )
 
     def generate_pcp_metadata(
         self,

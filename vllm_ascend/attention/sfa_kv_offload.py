@@ -48,7 +48,6 @@ from vllm_ascend.attention.sfa_v1 import (
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     build_valid_topk_mask,
-    enable_cp,
     split_decodes_and_prefills,
 )
 from vllm_ascend.device.device_op import DeviceOperator
@@ -92,6 +91,8 @@ def _check_device_kv_cache_exist() -> None:
 
 class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
     """Fills the offload-specific SFA metadata (decode split + request ids)."""
+
+    uses_unified_main_kv_view = True
 
     def __init__(
         self,
@@ -193,8 +194,12 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             kv_sharing_target_layer_name,
             **kwargs,
         )
-        if enable_cp() or self.enable_dsa_cp:
-            raise NotImplementedError("KV offload decode currently requires TP without context parallelism")
+        # ALLOW_DCP8_OFFLOAD / UNIFIED_VIEW: Host pool is a DCP=1 linear token
+        # view; Prefill CP shards are gathered in MAIN_D2RH. Keep DSA-CP reject.
+        if self.enable_dsa_cp:
+            raise NotImplementedError(
+                "KV offload decode currently requires enable_dsa_cp=false"
+            )
         if self.enable_sparse_sfa_c8:
             raise NotImplementedError(
                 "KV offload decode does not support the sparse SFA C8 main "

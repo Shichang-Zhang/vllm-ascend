@@ -111,6 +111,11 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 # yapf: enable
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.core.kv_cache_interface import (
+    get_storage_cp_world_size,
+    kv_cache_groups_share_unified_scheduler_pages,
+    kv_cache_spec_uses_unified_host_view,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
@@ -5191,10 +5196,36 @@ class NPUModelRunner(GPUModelRunner):
 
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
+        runtime_cp = get_total_cp_world_size()
+        unified_pages = kv_cache_groups_share_unified_scheduler_pages(
+            kv_cache_config.kv_cache_groups
+        )
         for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
-            max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
+            storage_cp = get_storage_cp_world_size(
+                kv_cache_group.kv_cache_spec,
+                runtime_cp,
+                scheduler_uses_unified_pages=unified_pages,
+            )
+            max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * storage_cp)
+            if kv_cache_spec_uses_unified_host_view(kv_cache_group.kv_cache_spec):
+                layout = "unified_host"
+            elif unified_pages:
+                layout = "unified_logical"
+            else:
+                layout = "device_local_cp"
+            logger.info(
+                "group=%s layout=%s runtime_cp=%s storage_cp=%s page_tokens=%s "
+                "max_model_len=%s table_cols=%s",
+                i,
+                layout,
+                runtime_cp,
+                storage_cp,
+                block_sizes[i],
+                max_model_len,
+                max_num_blocks_per_req,
+            )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
                     max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
@@ -5204,9 +5235,27 @@ class NPUModelRunner(GPUModelRunner):
                 max_num_blocks_per_req += kv_cache_group.kv_cache_spec.num_speculative_blocks
             max_num_blocks.append(max_num_blocks_per_req)
 
-        if (block_sizes != [self.cache_config.block_size]
-                or self.kernel_block_sizes != [[self.cache_config.block_size]]
-                or len(kv_cache_config.kv_cache_groups) > 1):
+        # The constructor InputBatch uses runtime_cp in the table-width
+        # fallback (DCP=8 → 128 cols) and has no kv_cache_group, so
+        # uses_unified_host_view stays False. A single Host-offload group
+        # keeps block_size==cache_config.block_size, so the old guard
+        # skipped reinit and 16k still wrote 129 ids into 128 cols.
+        default_cols = [cdiv(max_model_len, bs * runtime_cp) for bs in block_sizes]
+        need_reinit = (
+            block_sizes != [self.cache_config.block_size]
+            or self.kernel_block_sizes != [[self.cache_config.block_size]]
+            or len(kv_cache_config.kv_cache_groups) > 1
+            or max_num_blocks != default_cols
+            or unified_pages
+        )
+        logger.info(
+            "reinit_input_batch need=%s unified_pages=%s table_cols=%s default_cols=%s",
+            need_reinit,
+            unified_pages,
+            max_num_blocks,
+            default_cols,
+        )
+        if need_reinit:
             assert self.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501

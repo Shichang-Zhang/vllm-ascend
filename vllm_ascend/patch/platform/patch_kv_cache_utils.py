@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
+from collections.abc import Mapping
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
@@ -20,6 +21,40 @@ from vllm.v1.kv_cache_interface import (
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 
 
+from vllm_ascend.core.kv_cache_interface import kv_cache_spec_uses_unified_host_view
+
+
+def _kv_spec_store_on_host(kv_cache_spec: KVCacheSpec) -> bool:
+    """Thin proxy: nested Host detection lives in core.kv_cache_interface."""
+    return kv_cache_spec_uses_unified_host_view(kv_cache_spec)
+
+
+def _vllm_config_host_offload_enabled(vllm_config: VllmConfig) -> bool:
+    """Decode fused offload is configured on the engine, not only on specs.
+
+    EngineCore may wrap Main+Indexer in one UniformType group whose outer spec
+    has no ``store_on_host``. Live 8/8 still allocated ``cdiv(tokens, page*dcp)``
+    ids until we also honor ``additional_config.kv_offload_decode_config``.
+    Prefill does not set that flag, so it keeps ``lcm * dcp * pcp``.
+    """
+    additional = getattr(vllm_config, "additional_config", None)
+    if additional is None:
+        return False
+    if isinstance(additional, Mapping):
+        cfg = additional.get("kv_offload_decode_config")
+    else:
+        cfg = getattr(additional, "kv_offload_decode_config", None)
+    if cfg is None:
+        return False
+    if isinstance(cfg, Mapping):
+        return bool(cfg.get("enabled"))
+    return bool(getattr(cfg, "enabled", False))
+
+
+def _groups_use_unified_host_pages(groups) -> bool:
+    return any(_kv_spec_store_on_host(g.kv_cache_spec) for g in groups)
+
+
 def _ascend_resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -34,14 +69,25 @@ def _ascend_resolve_kv_cache_block_sizes(
     For multiple KV cache groups with CP, compute scheduler_block_size as
     lcm(group_block_sizes) * dcp * pcp to maintain alignment, consistent
     with the pre-PR-#40860 behavior of block_size * dcp * pcp.
+
+    Exception: a Host-resident Main group (``store_on_host``) is addressed in
+    DCP=1 pages of ``spec.block_size``. Multiplying that LCM by DCP makes
+    ``allocate_slots`` hand out too few Host ids (e.g. 3 instead of
+    cdiv(tokens, page)). Do not scale reported connector tokens to fake extra
+    ids — that trips ``num_computed_tokens <= request.num_tokens``.
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     pcp = vllm_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
+    host_pages = _groups_use_unified_host_pages(groups) or _vllm_config_host_offload_enabled(
+        vllm_config
+    )
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp * pcp
+        bs = cache_config.block_size
+        if not host_pages:
+            bs *= dcp * pcp
         return bs, bs
 
     if dcp != 1 or pcp != 1:
@@ -49,7 +95,9 @@ def _ascend_resolve_kv_cache_block_sizes(
         # scheduler_block_size using the LCM of all group block sizes
         # multiplied by the CP factors for proper alignment.
         group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
-        scheduler_block_size = math.lcm(*group_block_sizes) * dcp * pcp
+        scheduler_block_size = math.lcm(*group_block_sizes)
+        if not host_pages:
+            scheduler_block_size *= dcp * pcp
         if not cache_config.enable_prefix_caching:
             return scheduler_block_size, scheduler_block_size
         hash_block_size = math.gcd(*group_block_sizes)

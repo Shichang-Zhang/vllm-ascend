@@ -50,6 +50,19 @@ def test_remote_source_normalizes_block_ids() -> None:
     assert source.main_block_ids == (3, 4)
 
 
+def test_remote_source_keeps_remote_cp_sizes() -> None:
+    source = dsa.RemoteSource(
+        "prefill-request",
+        [_endpoint()],
+        [1],
+        [2],
+        remote_dcp_size=8,
+        remote_pcp_size=1,
+    )
+    assert source.remote_dcp_size == 8
+    assert source.remote_pcp_size == 1
+
+
 @pytest.mark.parametrize(
     "field",
     ("indexer_block_ids", "main_block_ids"),

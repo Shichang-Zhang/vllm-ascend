@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -9,7 +10,7 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
@@ -209,6 +210,57 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
         )
+
+
+def kv_cache_spec_uses_unified_host_view(kv_cache_spec: KVCacheSpec | None) -> bool:
+    """True when this spec (or a nested UniformType member) is Host DRAM.
+
+    Decode fused-offload Main pages are a storage-CP=1 view. Recurse into
+    ``UniformTypeKVCacheSpecs.kv_cache_specs`` so a wrapper group without a
+    top-level ``store_on_host`` still matches the nested Main spec.
+    """
+    if kv_cache_spec is None:
+        return False
+    if bool(getattr(kv_cache_spec, "store_on_host", False)):
+        return True
+    nested = getattr(kv_cache_spec, "kv_cache_specs", None)
+    if isinstance(nested, Mapping):
+        return any(kv_cache_spec_uses_unified_host_view(spec) for spec in nested.values())
+    if isinstance(nested, (list, tuple)):
+        return any(kv_cache_spec_uses_unified_host_view(spec) for spec in nested)
+    return False
+
+
+def kv_cache_groups_share_unified_scheduler_pages(groups) -> bool:
+    """True when any group in this config is Host DRAM.
+
+    Decode fused-offload uses one scheduler block-id namespace: Host Main and
+    the device-resident Indexer share global page ids. Sibling groups must
+    then use storage CP=1 even if they themselves are not ``store_on_host``.
+    """
+    if not groups:
+        return False
+    return any(kv_cache_spec_uses_unified_host_view(getattr(g, "kv_cache_spec", None)) for g in groups)
+
+
+def get_storage_cp_world_size(
+    kv_cache_spec: KVCacheSpec | None,
+    runtime_cp_world_size: int,
+    *,
+    scheduler_uses_unified_pages: bool = False,
+) -> int:
+    """CP size for block-id / slot addressing, not the process group.
+
+    Unified Host groups always use 1. When the scheduler already emits global
+    Host pages, sibling device-local groups (SFA Indexer) also use 1 so their
+    BlockTable can hold ``cdiv(seq_len, page)`` ids. Isolated device-local
+    groups keep runtime CP. Never derive this from node device count.
+    """
+    if runtime_cp_world_size < 1:
+        raise ValueError(f"runtime_cp_world_size must be >= 1, got {runtime_cp_world_size}")
+    if kv_cache_spec_uses_unified_host_view(kv_cache_spec) or scheduler_uses_unified_pages:
+        return 1
+    return runtime_cp_world_size
 
 
 def register_ascend_kv_cache_specs() -> None:

@@ -14,6 +14,7 @@
 #
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -44,7 +45,17 @@ class TestBlockTableComputeSlotMapping(TestBase):
         self.kernel_sizes = [128]
         self._skip_triton_kernel = True
 
-    def create_block_table(self, dcp_world_size, dcp_rank, pcp_world_size, pcp_rank, cp_kv_cache_interleave_size):
+    def create_block_table(
+        self,
+        dcp_world_size,
+        dcp_rank,
+        pcp_world_size,
+        pcp_rank,
+        cp_kv_cache_interleave_size,
+        kv_cache_group=None,
+        max_num_blocks_per_req=None,
+        unified_logical_view=False,
+    ):
         """Helper method to create BlockTable with mocked distributed groups"""
 
         with (
@@ -68,13 +79,17 @@ class TestBlockTableComputeSlotMapping(TestBase):
             block_table = BlockTable(
                 block_size=self.block_size,
                 max_num_reqs=self.max_num_reqs,
-                max_num_blocks_per_req=self.max_num_blocks_per_req,
+                max_num_blocks_per_req=(
+                    self.max_num_blocks_per_req if max_num_blocks_per_req is None else max_num_blocks_per_req
+                ),
                 max_num_batched_tokens=self.max_num_batched_tokens,
                 pin_memory=self.pin_memory,
                 device=self.device,
                 kernel_sizes=self.kernel_sizes,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                 num_speculative_tokens=0,
+                kv_cache_group=kv_cache_group,
+                unified_logical_view=unified_logical_view,
             )
 
             return block_table
@@ -307,6 +322,85 @@ class TestBlockTableComputeSlotMapping(TestBase):
         self._test_slot_mapping_for_ranks(
             dcp_world_size=4, pcp_world_size=2, cp_kv_cache_interleave_size=128, test_configs=test_configs
         )
+
+
+class TestUnifiedHostBlockTable(TestBlockTableComputeSlotMapping):
+    def _host_group(self):
+        return SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(
+                store_on_host=False,
+                kv_cache_specs={"main": SimpleNamespace(store_on_host=True, block_size=128)},
+            )
+        )
+
+    def test_unified_host_row_accepts_129_ids(self):
+        table = self.create_block_table(
+            8, 0, 1, 0, 1, kv_cache_group=self._host_group(), max_num_blocks_per_req=1024
+        )
+        self.assertTrue(table.uses_unified_host_view)
+        self.assertEqual(table.block_table.np.shape[1], 1024)
+        table.add_row(list(range(129)), 0)
+        self.assertEqual(int(table.num_blocks_per_row[0]), 129)
+
+    def test_narrow_table_raises_capacity_error(self):
+        table = self.create_block_table(
+            8, 0, 1, 0, 1, kv_cache_group=self._host_group(), max_num_blocks_per_req=128
+        )
+        with self.assertRaises(ValueError) as ctx:
+            table.add_row(list(range(129)), 0)
+        msg = str(ctx.exception)
+        self.assertIn("need=129", msg)
+        self.assertIn("capacity=128", msg)
+        self.assertIn("layout=unified_host", msg)
+
+    def test_global_slot_position_2060_same_on_all_dcp_ranks(self):
+        ids = list(range(20))
+        for dcp_rank in range(8):
+            table = self.create_block_table(
+                8, dcp_rank, 1, 0, 1, kv_cache_group=self._host_group(), max_num_blocks_per_req=1024
+            )
+            table.add_row(ids, 0)
+            table.compute_slot_mapping_draft(np.array([0], dtype=np.int32), np.array([2060], dtype=np.int32))
+            slot = int(table.slot_mapping.np[0])
+            self.assertEqual(slot, ids[16] * 128 + 12, f"dcp_rank={dcp_rank}")
+
+    def test_draft_numpy_and_cpu_tensor_match(self):
+        table = self.create_block_table(
+            8, 3, 1, 0, 1, kv_cache_group=self._host_group(), max_num_blocks_per_req=1024
+        )
+        table.add_row(list(range(20)), 0)
+        positions = [0, 127, 128, 2060]
+        table.compute_slot_mapping_draft(np.array([0] * 4, dtype=np.int32), np.array(positions, dtype=np.int32))
+        numpy_slots = table.slot_mapping.np[:4].copy()
+        table.compute_slot_mapping_draft(
+            torch.tensor([0, 0, 0, 0], dtype=torch.int32),
+            torch.tensor(positions, dtype=torch.int32),
+        )
+        cpu_slots = table.slot_mapping.np[:4].copy()
+        np.testing.assert_array_equal(numpy_slots, cpu_slots)
+        self.assertEqual(int(numpy_slots[0]), 0 * 128 + 0)
+        self.assertEqual(int(numpy_slots[1]), 0 * 128 + 127)
+        self.assertEqual(int(numpy_slots[2]), 1 * 128 + 0)
+        self.assertEqual(int(numpy_slots[3]), 16 * 128 + 12)
+
+    def test_indexer_unified_logical_accepts_129_and_global_slot(self):
+        indexer_group = SimpleNamespace(kv_cache_spec=SimpleNamespace(store_on_host=False, block_size=128))
+        table = self.create_block_table(
+            8,
+            4,
+            1,
+            0,
+            1,
+            kv_cache_group=indexer_group,
+            max_num_blocks_per_req=1024,
+            unified_logical_view=True,
+        )
+        self.assertTrue(table.uses_unified_host_view)
+        self.assertEqual(table.storage_layout, "unified_logical")
+        table.add_row(list(range(129)), 0)
+        self.assertEqual(int(table.num_blocks_per_row[0]), 129)
+        table.compute_slot_mapping_draft(np.array([0], dtype=np.int32), np.array([2060], dtype=np.int32))
+        self.assertEqual(int(table.slot_mapping.np[0]), 16 * 128 + 12)
 
 
 if __name__ == "__main__":

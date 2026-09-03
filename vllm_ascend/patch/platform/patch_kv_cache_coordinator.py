@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
+from vllm_ascend.patch.platform.patch_kv_cache_utils import _kv_spec_store_on_host
 from vllm_ascend.utils import vllm_version_is
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -148,6 +149,17 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        # Host pages stay spec.block_size even if a manager multiplied dcp.
+        for i, mgr in enumerate(self.single_type_managers):
+            spec = self.kv_cache_config.kv_cache_groups[i].kv_cache_spec
+            if not _kv_spec_store_on_host(spec):
+                continue
+            page = int(getattr(spec, "block_size", 0) or 0)
+            if page <= 0:
+                continue
+            mgr.block_size = page
+            if getattr(mgr, "scheduler_block_size", None) is not None:
+                mgr.scheduler_block_size = page
 
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -176,8 +188,16 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         block_size = kv_cache_spec.block_size
         if isinstance(kv_cache_spec, MambaSpec) and self.enable_caching:
             return block_size
-        if self.dcp_world_size * self.pcp_world_size > 1:
-            block_size *= self.dcp_world_size * self.pcp_world_size
+        cp = self.dcp_world_size * self.pcp_world_size
+        # Host-resident Main is a DCP=1 page view (spec.block_size). When the
+        # scheduler also uses that unscaled page (Decode host offload), device
+        # Indexer rows must match or Hybrid asserts
+        # ``scheduler_block_size % effective == 0`` fail at EngineCore init.
+        if not _kv_spec_store_on_host(kv_cache_spec) and cp > 1:
+            scaled = block_size * cp
+            sched = getattr(self, "scheduler_block_size", None)
+            if sched is None or sched % scaled == 0:
+                block_size = scaled
         if hasattr(kv_cache_spec, "compress_ratio"):
             compress_ratio = kv_cache_spec.compress_ratio or 1
             compress_ratio = compress_ratio if compress_ratio >= 1 else 1
@@ -277,7 +297,11 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             target_block_size = kv_cache_spec.block_size
-            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
+            if (
+                not isinstance(kv_cache_spec, MambaSpec)
+                and not _kv_spec_store_on_host(kv_cache_spec)
+                and self.dcp_world_size * self.pcp_world_size > 1
+            ):
                 target_block_size *= self.dcp_world_size * self.pcp_world_size
             if target_block_size == self.hash_block_size:
                 return block_hashes
@@ -369,7 +393,11 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             target_block_size = kv_cache_spec.block_size
-            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
+            if (
+                not isinstance(kv_cache_spec, MambaSpec)
+                and not _kv_spec_store_on_host(kv_cache_spec)
+                and self.dcp_world_size * self.pcp_world_size > 1
+            ):
                 target_block_size *= self.dcp_world_size * self.pcp_world_size
             if target_block_size == self.hash_block_size:
                 return block_hashes
@@ -515,6 +543,20 @@ def get_kv_cache_coordinator(
         else:
             orig_kwargs["max_in_flight_tokens"] = token_budget
         orig_kwargs["scheduler_block_size"] = scheduler_block_size
+        # Host-page resolve returns unscaled spec.block_size. Unitary would
+        # multiply dcp into its own block_size and assert hash==block_size
+        # (live 8/8: hash=128 vs 1024). Keep coordinator DCP=1 so allocation
+        # uses Host pages; workers still run with real DCP.
+        if kv_cache_config.kv_cache_groups:
+            spec_bs = int(getattr(kv_cache_config.kv_cache_groups[0].kv_cache_spec, "block_size", 0) or 0)
+            if (
+                scheduler_block_size is not None
+                and spec_bs > 0
+                and dcp_world_size * pcp_world_size > 1
+                and int(scheduler_block_size) == spec_bs
+            ):
+                orig_kwargs["dcp_world_size"] = 1
+                orig_kwargs["pcp_world_size"] = 1
         return _orig_get_kv_cache_coordinator(**orig_kwargs)
 
     return AscendHybridKVCacheCoordinator(

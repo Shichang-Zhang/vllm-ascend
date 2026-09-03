@@ -98,6 +98,12 @@ from .mooncake_dsa_metadata import (
     RemoteEndpoint,
     RemoteSource,
 )
+from .mooncake_dsa_unified_view import (
+    host_pages_for_tokens,
+    prefill_rank_for_cp_rank,
+    tokens_per_page,
+    unified_host_slot,
+)
 
 # isort: off
 if TYPE_CHECKING:
@@ -931,14 +937,31 @@ class KVCacheRecvingThread(threading.Thread):
                         f"layer={layer_idx} position={position}"
                     )
                 destination_physical = self._expand_dsa_block_ids(destination_block_ids, local_scale)
-                if len(source_physical) != len(destination_physical):
+                # P DCP>1 / D DCP=1: Prefill scheduler_block_size = block_size * dcp
+                # so remote_scale (e.g. 8) != local_scale (1). Transfer kernel pages
+                # for the overlapping prefix instead of requiring equal coverage.
+                n = min(len(source_physical), len(destination_physical))
+                if n <= 0:
                     raise ValueError(
-                        "DSA positional source/destination block coverage must match: "
+                        "DSA positional source/destination block coverage is empty: "
                         f"n_src={len(source_block_ids)} remote_scale={remote_scale} "
                         f"n_dst={len(destination_block_ids)} local_scale={local_scale} "
                         f"layer={layer_idx} position={position}"
                     )
-                for source_id, destination_id in zip(source_physical, destination_physical):
+                if n < max(len(source_physical), len(destination_physical)):
+                    logger.debug(
+                        "DSA asymmetric DCP coverage: transferring %s kernel pages "
+                        "(src_phys=%s dst_phys=%s remote_scale=%s local_scale=%s "
+                        "layer=%s position=%s)",
+                        n,
+                        len(source_physical),
+                        len(destination_physical),
+                        remote_scale,
+                        local_scale,
+                        layer_idx,
+                        position,
+                    )
+                for source_id, destination_id in zip(source_physical[:n], destination_physical[:n]):
                     local_addresses.append(base + destination_id * stride)
                     remote_addresses.append(remote_base + source_id * remote_stride)
                     lengths.append(block_len)
@@ -946,6 +969,101 @@ class KVCacheRecvingThread(threading.Thread):
             if allow_empty:
                 return [], [], []
             raise ValueError("DSA transfer phase must not be empty")
+        return local_addresses, remote_addresses, lengths
+
+    def _dsa_load_remote_handshake(self, remote_endpoint: RemoteEndpoint):
+        """GET_META + cached handshake arrays for one Prefill rank."""
+        remote_engine_id = remote_endpoint.remote_engine_id
+        remote_host = remote_endpoint.remote_host
+        remote_handshake_port = remote_endpoint.remote_port
+        with self.remote_metadata_lock:
+            has_remote_metadata = (
+                remote_engine_id in self.kv_caches_base_addr
+                and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
+                and self.remote_metadata_hosts.get(remote_engine_id, {}).get(remote_handshake_port) == remote_host
+            )
+        if not has_remote_metadata:
+            self._get_remote_metadata(remote_host, remote_handshake_port)
+        with self.remote_metadata_lock:
+            if (
+                remote_engine_id not in self.kv_caches_base_addr
+                or remote_handshake_port not in self.kv_caches_base_addr[remote_engine_id]
+                or self.remote_metadata_hosts.get(remote_engine_id, {}).get(remote_handshake_port) != remote_host
+            ):
+                raise ValueError(
+                    "DSA GET_META engine identity did not match selected endpoint "
+                    f"{remote_engine_id!r} at {remote_host}:{remote_handshake_port}"
+                )
+            remote_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
+            remote_strides = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
+            remote_scales = self.remote_block_size_scale[remote_engine_id][remote_handshake_port]
+            remote_lens = self.remote_block_len_per_addr[remote_engine_id][remote_handshake_port]
+            remote_te_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
+        session_id = f"{remote_host}:{remote_te_port}"
+        return remote_base_addrs, remote_strides, remote_scales, remote_lens, session_id
+
+    def _build_dsa_unified_main_lists(
+        self,
+        local_layout: list[list[tuple[int, int, int, int, int]]],
+        remote_base_addrs: list[list[int]],
+        remote_strides: list[list[int]],
+        remote_scales: list[list[int]],
+        remote_lens: list[list[int]],
+        source_block_ids: tuple[int, ...],
+        destination_block_ids: tuple[int, ...],
+        *,
+        cp_rank: int,
+        remote_cp_size: int,
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Copy one Prefill-CP Main shard into the unified Host view."""
+        del remote_strides
+        host_block_tokens = int(getattr(self, "_dsa_host_block_tokens", self.block_size) or self.block_size)
+        local_addresses: list[int] = []
+        remote_addresses: list[int] = []
+        lengths: list[int] = []
+        for layer_idx, layer_layout in enumerate(local_layout):
+            remote_n = (
+                len(remote_base_addrs[layer_idx]) if layer_idx < len(remote_base_addrs) else 0
+            )
+            for position, base, block_len, stride, local_scale in layer_layout:
+                if position >= remote_n:
+                    continue
+                remote_base = remote_base_addrs[layer_idx][position]
+                remote_scale = remote_scales[layer_idx][position]
+                remote_len = remote_lens[layer_idx][position]
+                if remote_scale != 1:
+                    raise ValueError(
+                        "DSA unified Main handshake scale must be 1 "
+                        f"(CP shards are separate ranks): layer={layer_idx} "
+                        f"position={position} remote_scale={remote_scale}"
+                    )
+                if local_scale != 1:
+                    raise ValueError(
+                        "DSA unified Host Main local_scale must be 1: "
+                        f"layer={layer_idx} position={position} local_scale={local_scale}"
+                    )
+                p_kernel_tokens = tokens_per_page(
+                    page_nbytes=remote_len,
+                    host_block_nbytes=block_len,
+                    host_block_tokens=host_block_tokens,
+                )
+                token_nbytes = block_len // host_block_tokens
+                for src_index, source_id in enumerate(source_block_ids):
+                    dest_index, token_offset = unified_host_slot(
+                        src_index,
+                        cp_rank,
+                        remote_cp_size=remote_cp_size,
+                        p_kernel_tokens=p_kernel_tokens,
+                        d_block_tokens=host_block_tokens,
+                    )
+                    if dest_index >= len(destination_block_ids):
+                        continue
+                    dest_id = destination_block_ids[dest_index]
+                    local_addresses.append(
+                        base + dest_id * stride + token_offset * token_nbytes
+                    )
+                    remote_addresses.append(remote_base + source_id * remote_len)
+                    lengths.append(remote_len)
         return local_addresses, remote_addresses, lengths
 
     def _log_dsa_transfer_phase_diag(
@@ -1093,34 +1211,16 @@ class KVCacheRecvingThread(threading.Thread):
             raise ValueError("RECEIVE_REMOTE requires a remote source")
         result_kind: DsaLocalResultKind | None = None
         failure_phase = None
-        remote_engine_id = remote_endpoint.remote_engine_id
         remote_host = remote_endpoint.remote_host
         remote_handshake_port = remote_endpoint.remote_port
         try:
-            with self.remote_metadata_lock:
-                has_remote_metadata = (
-                    remote_engine_id in self.kv_caches_base_addr
-                    and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
-                    and self.remote_metadata_hosts.get(remote_engine_id, {}).get(remote_handshake_port) == remote_host
-                )
-            if not has_remote_metadata:
-                self._get_remote_metadata(remote_host, remote_handshake_port)
-            with self.remote_metadata_lock:
-                if (
-                    remote_engine_id not in self.kv_caches_base_addr
-                    or remote_handshake_port not in self.kv_caches_base_addr[remote_engine_id]
-                    or self.remote_metadata_hosts.get(remote_engine_id, {}).get(remote_handshake_port) != remote_host
-                ):
-                    raise ValueError(
-                        "DSA GET_META engine identity did not match selected endpoint "
-                        f"{remote_engine_id!r} at {remote_host}:{remote_handshake_port}"
-                    )
-                remote_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
-                remote_strides = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
-                remote_scales = self.remote_block_size_scale[remote_engine_id][remote_handshake_port]
-                remote_lens = self.remote_block_len_per_addr[remote_engine_id][remote_handshake_port]
-                remote_te_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
-            session_id = f"{remote_host}:{remote_te_port}"
+            (
+                remote_base_addrs,
+                remote_strides,
+                remote_scales,
+                remote_lens,
+                session_id,
+            ) = self._dsa_load_remote_handshake(remote_endpoint)
             if is_cancelled is None or not is_cancelled():
                 indexer_lists = self._build_dsa_transfer_lists(
                     self._dsa_indexer_local_layout,
@@ -1171,64 +1271,13 @@ class KVCacheRecvingThread(threading.Thread):
                         remote_lens=remote_lens,
                     )
                     if getattr(self, "_dsa_main_owner", True):
-                        main_lists = self._build_dsa_transfer_lists(
-                            self._dsa_main_local_layout,
-                            remote_base_addrs,
-                            remote_strides,
-                            remote_scales,
-                            remote_lens,
-                            source.main_block_ids,
-                            command.main_host_block_ids,
+                        result_kind, failure_phase = self._dsa_gather_main_unified_view(
+                            command,
+                            source,
+                            is_cancelled=is_cancelled,
                         )
                     else:
-                        # The runner-owned Host pool is shared by Decode TP
-                        # ranks. Only TP0 writes Main KV; peers pull Indexer
-                        # into their rank-local HBM and observe the same DRAM.
-                        main_lists = ([], [], [])
-                    if logger.isEnabledFor(logging.INFO):
-                        self._log_dsa_transfer_phase_diag(
-                            phase="MAIN_D2RH",
-                            command=command,
-                            local_layout=self._dsa_main_local_layout,
-                            remote_base_addrs=remote_base_addrs,
-                            remote_strides=remote_strides,
-                            remote_scales=remote_scales,
-                            remote_lens=remote_lens,
-                            source_block_ids=source.main_block_ids,
-                            destination_block_ids=command.main_host_block_ids,
-                            transfer_lists=main_lists,
-                        )
-                    if (
-                        main_lists[0]
-                        and self.engine.batch_transfer_sync_read(
-                            session_id, *main_lists
-                        )
-                        < 0
-                    ):
-                        result_kind = DsaLocalResultKind.TRANSFER_FAILED
-                        failure_phase = DsaTransferPhase.MAIN_D2RH
-                        logger.error(
-                            "blockwise_dsa_transfer_failed phase=MAIN_D2RH request_id=%s "
-                            "session=%s n_entries=%s src_ids=%s dst_ids=%s "
-                            "sample_local=%s sample_remote=%s sample_len=%s",
-                            command.request_id,
-                            session_id,
-                            len(main_lists[0]),
-                            source.main_block_ids[:8],
-                            command.main_host_block_ids[:8],
-                            main_lists[0][:4],
-                            main_lists[1][:4],
-                            main_lists[2][:4],
-                        )
-                    else:
-                        self._log_dsa_destination_checksums(
-                            phase="MAIN_D2RH",
-                            command=command,
-                            source_block_ids=source.main_block_ids,
-                            destination_block_ids=command.main_host_block_ids,
-                            remote_scales=remote_scales,
-                            remote_lens=remote_lens,
-                        )
+                        # Shared Host pool: only TP0 writes Main; peers observe DRAM.
                         result_kind = DsaLocalResultKind.RECEIVE_COMPLETE
         finally:
             self._send_done_recv_signal(
@@ -1249,6 +1298,104 @@ class KVCacheRecvingThread(threading.Thread):
             )
         )
         on_result(result)
+
+    def _dsa_gather_main_unified_view(
+        self,
+        command: DsaStepRequest,
+        source: RemoteSource,
+        *,
+        is_cancelled: Any,
+    ) -> tuple[DsaLocalResultKind, DsaTransferPhase | None]:
+        """Pull Prefill-CP Main shards into the unified Host view (TP0 owner)."""
+        remote_cp_size = source.remote_dcp_size * source.remote_pcp_size
+        prefill_tp_size = len(source.endpoints_by_prefill_rank)
+        n_written = 0
+        last_handshake = None
+        for cp_rank in range(remote_cp_size):
+            if is_cancelled is not None and is_cancelled():
+                return DsaLocalResultKind.RECEIVE_COMPLETE, None
+            prefill_rank = prefill_rank_for_cp_rank(
+                cp_rank,
+                prefill_tp_size=prefill_tp_size,
+                remote_cp_size=remote_cp_size,
+                remote_pcp_size=source.remote_pcp_size,
+            )
+            endpoint = source.endpoints_by_prefill_rank[prefill_rank]
+            (
+                remote_base_addrs,
+                remote_strides,
+                remote_scales,
+                remote_lens,
+                session_id,
+            ) = self._dsa_load_remote_handshake(endpoint)
+            main_lists = self._build_dsa_unified_main_lists(
+                self._dsa_main_local_layout,
+                remote_base_addrs,
+                remote_strides,
+                remote_scales,
+                remote_lens,
+                source.main_block_ids,
+                command.main_host_block_ids,
+                cp_rank=cp_rank,
+                remote_cp_size=remote_cp_size,
+            )
+            if logger.isEnabledFor(logging.INFO):
+                self._log_dsa_transfer_phase_diag(
+                    phase=f"MAIN_D2RH/cp{cp_rank}",
+                    command=command,
+                    local_layout=self._dsa_main_local_layout,
+                    remote_base_addrs=remote_base_addrs,
+                    remote_strides=remote_strides,
+                    remote_scales=remote_scales,
+                    remote_lens=remote_lens,
+                    source_block_ids=source.main_block_ids,
+                    destination_block_ids=command.main_host_block_ids,
+                    transfer_lists=main_lists,
+                )
+            if main_lists[0] and self.engine.batch_transfer_sync_read(session_id, *main_lists) < 0:
+                logger.error(
+                    "blockwise_dsa_transfer_failed phase=MAIN_D2RH request_id=%s "
+                    "cp_rank=%s/%s session=%s n_entries=%s src_ids=%s dst_ids=%s "
+                    "sample_local=%s sample_remote=%s sample_len=%s",
+                    command.request_id,
+                    cp_rank,
+                    remote_cp_size,
+                    session_id,
+                    len(main_lists[0]),
+                    source.main_block_ids[:8],
+                    command.main_host_block_ids[:8],
+                    main_lists[0][:4],
+                    main_lists[1][:4],
+                    main_lists[2][:4],
+                )
+                return DsaLocalResultKind.TRANSFER_FAILED, DsaTransferPhase.MAIN_D2RH
+            n_written += len(main_lists[0])
+            last_handshake = (remote_scales, remote_lens)
+        if n_written <= 0:
+            raise ValueError(
+                "DSA unified Main gather produced no Host writes: "
+                f"request_id={command.request_id!r} remote_cp={remote_cp_size} "
+                f"n_src={len(source.main_block_ids)} n_dst={len(command.main_host_block_ids)}"
+            )
+        logger.info(
+            "blockwise_dsa_unified_view MAIN_D2RH request_id=%s remote_cp=%s "
+            "n_src_ids=%s n_dst_ids=%s n_entries_total=%s",
+            command.request_id,
+            remote_cp_size,
+            len(source.main_block_ids),
+            len(command.main_host_block_ids),
+            n_written,
+        )
+        if last_handshake is not None:
+            self._log_dsa_destination_checksums(
+                phase="MAIN_D2RH",
+                command=command,
+                source_block_ids=source.main_block_ids,
+                destination_block_ids=command.main_host_block_ids,
+                remote_scales=last_handshake[0],
+                remote_lens=last_handshake[1],
+            )
+        return DsaLocalResultKind.RECEIVE_COMPLETE, None
 
     def _handle_dsa_request(self, request_data: dict[str, Any]) -> None:
         on_result = request_data["dsa_on_result"]
@@ -2176,6 +2323,12 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
             range(vllm_config.parallel_config.tensor_parallel_size)
         )
 
+    def _dcp_size(self) -> int:
+        return max(int(self.vllm_config.parallel_config.decode_context_parallel_size or 1), 1)
+
+    def _pcp_size(self) -> int:
+        return max(int(self.vllm_config.parallel_config.prefill_context_parallel_size or 1), 1)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -2209,6 +2362,8 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
             ),
             indexer_block_ids=remote_groups[0],
             main_block_ids=remote_groups[0] if len(remote_groups) == 1 else remote_groups[-1],
+            remote_dcp_size=int(params.get("remote_dcp_size", 1) or 1),
+            remote_pcp_size=int(params.get("remote_pcp_size", 1) or 1),
         )
         self._dsa_requests[request.request_id] = _DsaSchedulerRequest(
             request=request,
@@ -2237,11 +2392,19 @@ class _MooncakeDsaDecodeScheduler(SFAPDCpuOffloadScheduler):
         indexer_block_ids = groups[self.indexer_group_idx]
         if not indexer_block_ids:
             raise ValueError("Indexer destination block IDs must not be empty")
-        bound_tokens = tracker.num_computed_tokens + num_external_tokens
-        bound_blocks = cdiv(bound_tokens, self._main_block_size)
+        bound_tokens = tracker.num_computed_tokens + tracker.num_external_tokens
+        bound_blocks = host_pages_for_tokens(
+            bound_tokens, host_page_tokens=self._main_block_size
+        )
         main_block_ids = groups[self.main_group_idx]
         if bound_blocks > len(main_block_ids):
-            raise ValueError("vLLM has not allocated enough Main Host blocks")
+            raise ValueError(
+                "vLLM has not allocated enough Main Host blocks: "
+                f"need={bound_blocks} got={len(main_block_ids)} "
+                f"bound_tokens={bound_tokens} host_page={self._main_block_size} "
+                f"dcp={self._dcp_size()} pcp={self._pcp_size()} "
+                f"reported_external={num_external_tokens}"
+            )
         tracker.indexer_hbm_block_ids = indexer_block_ids
         tracker.main_block_ids = main_block_ids[:bound_blocks]
         if isinstance(request.kv_transfer_params, dict):
@@ -2399,9 +2562,16 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             else:
                 dcp_size = vllm_config.parallel_config.decode_context_parallel_size
                 pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+                # UNIFIED_VIEW: Host pool is always a DCP=1 linear token view.
+                # Prefill DCP shards are gathered in MAIN_D2RH (see
+                # mooncake_dsa_unified_view). Decode DCP>1 fused_overlap must
+                # address that same view; do not refuse consumer init here.
                 if dcp_size * pcp_size != 1:
-                    raise ValueError(
-                        f"Blockwise DSA Decode requires DCP * PCP == 1, got DCP={dcp_size}, PCP={pcp_size}."
+                    logger.warning(
+                        "Blockwise DSA Decode DCP=%s PCP=%s: Host pool uses "
+                        "unified DCP=1 view; MAIN_D2RH gathers Prefill CP shards.",
+                        dcp_size,
+                        pcp_size,
                     )
                 if not decode_offload.enabled:
                     raise ValueError(
@@ -3712,6 +3882,9 @@ class MooncakeConnectorWorker:
                 ) = dsa_local_layouts
                 self.kv_recv_thread._dsa_main_owner = (
                     self._pending_runner_host_pool.is_owner
+                )
+                self.kv_recv_thread._dsa_host_block_tokens = (
+                    self._pending_runner_host_pool.layout.block_size
                 )
             self.kv_recv_thread.start()
         start_wait_time = time.time()

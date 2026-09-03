@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
     _is_deepseek_v4_kv_cache_spec,
@@ -101,6 +102,7 @@ def _make_vllm_config(
     dcp: int,
     pcp: int,
     block_size: int = 16,
+    additional_config=None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -111,6 +113,7 @@ def _make_vllm_config(
             decode_context_parallel_size=dcp,
             prefill_context_parallel_size=pcp,
         ),
+        additional_config=additional_config if additional_config is not None else {},
     )
 
 
@@ -215,6 +218,97 @@ def test_get_effective_block_size(
     assert coordinator._get_effective_block_size(spec_factory()) == expected
 
 
+def test_get_effective_block_size_host_spec_skips_cp() -> None:
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=8,
+        pcp_world_size=1,
+        enable_caching=True,
+    )
+    host_spec = SimpleNamespace(block_size=64, store_on_host=True)
+    device_spec = SimpleNamespace(block_size=64, store_on_host=False)
+    assert coordinator._get_effective_block_size(host_spec) == 64
+    assert coordinator._get_effective_block_size(device_spec) == 512
+
+
+def test_get_effective_block_size_follows_unscaled_scheduler() -> None:
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=8,
+        pcp_world_size=1,
+        enable_caching=True,
+    )
+    coordinator.scheduler_block_size = 64
+    device_spec = SimpleNamespace(block_size=64, store_on_host=False)
+    assert coordinator._get_effective_block_size(device_spec) == 64
+
+
+def _make_host_device_kv_cache_config(*, block_size: int) -> KVCacheConfig:
+    host_spec = AscendMLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        store_on_host=True,
+    )
+    device_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    return KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[
+            KVCacheTensor(size=host_spec.page_size_bytes * 32, shared_by=["main"]),
+            KVCacheTensor(size=device_spec.page_size_bytes * 32, shared_by=["indexer"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["indexer.k"], kv_cache_spec=device_spec),
+            KVCacheGroupSpec(layer_names=["mla"], kv_cache_spec=host_spec),
+        ],
+    )
+
+
+def test_resolve_kv_cache_block_sizes_host_group_skips_cp() -> None:
+    kv_cache_config = _make_host_device_kv_cache_config(block_size=64)
+    vllm_config = _make_vllm_config(
+        enable_prefix_caching=False,
+        dcp=8,
+        pcp=1,
+        block_size=64,
+    )
+    scheduler_block_size, hash_block_size = _ascend_resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+    assert scheduler_block_size == 64
+    assert hash_block_size == 64
+
+
+def test_resolve_kv_cache_block_sizes_device_hybrid_still_scales_cp() -> None:
+    kv_cache_config = _make_hybrid_kv_cache_config(full_block_size=16, mamba_block_size=16)
+    vllm_config = _make_vllm_config(enable_prefix_caching=False, dcp=8, pcp=1)
+    scheduler_block_size, _ = _ascend_resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+    assert scheduler_block_size == 16 * 8
+
+
+def test_resolve_kv_cache_block_sizes_decode_offload_config_skips_cp() -> None:
+    kv_cache_config = _make_hybrid_kv_cache_config(full_block_size=16, mamba_block_size=16)
+    vllm_config = _make_vllm_config(
+        enable_prefix_caching=False,
+        dcp=8,
+        pcp=1,
+        additional_config={"kv_offload_decode_config": {"enabled": True}},
+    )
+    scheduler_block_size, _ = _ascend_resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+    assert scheduler_block_size == 16
+
+
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:
     sentinel = object()
     kv_cache_config = _make_hybrid_kv_cache_config(full_block_size=16, mamba_block_size=16)
@@ -245,6 +339,88 @@ def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:
     )
 
     assert coordinator is sentinel
+
+
+def test_get_kv_cache_coordinator_unitary_unscaled_host_pages_drops_dcp(monkeypatch) -> None:
+    captured = {}
+    spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * 32, shared_by=["mla"])],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["mla"], kv_cache_spec=spec)],
+    )
+
+    def _fake_orig(*args, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "vllm_ascend.patch.platform.patch_kv_cache_coordinator._orig_get_kv_cache_coordinator",
+        _fake_orig,
+    )
+
+    get_kv_cache_coordinator(
+        kv_cache_config,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=8,
+        pcp_world_size=1,
+        hash_block_size=128,
+        scheduler_block_size=128,
+    )
+
+    assert captured["dcp_world_size"] == 1
+    assert captured["pcp_world_size"] == 1
+    assert captured["scheduler_block_size"] == 128
+    assert captured["hash_block_size"] == 128
+
+
+def test_get_kv_cache_coordinator_unitary_scaled_scheduler_keeps_dcp(monkeypatch) -> None:
+    captured = {}
+    spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * 32, shared_by=["mla"])],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["mla"], kv_cache_spec=spec)],
+    )
+
+    def _fake_orig(*args, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "vllm_ascend.patch.platform.patch_kv_cache_coordinator._orig_get_kv_cache_coordinator",
+        _fake_orig,
+    )
+
+    get_kv_cache_coordinator(
+        kv_cache_config,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=8,
+        pcp_world_size=1,
+        hash_block_size=128,
+        scheduler_block_size=1024,
+    )
+
+    assert captured["dcp_world_size"] == 8
+    assert captured["pcp_world_size"] == 1
 
 
 def test_get_kv_cache_coordinator_delegates_hybrid_without_caching(monkeypatch) -> None:
