@@ -3942,6 +3942,10 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config,
                 self.sparse_kv_offload_config,
             )
+            self.sparse_kv_offload_manager.prepare_host_kv_allocation(
+                device_id=torch_npu.npu.current_device(),
+                dp_rank=int(self.dp_rank),
+            )
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         if (
@@ -3983,6 +3987,16 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def shutdown(self) -> None:
+        parent_shutdown = getattr(super(), "shutdown", None)
+        try:
+            if callable(parent_shutdown):
+                parent_shutdown()
+        finally:
+            manager = getattr(self, "sparse_kv_offload_manager", None)
+            if manager is not None:
+                manager.close()
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
@@ -4333,6 +4347,7 @@ class NPUModelRunner(GPUModelRunner):
                             self.tp_rank,
                             self.sparse_kv_offload_config.keep_device_kv_cache,
                             self._allocate_int8_cache_tensor,
+                            self.sparse_kv_offload_manager.allocate_host_kv_tensors,
                         )
                         assert len(kv_cache_tensor.shared_by) == 1, "Sparse KV offload do not support HMA."
                         kv_cache_raw_tensors[layer_name] = raw_tensors
