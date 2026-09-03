@@ -120,7 +120,11 @@ def model_uses_sfa_sparse(model_config: Any | None) -> bool:
 
 
 def kv_offload_decode_enabled(vllm_config: VllmConfig | None = None) -> bool:
-    """True when Decode fused Host offload is configured for this engine."""
+    """True when Decode fused Host offload is configured for this engine.
+
+    Config-parse helper only. Do not use this as the sole layout signal; see
+    ``fused_sfa_host_offload_decode_enabled``.
+    """
     if vllm_config is None:
         try:
             from vllm.config import get_current_vllm_config
@@ -134,10 +138,52 @@ def kv_offload_decode_enabled(vllm_config: VllmConfig | None = None) -> bool:
         if isinstance(cfg, dict):
             return bool(cfg.get("enabled"))
         return bool(getattr(cfg, "enabled", False))
+    if additional is not None and not isinstance(additional, dict):
+        cfg = getattr(additional, "kv_offload_decode_config", None)
+        if cfg is not None:
+            if isinstance(cfg, dict):
+                return bool(cfg.get("enabled"))
+            return bool(getattr(cfg, "enabled", False))
     try:
         return bool(get_ascend_config().kv_offload_decode_config.enabled)
     except Exception:
         return False
+
+
+def is_pd_decode_kv_consumer(vllm_config: VllmConfig | None = None) -> bool:
+    """True when this worker's KV role is PD Decode consumer, not producer."""
+    if vllm_config is None:
+        return False
+    kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_cfg is None:
+        return False
+    role = getattr(kv_cfg, "kv_role", None)
+    if role:
+        return role == "kv_consumer"
+    return bool(getattr(kv_cfg, "is_kv_consumer", False)) and not bool(
+        getattr(kv_cfg, "is_kv_producer", False)
+    )
+
+
+def fused_sfa_host_offload_decode_enabled(vllm_config: VllmConfig | None = None) -> bool:
+    """Decode consumer + fused Host offload + SFA sparse.
+
+    Layout-adjacent capability used to turn off DCP-replicated Indexer packing.
+    Not a group addressing enum; Phase B replaces bools with KVCacheAddressingLayout.
+    DSA-CP remains unsupported.
+    """
+    if vllm_config is None:
+        try:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+        except Exception:
+            return False
+    if not kv_offload_decode_enabled(vllm_config):
+        return False
+    if not is_pd_decode_kv_consumer(vllm_config):
+        return False
+    return model_uses_sfa_sparse(getattr(vllm_config, "model_config", None))
 
 
 def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:
@@ -146,12 +192,14 @@ def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> 
 
         vllm_config = get_current_vllm_config()
 
-    # Fused offload Decode uses Host-global Main pages + a device Indexer group.
-    # Packing Indexer rows by runtime DCP (×8) inflates page_size_bytes, so the
-    # shared num_blocks pool is NPU-capped around 426 while a 64k unified-view
-    # request needs 513 Host ids. The offload attention impl is not the DCP
-    # replicated-indexer kernel, so the 8× HBM packing is wasted.
-    if kv_offload_decode_enabled(vllm_config):
+    # Fused Host-offload Decode uses Host-global Main pages + a device Indexer
+    # sibling. Packing Indexer rows by runtime DCP (×8) inflates page_size_bytes,
+    # so the shared num_blocks pool is NPU-capped around 426 while a 64k
+    # unified-view request needs 513 Host ids. The offload attention impl is
+    # not the DCP replicated-indexer kernel, so the 8× HBM packing is wasted.
+    # Only Decode consumer + fused offload + SFA takes this path; Prefill /
+    # producer keep the original DCP replicated Indexer.
+    if fused_sfa_host_offload_decode_enabled(vllm_config):
         return False
 
     parallel_config = vllm_config.parallel_config

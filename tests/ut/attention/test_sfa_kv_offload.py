@@ -126,8 +126,8 @@ def test_kv_offload_memory_plan_keep_device_counts_full_npu_page():
     assert budget.limiting_factor == "npu"
 
 
-def test_kv_offload_memory_plan_fat_indexer_can_starve_64k_host_pages():
-    """DCP-replicated Indexer pages cap the shared pool below one 64k Host request."""
+def test_kv_offload_memory_plan_fat_indexer_is_rejected_below_one_host_request():
+    """DCP-replicated Indexer pages would cap the shared pool below one Host request."""
     specs = {
         "host.0": _FakeKVCacheSpec(
             page_size_bytes=1024,
@@ -142,22 +142,46 @@ def test_kv_offload_memory_plan_fat_indexer_can_starve_64k_host_pages():
     }
     vllm_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=32))
     alignment_reserve = offload_manager_module._CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
-    budget = plan_kv_offload_decode_memory(
-        kv_cache_spec=specs,
-        vllm_config=vllm_config,
-        available_device_memory_bytes=426 * 8192,
-        dram_limit_bytes=alignment_reserve + 1432 * 1024,
-        keep_device_kv_cache=False,
-    )
-    assert budget.npu_limit_blocks == 426
-    assert budget.dram_limit_blocks == 1432
-    assert budget.final_num_blocks == 426
-    assert budget.limiting_factor == "npu"
-    assert budget.final_num_blocks < 513
+    with pytest.raises(ValueError, match=r"need=513 Host pages, have=426"):
+        plan_kv_offload_decode_memory(
+            kv_cache_spec=specs,
+            vllm_config=vllm_config,
+            available_device_memory_bytes=426 * 8192,
+            dram_limit_bytes=alignment_reserve + 1432 * 1024,
+            keep_device_kv_cache=False,
+        )
+
+
+def test_kv_offload_memory_plan_rejects_pool_below_max_model_len_pages():
+    """DCP=8, max_len=131072, page=128 => required=1024; NPU pool 426 must fail-fast."""
+    specs = {
+        "host.0": _FakeKVCacheSpec(
+            page_size_bytes=1024,
+            max_blocks_per_request=1024,
+            store_on_host=True,
+            block_size=128,
+        ),
+        "device.0": _FakeKVCacheSpec(
+            page_size_bytes=8192,
+            max_blocks_per_request=128,
+            store_on_host=False,
+            block_size=128,
+        ),
+    }
+    vllm_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=32))
+    alignment_reserve = offload_manager_module._CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
+    with pytest.raises(ValueError, match=r"need=1024 Host pages, have=426"):
+        plan_kv_offload_decode_memory(
+            kv_cache_spec=specs,
+            vllm_config=vllm_config,
+            available_device_memory_bytes=426 * 8192,
+            dram_limit_bytes=alignment_reserve + 1432 * 1024,
+            keep_device_kv_cache=False,
+        )
 
 
 def test_kv_offload_memory_plan_skinny_indexer_covers_64k_host_pages():
-    """Offload Decode without DCP Indexer packing: NPU no longer binds below 513."""
+    """Offload Decode without DCP Indexer packing: NPU no longer binds below 1024."""
     specs = {
         "host.0": _FakeKVCacheSpec(
             page_size_bytes=1024,
@@ -183,7 +207,7 @@ def test_kv_offload_memory_plan_skinny_indexer_covers_64k_host_pages():
     assert budget.dram_limit_blocks == 1432
     assert budget.final_num_blocks == 1432
     assert budget.limiting_factor == "dram"
-    assert budget.final_num_blocks >= 513
+    assert budget.final_num_blocks >= 1024
 
 
 def test_kv_offload_cpu_pool_size_includes_per_layer_alignment_reserve():

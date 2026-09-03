@@ -163,6 +163,7 @@ def plan_kv_offload_decode_memory(
     }
     limiting_factor = min(limits, key=limits.get)
     final_num_blocks = limits[limiting_factor]
+    host_page_tokens = min((int(spec.block_size) for spec in host_specs), default=0)
     host_pages_for_max_len = max(
         (
             cdiv(
@@ -173,16 +174,22 @@ def plan_kv_offload_decode_memory(
         ),
         default=0,
     )
+    logger.info(
+        "KVPOOL layout=UNIFIED_HOST_MAIN host_page_tokens=%s required_blocks=%s "
+        "npu=%s dram=%s workload=%s final_blocks=%s limiting=%s",
+        host_page_tokens,
+        host_pages_for_max_len,
+        npu_limit_blocks,
+        dram_limit_blocks,
+        workload_limit_blocks,
+        final_num_blocks,
+        limiting_factor,
+    )
     if host_pages_for_max_len > final_num_blocks:
-        logger.error(
+        raise ValueError(
             "KV offload Host pool cannot cover one max_model_len request: "
-            "need=%s Host pages, have=%s blocks (%s-limited). Sequences "
-            "longer than the pool will stall in WAITING and never start DSA "
-            "pull (observed at 64k when DCP-replicated Indexer capped the "
-            "shared pool at ~426).",
-            host_pages_for_max_len,
-            final_num_blocks,
-            limiting_factor,
+            f"need={host_pages_for_max_len} Host pages, have={final_num_blocks} "
+            f"blocks ({limiting_factor}-limited)."
         )
     final_planner_bytes = final_num_blocks * total_page_size_bytes
     planned_host_bytes = final_num_blocks * host_page_size_bytes

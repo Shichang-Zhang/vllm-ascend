@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
-from collections.abc import Mapping
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
@@ -21,7 +20,10 @@ from vllm.v1.kv_cache_interface import (
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 
 
-from vllm_ascend.core.kv_cache_interface import kv_cache_spec_uses_unified_host_view
+from vllm_ascend.core.kv_cache_interface import (
+    kv_cache_groups_share_unified_scheduler_pages,
+    kv_cache_spec_uses_unified_host_view,
+)
 
 
 def _kv_spec_store_on_host(kv_cache_spec: KVCacheSpec) -> bool:
@@ -30,29 +32,20 @@ def _kv_spec_store_on_host(kv_cache_spec: KVCacheSpec) -> bool:
 
 
 def _vllm_config_host_offload_enabled(vllm_config: VllmConfig) -> bool:
-    """Decode fused offload is configured on the engine, not only on specs.
+    """Engine-level fused offload flag; delegates to the single config helper.
 
     EngineCore may wrap Main+Indexer in one UniformType group whose outer spec
     has no ``store_on_host``. Live 8/8 still allocated ``cdiv(tokens, page*dcp)``
     ids until we also honor ``additional_config.kv_offload_decode_config``.
     Prefill does not set that flag, so it keeps ``lcm * dcp * pcp``.
     """
-    additional = getattr(vllm_config, "additional_config", None)
-    if additional is None:
-        return False
-    if isinstance(additional, Mapping):
-        cfg = additional.get("kv_offload_decode_config")
-    else:
-        cfg = getattr(additional, "kv_offload_decode_config", None)
-    if cfg is None:
-        return False
-    if isinstance(cfg, Mapping):
-        return bool(cfg.get("enabled"))
-    return bool(getattr(cfg, "enabled", False))
+    from vllm_ascend.utils import kv_offload_decode_enabled
+
+    return kv_offload_decode_enabled(vllm_config)
 
 
 def _groups_use_unified_host_pages(groups) -> bool:
-    return any(_kv_spec_store_on_host(g.kv_cache_spec) for g in groups)
+    return kv_cache_groups_share_unified_scheduler_pages(groups)
 
 
 def _ascend_resolve_kv_cache_block_sizes(
