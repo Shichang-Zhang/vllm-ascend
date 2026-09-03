@@ -119,11 +119,40 @@ def model_uses_sfa_sparse(model_config: Any | None) -> bool:
     )
 
 
+def kv_offload_decode_enabled(vllm_config: VllmConfig | None = None) -> bool:
+    """True when Decode fused Host offload is configured for this engine."""
+    if vllm_config is None:
+        try:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+        except Exception:
+            vllm_config = None
+    additional = getattr(vllm_config, "additional_config", None) if vllm_config is not None else None
+    if isinstance(additional, dict) and "kv_offload_decode_config" in additional:
+        cfg = additional.get("kv_offload_decode_config") or {}
+        if isinstance(cfg, dict):
+            return bool(cfg.get("enabled"))
+        return bool(getattr(cfg, "enabled", False))
+    try:
+        return bool(get_ascend_config().kv_offload_decode_config.enabled)
+    except Exception:
+        return False
+
+
 def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:
     if vllm_config is None:
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
+
+    # Fused offload Decode uses Host-global Main pages + a device Indexer group.
+    # Packing Indexer rows by runtime DCP (×8) inflates page_size_bytes, so the
+    # shared num_blocks pool is NPU-capped around 426 while a 64k unified-view
+    # request needs 513 Host ids. The offload attention impl is not the DCP
+    # replicated-indexer kernel, so the 8× HBM packing is wasted.
+    if kv_offload_decode_enabled(vllm_config):
+        return False
 
     parallel_config = vllm_config.parallel_config
     return (

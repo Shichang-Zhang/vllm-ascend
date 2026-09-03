@@ -630,6 +630,21 @@ class BalanceScheduler(Scheduler):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if load_kv_async:
+                        logged = getattr(self, "_logged_remote_kv_alloc_fail", None)
+                        if logged is None:
+                            logged = set()
+                            self._logged_remote_kv_alloc_fail = logged
+                        if request_id not in logged:
+                            logged.add(request_id)
+                            logger.error(
+                                "Unable to allocate KV slots for remote-prefill "
+                                "request %s (external_tokens=%s). If the Host "
+                                "pool is smaller than this sequence, DSA pull "
+                                "will never start and the request will stall.",
+                                request_id,
+                                num_external_computed_tokens,
+                            )
                     break
 
                 # KVTransfer: the connector uses this info to determine

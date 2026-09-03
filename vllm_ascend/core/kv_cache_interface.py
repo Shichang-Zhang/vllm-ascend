@@ -86,12 +86,15 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
-        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
-        # Note(hc): each dcp rank only need save
-        # (max_model_len//dcp_world_size) tokens locally.
-        if dcp_world_size * pcp_world_size > 1:
-            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+        # Device-local MLA still shards by runtime CP. Unified Host pages are a
+        # storage-CP=1 global view: dividing by DCP under-sizes the Decode Host
+        # pool (e.g. 426 pages) so a 64k request that needs 513 global pages
+        # livelocks in allocate_slots instead of starting the DSA pull.
+        if not self.store_on_host:
+            dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+            pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+            if dcp_world_size * pcp_world_size > 1:
+                max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
         return cdiv(max_model_len, self.block_size * self.compress_ratio) * self.page_size_bytes
 
 
