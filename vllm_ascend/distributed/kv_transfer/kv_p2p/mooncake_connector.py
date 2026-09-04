@@ -99,6 +99,7 @@ from .mooncake_dsa_metadata import (
     RemoteSource,
 )
 from .mooncake_dsa_unified_view import (
+    decode_tp_owned_cp_ranks,
     host_pages_for_tokens,
     prefill_rank_for_cp_rank,
     tokens_per_page,
@@ -1277,7 +1278,7 @@ class KVCacheRecvingThread(threading.Thread):
                             is_cancelled=is_cancelled,
                         )
                     else:
-                        # Shared Host pool: only TP0 writes Main; peers observe DRAM.
+                        # Tests / ranks without a Host layout skip Main writes.
                         result_kind = DsaLocalResultKind.RECEIVE_COMPLETE
         finally:
             self._send_done_recv_signal(
@@ -1306,12 +1307,29 @@ class KVCacheRecvingThread(threading.Thread):
         *,
         is_cancelled: Any,
     ) -> tuple[DsaLocalResultKind, DsaTransferPhase | None]:
-        """Pull Prefill-CP Main shards into the unified Host view (TP0 owner)."""
+        """Pull this Decode TP's Prefill-CP Main shards into the shared Host view."""
         remote_cp_size = source.remote_dcp_size * source.remote_pcp_size
         prefill_tp_size = len(source.endpoints_by_prefill_rank)
+        owned_cp_ranks = decode_tp_owned_cp_ranks(
+            self.tp_rank,
+            decode_tp_size=self.tp_size,
+            prefill_tp_size=prefill_tp_size,
+            remote_cp_size=remote_cp_size,
+            remote_pcp_size=source.remote_pcp_size,
+        )
+        if not owned_cp_ranks:
+            logger.info(
+                "blockwise_dsa_unified_view MAIN_D2RH skip request_id=%s "
+                "tp=%s/%s remote_cp=%s owned_cp=()",
+                command.request_id,
+                self.tp_rank,
+                self.tp_size,
+                remote_cp_size,
+            )
+            return DsaLocalResultKind.RECEIVE_COMPLETE, None
         n_written = 0
         last_handshake = None
-        for cp_rank in range(remote_cp_size):
+        for cp_rank in owned_cp_ranks:
             if is_cancelled is not None and is_cancelled():
                 return DsaLocalResultKind.RECEIVE_COMPLETE, None
             prefill_rank = prefill_rank_for_cp_rank(
@@ -1371,17 +1389,14 @@ class KVCacheRecvingThread(threading.Thread):
                 return DsaLocalResultKind.TRANSFER_FAILED, DsaTransferPhase.MAIN_D2RH
             n_written += len(main_lists[0])
             last_handshake = (remote_scales, remote_lens)
-        if n_written <= 0:
-            raise ValueError(
-                "DSA unified Main gather produced no Host writes: "
-                f"request_id={command.request_id!r} remote_cp={remote_cp_size} "
-                f"n_src={len(source.main_block_ids)} n_dst={len(command.main_host_block_ids)}"
-            )
         logger.info(
-            "blockwise_dsa_unified_view MAIN_D2RH request_id=%s remote_cp=%s "
-            "n_src_ids=%s n_dst_ids=%s n_entries_total=%s",
+            "blockwise_dsa_unified_view MAIN_D2RH request_id=%s tp=%s/%s "
+            "remote_cp=%s owned_cp=%s n_src_ids=%s n_dst_ids=%s n_entries_total=%s",
             command.request_id,
+            self.tp_rank,
+            self.tp_size,
             remote_cp_size,
+            owned_cp_ranks,
             len(source.main_block_ids),
             len(command.main_host_block_ids),
             n_written,
@@ -3646,21 +3661,23 @@ class MooncakeConnectorWorker:
         if not any(indexer_layout):
             raise ValueError("Blockwise DSA Decode has no Indexer cache")
 
-        if pool.is_owner:
-            for offload_layer_id, layer_name in enumerate(
-                self.decode_manager.offload_layer_names
-            ):
-                layer_idx = layer_name_to_idx[layer_name]
-                host_k = pool.k_caches[offload_layer_id]
-                host_v = pool.v_caches[offload_layer_id]
-                main_debug_tensors[layer_idx] = [host_k, host_v]
-                main_layout[layer_idx].extend(
-                    (
-                        tensor_entry(0, host_k, require_exact_capacity=True),
-                        tensor_entry(1, host_v, require_exact_capacity=True),
-                    )
+        # Every Decode TP maps the shared Host segment; each writes disjoint
+        # CP shards into that view. TE dest registration happens in
+        # pool.register, not only on the owner rank.
+        for offload_layer_id, layer_name in enumerate(
+            self.decode_manager.offload_layer_names
+        ):
+            layer_idx = layer_name_to_idx[layer_name]
+            host_k = pool.k_caches[offload_layer_id]
+            host_v = pool.v_caches[offload_layer_id]
+            main_debug_tensors[layer_idx] = [host_k, host_v]
+            main_layout[layer_idx].extend(
+                (
+                    tensor_entry(0, host_k, require_exact_capacity=True),
+                    tensor_entry(1, host_v, require_exact_capacity=True),
                 )
-                host_tensors.extend((host_k, host_v))
+            )
+            host_tensors.extend((host_k, host_v))
 
         host_regions = RegisterRegions(
             ptrs=[tensor.data_ptr() for tensor in host_tensors],
@@ -3691,8 +3708,7 @@ class MooncakeConnectorWorker:
                 )
             if pool.topology.tp_rank != self.tp_rank:
                 raise RuntimeError("DSA Host pool TP rank does not match worker")
-            if pool.is_owner:
-                pool.register(self.engine)
+            pool.register(self.engine)
 
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
@@ -3800,9 +3816,10 @@ class MooncakeConnectorWorker:
             host_n = len(host_regions.ptrs)
             logger.info(
                 "Blockwise DSA Decode TE register: device_regions=%s "
-                "shared_host_regions=%s main_owner=%s",
+                "shared_host_regions=%s main_writer=%s pool_owner=%s",
                 device_n,
                 host_n,
+                any(main_layout),
                 self._pending_runner_host_pool.is_owner,
             )
 
@@ -3880,8 +3897,8 @@ class MooncakeConnectorWorker:
                     self.kv_recv_thread._dsa_indexer_debug_tensors,
                     self.kv_recv_thread._dsa_main_debug_tensors,
                 ) = dsa_local_layouts
-                self.kv_recv_thread._dsa_main_owner = (
-                    self._pending_runner_host_pool.is_owner
+                self.kv_recv_thread._dsa_main_owner = any(
+                    self.kv_recv_thread._dsa_main_local_layout
                 )
                 self.kv_recv_thread._dsa_host_block_tokens = (
                     self._pending_runner_host_pool.layout.block_size

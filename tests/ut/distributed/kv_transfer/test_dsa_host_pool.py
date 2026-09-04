@@ -197,7 +197,7 @@ class TestDSAHostKVPool(unittest.TestCase):
         )
         self.assertEqual(lifecycle, [("release", "segment")])
 
-    def test_non_owner_maps_views_but_cannot_register(self):
+    def test_non_owner_maps_views_and_registers_local_te(self):
         layout = self._layout()
         topology = HOST_POOL.DSAHostPoolTopology(
             tp_rank=1,
@@ -207,15 +207,20 @@ class TestDSAHostKVPool(unittest.TestCase):
         pool = HOST_POOL.DSAHostKVPool(
             layout,
             HOST_POOL.DSAHostMemoryRegion(
-                tensor=_Tensor(layout.total_numel, 0x600000)
+                tensor=_Tensor(layout.total_numel, 0x600000),
+                register_location="npu:1",
             ),
             topology,
         )
+        engine = _Engine()
 
         self.assertFalse(pool.is_owner)
         self.assertEqual(len(pool.k_caches), layout.num_layers)
-        with self.assertRaisesRegex(RuntimeError, "only the owner rank"):
-            pool.register(_Engine())
+        pool.register(engine)
+        self.assertEqual(
+            engine.calls,
+            [("register", pool.data_ptr, pool.nbytes, "npu:1")],
+        )
 
     def test_failed_construction_releases_region(self):
         layout = self._layout()

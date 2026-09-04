@@ -17,13 +17,14 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_metadata import (
 )
 
 
-@pytest.mark.parametrize("main_owner", [True, False])
-def test_blockwise_receive_writes_shared_main_only_on_owner(main_owner):
+@pytest.mark.parametrize("main_writer", [True, False])
+def test_blockwise_receive_writes_main_when_layout_present(main_writer):
     thread = object.__new__(KVCacheRecvingThread)
     thread.tp_rank = 0
-    thread._dsa_main_owner = main_owner
+    thread.tp_size = 1
+    thread._dsa_main_owner = main_writer
     thread._dsa_indexer_local_layout = [[(0, 100, 8, 8, 1)]]
-    thread._dsa_main_local_layout = [[(0, 200, 8, 8, 1)]] if main_owner else [[]]
+    thread._dsa_main_local_layout = [[(0, 200, 8, 8, 1)]] if main_writer else [[]]
     thread.remote_metadata_lock = MagicMock()
     thread.kv_caches_base_addr = {"prefill": {5000: [[1000]]}}
     thread.remote_metadata_hosts = {"prefill": {5000: "10.0.0.1"}}
@@ -34,6 +35,13 @@ def test_blockwise_receive_writes_shared_main_only_on_owner(main_owner):
     thread._get_remote_metadata = MagicMock()
     thread._send_done_recv_signal = MagicMock()
     thread._log_dsa_transfer_phase_diag = MagicMock()
+    thread._log_dsa_destination_checksums = MagicMock()
+    thread._dsa_load_remote_handshake = MagicMock(
+        return_value=([[1000]], [[8]], [[1]], [[8]], "10.0.0.1:6000")
+    )
+    thread._build_dsa_unified_main_lists = MagicMock(
+        return_value=([2], [12], [8])
+    )
 
     calls = []
     thread.engine = SimpleNamespace(
@@ -43,9 +51,7 @@ def test_blockwise_receive_writes_shared_main_only_on_owner(main_owner):
         or 0
     )
     thread._build_dsa_transfer_lists = MagicMock(
-        side_effect=[([1], [11], [8]), ([2], [12], [8])]
-        if main_owner
-        else [([1], [11], [8])]
+        return_value=([1], [11], [8])
     )
 
     endpoint = RemoteEndpoint("10.0.0.1", 5000, "prefill")
@@ -59,13 +65,16 @@ def test_blockwise_receive_writes_shared_main_only_on_owner(main_owner):
 
     thread._execute_dsa_receive(command, endpoint, results.append)
 
-    assert len(calls) == (2 if main_owner else 1)
+    assert len(calls) == (2 if main_writer else 1)
     assert results[0].kind is DsaLocalResultKind.RECEIVE_COMPLETE
     thread._send_done_recv_signal.assert_called_once()
+    if main_writer:
+        thread._build_dsa_unified_main_lists.assert_called_once()
+    else:
+        thread._build_dsa_unified_main_lists.assert_not_called()
 
 
-@pytest.mark.parametrize("main_owner", [True, False])
-def test_local_layout_uses_shared_pool_only_on_owner(main_owner):
+def test_local_layout_uses_shared_pool_on_every_tp():
     worker = object.__new__(MooncakeConnectorWorker)
     worker.num_blocks = 4
     worker.kv_caches_base_addr = [[], []]
@@ -75,7 +84,7 @@ def test_local_layout_uses_shared_pool_only_on_owner(main_owner):
     host_k = torch.empty((4, 1, 2), dtype=torch.bfloat16)
     host_v = torch.empty((4, 1, 2), dtype=torch.bfloat16)
     worker._pending_runner_host_pool = SimpleNamespace(
-        is_owner=main_owner,
+        is_owner=False,
         k_caches=[host_k],
         v_caches=[host_v],
     )
@@ -92,9 +101,5 @@ def test_local_layout_uses_shared_pool_only_on_owner(main_owner):
 
     assert len(indexer_layout[1]) == 1
     assert indexer_layout[1][0][0] == 0
-    if main_owner:
-        assert [entry[0] for entry in main_layout[0]] == [0, 1]
-        assert host_regions.logical_tensor_count == 2
-    else:
-        assert not any(main_layout)
-        assert host_regions.logical_tensor_count == 0
+    assert [entry[0] for entry in main_layout[0]] == [0, 1]
+    assert host_regions.logical_tensor_count == 2

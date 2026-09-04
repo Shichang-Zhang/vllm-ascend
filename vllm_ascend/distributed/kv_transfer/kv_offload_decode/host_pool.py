@@ -401,14 +401,14 @@ class DSAHostKVPool:
                     )
 
     def register(self, engine: Any) -> None:
-        """Register the complete contiguous pool with the transfer engine."""
+        """Register the locally mapped pool VA with this process's TE.
+
+        Owner creates the shared segment; every Decode TP maps it. Each
+        process has its own TransferEngine, so every rank must register
+        the local VA before MAIN_D2RH can write disjoint Host pages.
+        """
         if self._closed:
             raise RuntimeError("cannot register a closed DSA Host pool")
-        if not self.is_owner:
-            raise RuntimeError(
-                "only the owner rank may register the DSA Host pool: "
-                f"rank={self.topology.tp_rank}, owner={self.topology.owner_rank}"
-            )
         if self._registered_engine is engine:
             return
         if self._registered_engine is not None:

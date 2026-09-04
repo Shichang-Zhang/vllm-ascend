@@ -4,6 +4,7 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_unified_view import (
     cp_local_page_to_unified_index,
+    decode_tp_owned_cp_ranks,
     host_pages_for_tokens,
     prefill_rank_for_cp_rank,
     tokens_per_page,
@@ -66,6 +67,35 @@ def test_prefill_rank_mla_tp_equals_dcp() -> None:
                 rank, prefill_tp_size=8, remote_cp_size=8
             )
             == rank
+        )
+
+
+def test_decode_tp_owns_matching_cp_when_p_tp_equals_d_tp() -> None:
+    for tp in range(8):
+        assert decode_tp_owned_cp_ranks(
+            tp,
+            decode_tp_size=8,
+            prefill_tp_size=8,
+            remote_cp_size=8,
+        ) == (tp,)
+
+
+def test_decode_tp0_gathers_all_cp_when_p8_d1() -> None:
+    assert decode_tp_owned_cp_ranks(
+        0,
+        decode_tp_size=1,
+        prefill_tp_size=8,
+        remote_cp_size=8,
+    ) == tuple(range(8))
+
+
+def test_decode_tp_owned_cp_rejects_bad_rank() -> None:
+    with pytest.raises(ValueError, match="decode_tp_rank out of range"):
+        decode_tp_owned_cp_ranks(
+            8,
+            decode_tp_size=8,
+            prefill_tp_size=8,
+            remote_cp_size=8,
         )
 
 

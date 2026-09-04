@@ -12,7 +12,9 @@ that Host view so:
   contiguous Host block.
 * P DCP=1 / D DCP=1: identity (``dest_index=src_index``, offset 0).
 
-Indexer stays rank-local D2D; only Main (Host pool, TP0 owner) uses this view.
+Indexer stays rank-local D2D. Main uses this view: after Host pages
+are allocated, each Decode TP writes the CP shards it owns (disjoint
+Host token ranges) through the shared pool.
 """
 
 from __future__ import annotations
@@ -51,6 +53,51 @@ def prefill_rank_for_cp_rank(
             f"cp_rank out of range: rank={cp_rank}, remote_cp_size={remote_cp_size}"
         )
     return cp_rank
+
+
+def decode_tp_owned_cp_ranks(
+    decode_tp_rank: int,
+    *,
+    decode_tp_size: int,
+    prefill_tp_size: int,
+    remote_cp_size: int,
+    remote_pcp_size: int = 1,
+) -> tuple[int, ...]:
+    """CP ranks this Decode TP should MAIN_D2RH into the shared Host pool.
+
+    Prefill CP ``r`` lives on Prefill TP ``prefill_rank_for_cp_rank(r)``.
+    Decode TP ``i`` owns Prefill ranks ``[i * stride, (i + 1) * stride)``
+    where ``stride = prefill_tp_size // decode_tp_size`` (same pairing as
+    Indexer D2D ``leader_rank``). Live 1P1D P_tp=D_tp=DCP=8 is TP_i ↔ cp_i;
+    P8/D1 keeps Decode TP0 gathering every CP.
+    """
+    if decode_tp_size <= 0:
+        raise ValueError(f"decode_tp_size must be positive, got {decode_tp_size}")
+    if decode_tp_rank < 0 or decode_tp_rank >= decode_tp_size:
+        raise ValueError(
+            f"decode_tp_rank out of range: rank={decode_tp_rank}, "
+            f"decode_tp_size={decode_tp_size}"
+        )
+    if prefill_tp_size <= 0:
+        raise ValueError(f"prefill_tp_size must be positive, got {prefill_tp_size}")
+    if prefill_tp_size % decode_tp_size != 0:
+        raise ValueError(
+            "prefill TP must be a multiple of decode TP: "
+            f"P_tp={prefill_tp_size} D_tp={decode_tp_size}"
+        )
+    stride = prefill_tp_size // decode_tp_size
+    leader = decode_tp_rank * stride
+    owned = []
+    for cp_rank in range(remote_cp_size):
+        prefill_rank = prefill_rank_for_cp_rank(
+            cp_rank,
+            prefill_tp_size=prefill_tp_size,
+            remote_cp_size=remote_cp_size,
+            remote_pcp_size=remote_pcp_size,
+        )
+        if leader <= prefill_rank < leader + stride:
+            owned.append(cp_rank)
+    return tuple(owned)
 
 
 def unified_host_slot(
