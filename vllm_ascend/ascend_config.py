@@ -1271,12 +1271,6 @@ class SparseKVOffloadConfig:
                     "sparse_kv_offload_config.host_backend='mooncake' "
                     "requires use_fused_overlap=true"
                 )
-            if self.keep_device_kv_cache:
-                raise ValueError(
-                    "sparse_kv_offload_config.host_backend='mooncake' is "
-                    "only supported for PD-disaggregated decode; "
-                    "keep_device_kv_cache must be false"
-                )
         return self
 
     @classmethod

@@ -688,17 +688,14 @@ class TestSparseKVOffloadConfig(TestBase):
                 {"enabled": "true", "host_backend": "mooncake"},
             )
 
-    def test_mooncake_host_backend_rejects_colocate_staging(self):
-        with self.assertRaisesRegex(ValueError, "keep_device_kv_cache"):
-            SparseKVOffloadConfig.from_additional_config(
-                SimpleNamespace(),
-                {
-                    "enabled": "true",
-                    "host_backend": "mooncake",
-                    "use_fused_overlap": "true",
-                    "keep_device_kv_cache": "true",
-                },
-            )
+    def test_mooncake_host_backend_allows_colocate_staging(self):
+        config = SparseKVOffloadConfig(
+            enabled=True,
+            host_backend="mooncake",
+            use_fused_overlap=True,
+            keep_device_kv_cache=True,
+        )
+        self.assertTrue(config.keep_device_kv_cache)
 
     def test_unknown_key_is_rejected_even_when_disabled(self):
         with self.assertRaises(ValueError):
