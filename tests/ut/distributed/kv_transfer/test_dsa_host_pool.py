@@ -104,11 +104,16 @@ HOST_POOL = _load_host_pool_module()
 
 class _Engine:
 
-    def __init__(self):
+    def __init__(self, *, fail_register_call=None):
         self.calls = []
+        self.fail_register_call = fail_register_call
+        self.register_calls = 0
 
     def register_memory(self, ptr, size, location=None):
         self.calls.append(("register", ptr, size, location))
+        self.register_calls += 1
+        if self.register_calls == self.fail_register_call:
+            return -1
         return 0
 
     def unregister_memory(self, ptr):
@@ -167,6 +172,95 @@ class TestDSAHostKVPool(unittest.TestCase):
         self.assertEqual(
             layout.v_stride_numel * BFLOAT16.itemsize % layout.alignment,
             0,
+        )
+
+    def test_glm_pool_te_registration_splits_at_layer_boundary(self):
+        layout = HOST_POOL.DSAHostKVPoolLayout(
+            layer_names=tuple(f"layer.{i}" for i in range(79)),
+            num_blocks=8806,
+            block_size=128,
+        )
+        layer_bytes = 1_300_234_240
+        first_size = 52 * layer_bytes
+        second_size = 27 * layer_bytes
+
+        self.assertEqual(layout.layer_stride_nbytes, layer_bytes)
+        self.assertEqual(
+            layout.te_registration_ranges,
+            ((0, first_size), (first_size, second_size)),
+        )
+        self.assertLess(
+            first_size,
+            HOST_POOL.DSA_HOST_TE_REGISTRATION_LIMIT_BYTES,
+        )
+        self.assertGreaterEqual(
+            first_size + layer_bytes,
+            HOST_POOL.DSA_HOST_TE_REGISTRATION_LIMIT_BYTES,
+        )
+        self.assertLess(
+            second_size,
+            HOST_POOL.DSA_HOST_TE_REGISTRATION_LIMIT_BYTES,
+        )
+
+        pool = HOST_POOL.DSAHostKVPool(
+            layout,
+            HOST_POOL.DSAHostMemoryRegion(
+                tensor=_Tensor(layout.total_numel, 0x400000),
+                register_location="npu:0",
+            ),
+        )
+        engine = _Engine()
+
+        pool.register(engine)
+        pool.unregister()
+
+        self.assertEqual(
+            engine.calls,
+            [
+                ("register", pool.data_ptr, first_size, "npu:0"),
+                (
+                    "register",
+                    pool.data_ptr + first_size,
+                    second_size,
+                    "npu:0",
+                ),
+                ("unregister", pool.data_ptr + first_size),
+                ("unregister", pool.data_ptr),
+            ],
+        )
+
+    def test_split_registration_failure_rolls_back_prior_regions(self):
+        layout = HOST_POOL.DSAHostKVPoolLayout(
+            layer_names=tuple(f"layer.{i}" for i in range(79)),
+            num_blocks=8806,
+            block_size=128,
+        )
+        pool = HOST_POOL.DSAHostKVPool(
+            layout,
+            HOST_POOL.DSAHostMemoryRegion(
+                tensor=_Tensor(layout.total_numel, 0x400000),
+                register_location="npu:0",
+            ),
+        )
+        engine = _Engine(fail_register_call=2)
+        first_size = layout.te_registration_ranges[0][1]
+
+        with self.assertRaisesRegex(RuntimeError, "register_memory failed"):
+            pool.register(engine)
+
+        self.assertFalse(pool.is_registered)
+        self.assertEqual(
+            engine.calls,
+            [
+                ("register", pool.data_ptr, first_size, "npu:0"),
+                (
+                    "register",
+                    pool.data_ptr + first_size,
+                    layout.te_registration_ranges[1][1],
+                    "npu:0",
+                ),
+                ("unregister", pool.data_ptr),
+            ],
         )
 
     def test_register_once_then_unregister_before_release(self):

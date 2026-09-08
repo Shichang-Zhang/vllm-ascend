@@ -16,6 +16,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 DSA_HOST_POOL_ALIGNMENT = 2 * 1024 * 1024
+DSA_HOST_TE_REGISTRATION_LIMIT_BYTES = 64 * 1024 * 1024 * 1024
 DSA_MAIN_K_WIDTH = 512
 DSA_MAIN_V_WIDTH = 64
 
@@ -134,6 +135,40 @@ class DSAHostKVPoolLayout:
         return self.total_numel * self.dtype.itemsize
 
     @property
+    def layer_stride_nbytes(self) -> int:
+        return self.layer_stride_numel * self.dtype.itemsize
+
+    @property
+    def te_registration_ranges(self) -> tuple[tuple[int, int], ...]:
+        """Return ``(offset, size)`` ranges that keep every layer intact.
+
+        HIXL registers these NPU-visible addresses as device memory and
+        treats 64 GiB as an exclusive upper bound for every individual region.
+        All layers in this pool have the same aligned K/V stride, so the
+        maximum number of layers per region can be computed directly.
+        """
+        max_layers = (
+            DSA_HOST_TE_REGISTRATION_LIMIT_BYTES - 1
+        ) // self.layer_stride_nbytes
+        if max_layers <= 0:
+            raise ValueError(
+                "One DSA Host KV layer exceeds the TE registration limit: "
+                f"layer_bytes={self.layer_stride_nbytes}, "
+                f"limit={DSA_HOST_TE_REGISTRATION_LIMIT_BYTES}"
+            )
+
+        ranges: list[tuple[int, int]] = []
+        for first_layer in range(0, self.num_layers, max_layers):
+            layer_count = min(max_layers, self.num_layers - first_layer)
+            ranges.append(
+                (
+                    first_layer * self.layer_stride_nbytes,
+                    layer_count * self.layer_stride_nbytes,
+                )
+            )
+        return tuple(ranges)
+
+    @property
     def fingerprint(self) -> str:
         payload = {
             "version": 1,
@@ -205,8 +240,9 @@ def _select_shared_segment_mode() -> tuple[bool, bool]:
             "Mooncake shared_segment support is required for the DSA Host pool"
         ) from exc
 
-    if shared_segment_supported(mmap=False):
-        return False, False
+    # Temporarily force the PR #3952 mmap + HostRegister path for RoCE.
+    # if shared_segment_supported(mmap=False):
+    #     return False, False
     if shared_segment_supported(mmap=True, host_register=True):
         return True, True
     raise RuntimeError(
@@ -303,6 +339,7 @@ class DSAHostKVPool:
         self.region = region
         self.topology = topology or DSAHostPoolTopology()
         self._registered_engine: Any = None
+        self._registered_ranges: list[tuple[int, int]] = []
         self._closed = False
         self._validate_region()
 
@@ -401,12 +438,7 @@ class DSAHostKVPool:
                     )
 
     def register(self, engine: Any) -> None:
-        """Register the locally mapped pool VA with this process's TE.
-
-        Owner creates the shared segment; every Decode TP maps it. Each
-        process has its own TransferEngine, so every rank must register
-        the local VA before MAIN_D2RH can write disjoint Host pages.
-        """
+        """Register the mapped pool with TE in layer-aligned subregions."""
         if self._closed:
             raise RuntimeError("cannot register a closed DSA Host pool")
         if self._registered_engine is engine:
@@ -416,48 +448,108 @@ class DSAHostKVPool:
                 "DSA Host pool is already registered with another engine"
             )
 
+        ranges = tuple(
+            (self.data_ptr + offset, size)
+            for offset, size in self.layout.te_registration_ranges
+        )
+        logger.info(
+            "Registering DSA Host pool with TE: ptr=0x%x bytes=%s "
+            "regions=%s limit=%s",
+            self.data_ptr,
+            self.nbytes,
+            len(ranges),
+            DSA_HOST_TE_REGISTRATION_LIMIT_BYTES,
+        )
+
+        registered: list[tuple[int, int]] = []
+        try:
+            for index, (ptr, size) in enumerate(ranges):
+                self._register_te_range(engine, ptr, size)
+                registered.append((ptr, size))
+                logger.info(
+                    "Registered DSA Host TE region %s/%s: ptr=0x%x bytes=%s",
+                    index + 1,
+                    len(ranges),
+                    ptr,
+                    size,
+                )
+        except Exception:
+            rollback_failed: list[tuple[int, int]] = []
+            for ptr, size in reversed(registered):
+                try:
+                    self._unregister_te_range(engine, ptr, size)
+                except Exception:
+                    rollback_failed.append((ptr, size))
+                    logger.exception(
+                        "Failed to roll back DSA Host TE region: "
+                        "ptr=0x%x bytes=%s",
+                        ptr,
+                        size,
+                    )
+            if rollback_failed:
+                self._registered_engine = engine
+                self._registered_ranges = list(reversed(rollback_failed))
+            raise
+
+        self._registered_ranges = registered
+        self._registered_engine = engine
+
+    def _register_te_range(self, engine: Any, ptr: int, size: int) -> None:
         location = self.region.register_location
         if location is None:
-            result = engine.register_memory(self.data_ptr, self.nbytes)
+            result = engine.register_memory(ptr, size)
         else:
             try:
                 result = engine.register_memory(
-                    self.data_ptr,
-                    self.nbytes,
+                    ptr,
+                    size,
                     location=location,
                 )
             except TypeError:
-                result = engine.register_memory(
-                    self.data_ptr,
-                    self.nbytes,
-                    location,
-                )
+                result = engine.register_memory(ptr, size, location)
         if result not in (0, None):
             raise RuntimeError(
-                "Mooncake register_memory failed for DSA Host pool: "
-                f"result={result}, ptr=0x{self.data_ptr:x}, "
-                f"size={self.nbytes}, location={location}"
+                "Mooncake register_memory failed for DSA Host pool region: "
+                f"result={result}, ptr=0x{ptr:x}, size={size}, "
+                f"location={location}"
             )
-        self._registered_engine = engine
 
-    def unregister(self) -> None:
-        if self._registered_engine is None:
-            return
-        engine = self._registered_engine
+    @staticmethod
+    def _unregister_te_range(engine: Any, ptr: int, size: int) -> None:
         unregister_memory = getattr(engine, "unregister_memory", None)
         if unregister_memory is None:
             raise RuntimeError(
                 "Mooncake engine must unregister the DSA Host pool before release"
             )
         try:
-            result = unregister_memory(self.data_ptr)
+            result = unregister_memory(ptr)
         except TypeError:
-            result = unregister_memory(self.data_ptr, self.nbytes)
+            result = unregister_memory(ptr, size)
         if result not in (0, None):
             raise RuntimeError(
-                "Mooncake unregister_memory failed for DSA Host pool: "
-                f"result={result}, ptr=0x{self.data_ptr:x}"
+                "Mooncake unregister_memory failed for DSA Host pool region: "
+                f"result={result}, ptr=0x{ptr:x}, size={size}"
             )
+
+    def unregister(self) -> None:
+        if self._registered_engine is None:
+            return
+        engine = self._registered_engine
+        failed: list[tuple[int, int]] = []
+        first_error: Exception | None = None
+        for ptr, size in reversed(self._registered_ranges):
+            try:
+                self._unregister_te_range(engine, ptr, size)
+            except Exception as exc:
+                failed.append((ptr, size))
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            self._registered_ranges = list(reversed(failed))
+            raise RuntimeError(
+                "Failed to unregister one or more DSA Host TE regions"
+            ) from first_error
+        self._registered_ranges.clear()
         self._registered_engine = None
 
     def close(self) -> None:
