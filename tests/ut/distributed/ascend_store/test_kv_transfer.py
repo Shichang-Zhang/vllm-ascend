@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import torch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -50,6 +51,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreSendingThread,
     KVTransferThread,
     _mark_last_transfer_tasks,
+    _trace_store_batch,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer import (
     LayerTransferArrayBuilder,
@@ -130,6 +132,50 @@ class MaskedFakeTokenDatabase(FakeTokenDatabase):
             return True
         block_idx = start // self.block_size
         return block_idx < len(masks[kv_cache_group_id]) and masks[kv_cache_group_id][block_idx]
+
+
+class TestStoreIntegrityTrace(unittest.TestCase):
+    def test_logs_full_metadata_result_and_checksum(self):
+        db = FakeTokenDatabase(block_size=2)
+        db.metadata = [KeyMetadata("model", 0, 0, 3, 0)]
+        db.trace_dp_rank = 1
+        db.trace_group_tensors = {
+            0: {
+                7: [(torch.tensor([[1.0, -2.0], [3.0, -4.0]]), 1)],
+            }
+        }
+
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer."
+                "ascend_envs.VLLM_ASCEND_SFA_DEBUG",
+                True,
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.logger.info"
+            ) as log_info,
+        ):
+            _trace_store_batch(
+                phase="GET_DEST",
+                request_id="req-1",
+                tp_rank=3,
+                token_database=db,
+                keys=["complete-key"],
+                addrs=[[0x1000]],
+                sizes=[[4]],
+                block_ids=[1],
+                group_ids=[0],
+                results=[0],
+            )
+
+        args = log_info.call_args.args
+        self.assertEqual(args[1:13], ("GET_DEST", "req-1", 1, 3, 0, 3, 0, 0, 0, 0, 1, 0))
+        self.assertEqual(args[13], "complete-key")
+        self.assertEqual(args[14:18], (1, 1, 1, 4))
+        self.assertEqual(args[18], ["0x1000"])
+        self.assertEqual(args[19], [4])
+        self.assertIn("layer=7,pos=0,physical=1", args[20])
+        self.assertIn("abs_sum=7", args[20])
 
 
 class TestLayerTransferArrayBuilderCompactGvas(unittest.TestCase):

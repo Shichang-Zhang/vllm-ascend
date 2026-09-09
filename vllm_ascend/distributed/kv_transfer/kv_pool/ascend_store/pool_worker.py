@@ -56,6 +56,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreSendingThread,
     KVTransferThread,
     _circular_shift,
+    _trace_store_batch,
     record_failed_blocks,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
@@ -283,6 +284,11 @@ class KVPoolWorker:
         self.token_database = ChunkedTokenDatabase(
             self.metadata, self.grouped_block_size, partitions, self.use_hybrid, self.hash_block_size
         )
+        # Debug-only metadata consumed by the integrity tracer in
+        # kv_transfer.py.  Keep it on the token database because the
+        # asynchronous Store threads already own that object.
+        self.token_database.trace_dp_rank = self.dp_rank
+        self.token_database.trace_group_tensors = {}
         self.cache_coordinator = self._build_cache_coordinator(vllm_config)
         self.token_database.set_cache_coordinator(self.cache_coordinator)
 
@@ -690,6 +696,7 @@ class KVPoolWorker:
         group_addrs: list[int] = []
         group_block_lens: list[int] = []
         group_block_strides: list[int] = []
+        group_debug_tensors: dict[int, list[tuple[torch.Tensor, int]]] = {}
         layer_names_by_physical: dict[int, list[str]] = {}
         for layer_name in layer_names:
             phys = self._extract_physical_layer_index(layer_name)
@@ -714,16 +721,18 @@ class KVPoolWorker:
                 cache_or_caches = self.kv_caches[layer_name]
                 for cache in self._as_cache_tuple(cache_or_caches):
                     base_addr = cache.data_ptr()
-                    block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+                    block_len, block_stride, _, block_size_scale = self._get_cache_block_metadata(cache)
                     group_addrs.append(base_addr)
                     group_block_lens.append(block_len)
                     group_block_strides.append(block_stride)
+                    group_debug_tensors.setdefault(phys, []).append((cache, block_size_scale))
             layer_offsets.append(len(group_addrs))
         self.group_kv_caches_base_addr[group_id] = group_addrs
         self.group_block_len[group_id] = group_block_lens
         self.group_block_stride[group_id] = group_block_strides
         self.group_layer_offsets[group_id] = layer_offsets
         self.group_num_layers[group_id] = len(layer_names_by_physical)
+        self.token_database.trace_group_tensors[group_id] = group_debug_tensors
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
         """
@@ -930,6 +939,7 @@ class KVPoolWorker:
             size_list = []
             key_list = []
             block_id_list: list[int] = []
+            key_group_id_list: list[int] = []
             load_masks = self.token_database.load_mask(request.block_hashes, token_len)
             for group_id in load_group_ids:
                 if group_id >= len(request.block_ids_by_group):
@@ -959,12 +969,14 @@ class KVPoolWorker:
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
+                    key_group_id_list.append(group_id)
             if not key_list:
                 continue
             key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
             addr_list_c = _circular_shift(addr_list, self.tp_rank % len(addr_list))
             size_list_c = _circular_shift(size_list, self.tp_rank % len(size_list))
             block_id_list_c = _circular_shift(block_id_list, self.tp_rank % len(block_id_list))
+            key_group_id_list_c = _circular_shift(key_group_id_list, self.tp_rank % len(key_group_id_list))
             logger.debug(
                 "KV pool worker calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
                 request.req_id,
@@ -974,6 +986,18 @@ class KVPoolWorker:
                 key_list_c[:3],
             )
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            _trace_store_batch(
+                phase="GET_DEST",
+                request_id=request.req_id,
+                tp_rank=self.tp_rank,
+                token_database=self.token_database,
+                keys=key_list_c,
+                addrs=addr_list_c,
+                sizes=size_list_c,
+                block_ids=block_id_list_c,
+                group_ids=key_group_id_list_c,
+                results=ret,
+            )
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,

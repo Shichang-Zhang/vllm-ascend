@@ -195,7 +195,8 @@ class MooncakeBackend(Backend):
                 config.preferred_segment = self.local_seg
             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
             res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
-            failed_codes = [int(value) for value in res if value < 0]
+            res_list = list(res)
+            failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
                 error_codes = sorted(set(failed_codes))
@@ -205,9 +206,10 @@ class MooncakeBackend(Backend):
                     len(keys),
                     error_codes,
                 )
-                logger.debug("Failed to put key details. keys=%s, result=%s", keys, res)
+                logger.debug("Failed to put key details. keys=%s, result=%s", keys, res_list)
                 if self._lazy_init:
                     logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
+            return res_list
         except Exception as e:
             logger.error(
                 "Failed to put %d keys out of %d. Check store state and memory.",
@@ -222,6 +224,7 @@ class MooncakeBackend(Backend):
             )
             if self._lazy_init:
                 logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
+            return None
 
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         if self._lazy_init and not self._store_initialized:

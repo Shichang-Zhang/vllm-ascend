@@ -49,6 +49,81 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.attn_backend = backend
         return runner
 
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    @patch("vllm_ascend.worker.model_runner_v1.logger")
+    @patch("vllm_ascend.worker.model_runner_v1.envs_ascend.VLLM_ASCEND_SFA_DEBUG", True)
+    def test_trace_prefill_attention_metadata_covers_baseline_and_continuation(
+        self,
+        mock_logger,
+        mock_get_pp_group,
+    ):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.dp_rank = 1
+        runner.tp_rank = 2
+        runner.pcp_rank = 0
+        runner.dcp_rank = 2
+        runner.query_start_loc = SimpleNamespace(
+            np=np.array([0, 2, 4], dtype=np.int32),
+            gpu=torch.tensor([0, 2, 4], dtype=torch.int32),
+        )
+        runner.num_computed_tokens = torch.tensor([0, 2048], dtype=torch.int32)
+        runner.num_scheduled_tokens = SimpleNamespace(
+            gpu=torch.tensor([2, 2], dtype=torch.int32)
+        )
+        runner.seq_lens = torch.tensor([2, 2050], dtype=torch.int32)
+        runner.positions = torch.tensor([0, 1, 2048, 2049], dtype=torch.int64)
+
+        block_table = SimpleNamespace(
+            is_mamba_group=False,
+            num_blocks_per_row=np.array([3, 3], dtype=np.int32),
+            get_numpy_array=lambda: np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32),
+            get_device_tensor=lambda: torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32),
+            slot_mapping=SimpleNamespace(
+                gpu=torch.tensor([128, -1, 384, -1], dtype=torch.int32)
+            ),
+            storage_layout="device_local_cp",
+            uses_unified_host_view=False,
+            physical_block_size=128,
+            block_size=128,
+            blocks_per_phys_block=1,
+            cp_kv_cache_interleave_size=1,
+        )
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.array([0, 2048], dtype=np.int32),
+            num_prompt_tokens=np.array([2734, 2734], dtype=np.int32),
+            req_ids=["baseline", "continuation"],
+            block_table=SimpleNamespace(block_tables=[block_table]),
+        )
+        mock_get_pp_group.return_value = SimpleNamespace(rank_in_group=0)
+
+        runner._trace_prefill_attention_metadata(
+            num_reqs=2,
+            total_num_scheduled_tokens=4,
+            num_scheduled_tokens=np.array([2, 2], dtype=np.int32),
+            positions_np=np.array([0, 1, 2048, 2049], dtype=np.int64),
+        )
+
+        request_calls = [
+            log_call
+            for log_call in mock_logger.info.call_args_list
+            if "record=REQUEST" in log_call.args[0]
+        ]
+        self.assertEqual(
+            [(log_call.args[1], log_call.args[8]) for log_call in request_calls],
+            [("baseline", False), ("continuation", True)],
+        )
+        group_calls = [
+            log_call
+            for log_call in mock_logger.info.call_args_list
+            if "record=KV_GROUP" in log_call.args[0]
+        ]
+        self.assertEqual(len(group_calls), 2)
+        continuation_group = group_calls[1]
+        self.assertEqual(continuation_group.args[16], [4, 5, 6])
+        self.assertEqual(continuation_group.args[17], [4, 5, 6])
+        self.assertEqual(continuation_group.args[18], [384, -1])
+        self.assertEqual(continuation_group.args[21], [(2048, 384)])
+
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
         kv_cache_spec = FullAttentionSpec(

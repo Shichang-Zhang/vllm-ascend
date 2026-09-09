@@ -16,6 +16,7 @@ from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 
 # isort: off
@@ -44,6 +45,110 @@ def _circular_shift(lst: list, offset: int) -> list:
     if not lst or offset == 0:
         return lst
     return lst[offset:] + lst[:offset]
+
+
+def _trace_store_batch(
+    *,
+    phase: str,
+    request_id: str,
+    tp_rank: int,
+    token_database: ChunkedTokenDatabase,
+    keys: list[str],
+    addrs: list[list[int]],
+    sizes: list[list[int]],
+    block_ids: list[int],
+    group_ids: list[int],
+    results: Any = None,
+    include_payload: bool = True,
+) -> None:
+    """Log rank-aware Store metadata and lightweight NPU KV fingerprints.
+
+    This deliberately runs only under the existing SFA debug switch.  The
+    checksum reads the first and last physical layer in each cache group and
+    therefore introduces NPU synchronization; it is diagnostic, not a hot-path
+    production metric.
+    """
+    if not ascend_envs.VLLM_ASCEND_SFA_DEBUG:
+        return
+
+    raw_results = getattr(results, "raw_results", results)
+    trace_dp_rank = getattr(token_database, "trace_dp_rank", -1)
+    trace_group_tensors = getattr(token_database, "trace_group_tensors", {})
+    for key_index, key in enumerate(keys):
+        group_id = group_ids[key_index] if key_index < len(group_ids) else 0
+        block_id = block_ids[key_index] if key_index < len(block_ids) else -1
+        key_addrs = addrs[key_index] if key_index < len(addrs) else []
+        key_sizes = sizes[key_index] if key_index < len(sizes) else []
+        result = None
+        if raw_results is not None:
+            try:
+                result = raw_results[key_index]
+            except (IndexError, TypeError):
+                result = raw_results
+
+        metadata = token_database.metadata[group_id]
+        checksum_parts: list[str] = []
+        if include_payload:
+            try:
+                layer_tensors = trace_group_tensors.get(group_id, {})
+                layer_ids = sorted(layer_tensors)
+                selected_layer_ids = layer_ids[:1]
+                if len(layer_ids) > 1:
+                    selected_layer_ids.append(layer_ids[-1])
+                for layer_id in selected_layer_ids:
+                    for position, (tensor, block_size_scale) in enumerate(layer_tensors[layer_id]):
+                        if tensor.device.type == "npu":
+                            # NPU device selection is thread-local. Store put/get
+                            # diagnostics may run in background transfer threads.
+                            torch.npu.set_device(tensor.device)
+                        first_physical_block = block_id * block_size_scale
+                        last_physical_block = first_physical_block + block_size_scale
+                        for physical_block in range(first_physical_block, last_physical_block):
+                            values = tensor[physical_block].detach().float()
+                            abs_values = values.abs()
+                            stats = torch.stack((abs_values.mean(), abs_values.sum())).cpu().tolist()
+                            checksum_parts.append(
+                                f"layer={layer_id},pos={position},physical={physical_block},"
+                                f"abs_mean={stats[0]:.9g},abs_sum={stats[1]:.9g},numel={values.numel()}"
+                            )
+            except Exception:
+                logger.warning(
+                    "kv_integrity_trace checksum_failed phase=%s request_id=%s key_index=%s key=%s",
+                    phase,
+                    request_id,
+                    key_index,
+                    key,
+                    exc_info=True,
+                )
+                checksum_parts = ["ERROR"]
+
+        logger.info(
+            "kv_integrity_trace component=ASCEND_STORE phase=%s request_id=%s "
+            "rank=(dp=%s,tp=%s,pcp=%s,dcp=%s,head_or_tp=%s,pp=%s) "
+            "group=%s key_index=%s block_id=%s result=%s key=%s "
+            "buffer_count=%s addr_count=%s size_count=%s total_bytes=%s "
+            "addrs=%s sizes=%s checksum=[%s]",
+            phase,
+            request_id,
+            trace_dp_rank,
+            tp_rank,
+            metadata.pcp_rank,
+            metadata.dcp_rank,
+            metadata.head_or_tp_rank,
+            metadata.pp_rank,
+            group_id,
+            key_index,
+            block_id,
+            result,
+            key,
+            min(len(key_addrs), len(key_sizes)),
+            len(key_addrs),
+            len(key_sizes),
+            sum(key_sizes),
+            [hex(addr) for addr in key_addrs],
+            key_sizes,
+            ";".join(checksum_parts) if include_payload else "not-sampled",
+        )
 
 
 def _mark_last_transfer_tasks(layer_tasks: list[list[LayerTransferTask]], operation: str) -> None:
@@ -666,7 +771,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
                 if current_event is not None:
                     current_event.synchronize()
-                self.m_store.put(keys, addrs, sizes)
+                _trace_store_batch(
+                    phase="PUT_SOURCE",
+                    request_id=req_id,
+                    tp_rank=self.tp_rank,
+                    token_database=self.token_database,
+                    keys=keys,
+                    addrs=addrs,
+                    sizes=sizes,
+                    block_ids=key_block_ids,
+                    group_ids=[group_id] * len(keys),
+                )
+                put_results = self.m_store.put(keys, addrs, sizes)
+                _trace_store_batch(
+                    phase="PUT_RESULT",
+                    request_id=req_id,
+                    tp_rank=self.tp_rank,
+                    token_database=self.token_database,
+                    keys=keys,
+                    addrs=addrs,
+                    sizes=sizes,
+                    block_ids=key_block_ids,
+                    group_ids=[group_id] * len(keys),
+                    results=put_results,
+                    include_payload=False,
+                )
 
                 # TODO Query specific replica info to update the event
                 if self.enable_kv_event and stored_events is not None:
@@ -735,6 +864,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             size_list = []
             key_list = []
             block_id_list: list[int] = []
+            key_group_id_list: list[int] = []
             group_ids = req_meta.kv_cache_group_ids or [0]
             load_masks = self._load_mask(req_meta, token_len)
             for group_id in group_ids:
@@ -762,6 +892,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
+                    key_group_id_list.append(group_id)
             if not key_list:
                 self.set_finished_request(req_id)
                 return
@@ -770,6 +901,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
             block_id_list_c = (
                 block_id_list[self.tp_rank % len(block_id_list) :] + block_id_list[: self.tp_rank % len(block_id_list)]
+            )
+            key_group_id_list_c = (
+                key_group_id_list[self.tp_rank % len(key_group_id_list) :]
+                + key_group_id_list[: self.tp_rank % len(key_group_id_list)]
             )
             logger.debug(
                 "KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
@@ -780,6 +915,18 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 key_list_c[:3],
             )
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            _trace_store_batch(
+                phase="GET_DEST",
+                request_id=req_id,
+                tp_rank=self.tp_rank,
+                token_database=self.token_database,
+                keys=key_list_c,
+                addrs=addr_list_c,
+                sizes=size_list_c,
+                block_ids=block_id_list_c,
+                group_ids=key_group_id_list_c,
+                results=ret,
+            )
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,

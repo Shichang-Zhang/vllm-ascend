@@ -429,6 +429,9 @@ class KVCacheSendingThread(threading.Thread):
         ready_event: threading.Event,
         kv_caches: dict[str, Any],
         pcp_rank: int,
+        dp_rank: int = 0,
+        dcp_rank: int = 0,
+        head_or_tp_rank: int = 0,
     ):
         super().__init__(daemon=True, name="KVCacheSendingThread")
         self.tp_rank = tp_rank
@@ -444,6 +447,9 @@ class KVCacheSendingThread(threading.Thread):
         self.ready_event = ready_event
         self.kv_caches = kv_caches
         self.pcp_rank = pcp_rank
+        self.dp_rank = dp_rank
+        self.dcp_rank = dcp_rank
+        self.head_or_tp_rank = head_or_tp_rank
         self.port_send_num: dict[str, int] = {}
 
         self.task_tracker = KVCacheTaskTracker()
@@ -489,30 +495,39 @@ class KVCacheSendingThread(threading.Thread):
                 ("INDEXER_D2D", indexer_block_ids),
                 ("MAIN_D2RH", main_block_ids),
             ):
-                if not logical_block_ids or (phase == "MAIN_D2RH" and self.tp_rank != 0):
+                if not logical_block_ids:
                     continue
                 layout = layouts[phase]
-                logical_block = logical_block_ids[0]
-                for layer_id in _debug_layer_ids(layout):
-                    for position, tensor in enumerate(layout[layer_id]):
-                        scale = self.metadata.block_size_scale[layer_id][position]
-                        physical_block = logical_block * scale
-                        abs_mean, abs_sum, numel = _block_abs_stats(tensor, physical_block)
-                        logger.info(
-                            "blockwise_dsa_checksum side=P phase=%s request_id=%s tp=%s "
-                            "layer=%s position=%s logical_block=%s physical_block=%s "
-                            "abs_mean=%.9g abs_sum=%.9g numel=%s",
-                            phase,
-                            request_id,
-                            self.tp_rank,
-                            layer_id,
-                            position,
-                            logical_block,
-                            physical_block,
-                            abs_mean,
-                            abs_sum,
-                            numel,
-                        )
+                sample_indices = sorted({0, len(logical_block_ids) // 2, len(logical_block_ids) - 1})
+                for block_index in sample_indices:
+                    logical_block = logical_block_ids[block_index]
+                    for layer_id in _debug_layer_ids(layout):
+                        for position, tensor in enumerate(layout[layer_id]):
+                            scale = self.metadata.block_size_scale[layer_id][position]
+                            physical_block = logical_block * scale
+                            abs_mean, abs_sum, numel = _block_abs_stats(tensor, physical_block)
+                            logger.info(
+                                "blockwise_dsa_checksum side=P phase=%s request_id=%s "
+                                "rank=(dp=%s,tp=%s,pcp=%s,dcp=%s,head_or_tp=%s,pp=%s) "
+                                "block_index=%s layer=%s position=%s logical_block=%s physical_block=%s "
+                                "abs_mean=%.9g abs_sum=%.9g numel=%s",
+                                phase,
+                                request_id,
+                                self.dp_rank,
+                                self.tp_rank,
+                                self.pcp_rank,
+                                self.dcp_rank,
+                                self.head_or_tp_rank,
+                                self.pp_rank,
+                                block_index,
+                                layer_id,
+                                position,
+                                logical_block,
+                                physical_block,
+                                abs_mean,
+                                abs_sum,
+                                numel,
+                            )
         except Exception:
             logger.warning(
                 "Failed to compute blockwise DSA Prefill checksum for request %s",
@@ -658,10 +673,20 @@ class KVCacheRecvingThread(threading.Thread):
         prefill_pp_layer_partition: str | None = None,
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] | None = None,
         block_size_scale: list[list[int]] | None = None,
+        dp_rank: int = 0,
+        pcp_rank: int = 0,
+        dcp_rank: int = 0,
+        pp_rank: int = 0,
+        head_or_tp_rank: int = 0,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dp_rank = dp_rank
+        self.pcp_rank = pcp_rank
+        self.dcp_rank = dcp_rank
+        self.pp_rank = pp_rank
+        self.head_or_tp_rank = head_or_tp_rank
         self._prefill_pp_size = _prefill_pp_size
         self.local_engine_id = local_engine_id
         self.local_handshake_port = local_handshake_port
@@ -1081,14 +1106,17 @@ class KVCacheRecvingThread(threading.Thread):
         destination_block_ids: tuple[int, ...],
         transfer_lists: tuple[list[int], list[int], list[int]],
     ) -> None:
-        """One-shot handshake dump per RECEIVE phase for address debugging."""
+        """One handshake dump per request/RECEIVE phase for address debugging."""
+        if not ascend_envs.VLLM_ASCEND_SFA_DEBUG:
+            return
         logged_phases = getattr(self, "_dsa_transfer_diag_logged_phases", None)
         if logged_phases is None:
             logged_phases = set()
             self._dsa_transfer_diag_logged_phases = logged_phases
-        if phase in logged_phases:
+        phase_key = (command.request_id, phase)
+        if phase_key in logged_phases:
             return
-        logged_phases.add(phase)
+        logged_phases.add(phase_key)
         samples: list[str] = []
         for layer_idx, layer_layout in enumerate(local_layout):
             if not layer_layout:
@@ -1118,17 +1146,24 @@ class KVCacheRecvingThread(threading.Thread):
         local_addrs, remote_addrs, lengths = transfer_lists
         logger.info(
             "blockwise_dsa_transfer_diag phase=%s request_id=%s "
+            "rank=(dp=%s,tp=%s,pcp=%s,dcp=%s,head_or_tp=%s,pp=%s) "
             "n_src_ids=%s n_dst_ids=%s n_entries=%s "
-            "src_ids_head=%s dst_ids_head=%s "
+            "src_ids=%s dst_ids=%s "
             "handshake=[%s] "
             "addr_head local=%s remote=%s len=%s",
             phase,
             command.request_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pcp_rank,
+            self.dcp_rank,
+            self.head_or_tp_rank,
+            self.pp_rank,
             len(source_block_ids),
             len(destination_block_ids),
             len(local_addrs),
-            source_block_ids[:8],
-            destination_block_ids[:8],
+            source_block_ids,
+            destination_block_ids,
             " | ".join(samples),
             [hex(x) for x in local_addrs[:3]],
             [hex(x) for x in remote_addrs[:3]],
@@ -1153,45 +1188,55 @@ class KVCacheRecvingThread(threading.Thread):
                 if phase == "INDEXER_D2D"
                 else self._dsa_main_debug_tensors
             )
-            source_block = source_block_ids[0]
-            destination_block = destination_block_ids[0]
-            for layer_id in _debug_layer_ids(layout):
-                for position, tensor in enumerate(layout[layer_id]):
-                    byte_offset = 0
-                    byte_length = None
-                    page_slot = 0
-                    if phase == "INDEXER_D2D":
-                        remote_len = remote_lens[layer_id][position]
-                        local_block_len = tensor.element_size() * math.prod(tensor.shape[1:])
-                        if local_block_len % remote_len:
-                            raise ValueError(
-                                f"local Indexer block length {local_block_len} is not divisible by "
-                                f"remote length {remote_len}"
-                            )
-                        byte_length = remote_len
-                        byte_offset = page_slot * remote_len
-                    abs_mean, abs_sum, numel = _block_abs_stats(
-                        tensor,
-                        destination_block,
-                        byte_offset=byte_offset,
-                        byte_length=byte_length,
-                    )
-                    logger.info(
-                        "blockwise_dsa_checksum side=D phase=%s request_id=%s tp=%s "
-                        "layer=%s position=%s source_block=%s destination_block=%s "
-                        "page_slot=%s abs_mean=%.9g abs_sum=%.9g numel=%s",
-                        phase,
-                        command.request_id,
-                        self.tp_rank,
-                        layer_id,
-                        position,
-                        source_block,
-                        destination_block,
-                        page_slot,
-                        abs_mean,
-                        abs_sum,
-                        numel,
-                    )
+            sample_count = min(len(source_block_ids), len(destination_block_ids))
+            sample_indices = sorted({0, sample_count // 2, sample_count - 1})
+            for block_index in sample_indices:
+                source_block = source_block_ids[block_index]
+                destination_block = destination_block_ids[block_index]
+                for layer_id in _debug_layer_ids(layout):
+                    for position, tensor in enumerate(layout[layer_id]):
+                        byte_offset = 0
+                        byte_length = None
+                        page_slot = 0
+                        if phase == "INDEXER_D2D":
+                            remote_len = remote_lens[layer_id][position]
+                            local_block_len = tensor.element_size() * math.prod(tensor.shape[1:])
+                            if local_block_len % remote_len:
+                                raise ValueError(
+                                    f"local Indexer block length {local_block_len} is not divisible by "
+                                    f"remote length {remote_len}"
+                                )
+                            byte_length = remote_len
+                            byte_offset = page_slot * remote_len
+                        abs_mean, abs_sum, numel = _block_abs_stats(
+                            tensor,
+                            destination_block,
+                            byte_offset=byte_offset,
+                            byte_length=byte_length,
+                        )
+                        logger.info(
+                            "blockwise_dsa_checksum side=D phase=%s request_id=%s "
+                            "rank=(dp=%s,tp=%s,pcp=%s,dcp=%s,head_or_tp=%s,pp=%s) "
+                            "block_index=%s layer=%s position=%s source_block=%s destination_block=%s "
+                            "page_slot=%s abs_mean=%.9g abs_sum=%.9g numel=%s",
+                            phase,
+                            command.request_id,
+                            self.dp_rank,
+                            self.tp_rank,
+                            self.pcp_rank,
+                            self.dcp_rank,
+                            self.head_or_tp_rank,
+                            self.pp_rank,
+                            block_index,
+                            layer_id,
+                            position,
+                            source_block,
+                            destination_block,
+                            page_slot,
+                            abs_mean,
+                            abs_sum,
+                            numel,
+                        )
         except Exception:
             logger.warning(
                 "Failed to compute blockwise DSA Decode checksum for request %s phase=%s",
@@ -3186,6 +3231,7 @@ class MooncakeConnectorWorker:
         self.tp_group = get_tp_group()
         self.pp_rank = get_pp_group().rank_in_group
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank_local
+        self.global_dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.dp_size = vllm_config.parallel_config.data_parallel_size_local
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.kv_caches: dict[str, torch.Tensor] = {}
@@ -3201,6 +3247,13 @@ class MooncakeConnectorWorker:
         self.max_device_id = self.tp_size * self.dp_size * self.pcp_size * self.pp_size
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.num_key_value_heads = self.vllm_config.model_config.hf_text_config.num_key_value_heads
+        if self.vllm_config.model_config.is_deepseek_mla:
+            self.head_or_tp_rank = 0
+        elif self.num_key_value_heads < self.tp_size:
+            put_step = self.tp_size // self.num_key_value_heads
+            self.head_or_tp_rank = self.tp_rank // put_step
+        else:
+            self.head_or_tp_rank = self.tp_rank
 
         # kv cache config
         self.kv_cache_config = kv_cache_config
@@ -3868,6 +3921,9 @@ class MooncakeConnectorWorker:
                 ready_event,
                 self.kv_caches,
                 self.pcp_rank,
+                dp_rank=self.global_dp_rank,
+                dcp_rank=self.dcp_rank,
+                head_or_tp_rank=self.head_or_tp_rank,
             )
             self.kv_send_thread.start()
         else:
@@ -3889,6 +3945,11 @@ class MooncakeConnectorWorker:
                 self._prefill_pp_layer_partition,
                 self.kv_group2layeridx,
                 self.block_size_scale,
+                dp_rank=self.global_dp_rank,
+                pcp_rank=self.pcp_rank,
+                dcp_rank=self.dcp_rank,
+                pp_rank=self.pp_rank,
+                head_or_tp_rank=self.head_or_tp_rank,
             )
             if dsa_local_layouts is not None:
                 (
@@ -4944,6 +5005,13 @@ class MooncakeConnectorWorker:
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size > 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
+                source_blocks = metadata.dsa_debug_source_blocks.get(req_id)
+                if source_blocks is not None:
+                    self.kv_send_thread.log_dsa_source_checksums(
+                        req_id,
+                        indexer_block_ids=source_blocks[0],
+                        main_block_ids=source_blocks[1],
+                    )
                 self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
 
     def _start_dsa_commands(

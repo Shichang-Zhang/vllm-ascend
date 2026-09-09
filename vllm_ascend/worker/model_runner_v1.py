@@ -876,6 +876,189 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    def _trace_prefill_attention_metadata(
+        self,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        num_scheduled_tokens: np.ndarray,
+        positions_np: np.ndarray,
+    ) -> None:
+        """Log the exact attention addressing inputs used by prompt work.
+
+        A Store hit resumes a prompt with ``num_computed_tokens > 0``.  The
+        trace also covers an uncached prompt (``num_computed_tokens == 0``),
+        which gives us a baseline for the same global token positions.  Device
+        snapshots are intentional here: this debug-only path must show what
+        the attention kernels actually consume, not just the CPU staging
+        buffers.
+        """
+        if not envs_ascend.VLLM_ASCEND_SFA_DEBUG:
+            return
+
+        computed_cpu = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        prompt_cpu = self.input_batch.num_prompt_tokens[:num_reqs]
+        traced_req_indices = [
+            req_idx
+            for req_idx in range(num_reqs)
+            if int(num_scheduled_tokens[req_idx]) > 0
+            and int(computed_cpu[req_idx]) < int(prompt_cpu[req_idx])
+        ]
+        if not traced_req_indices:
+            return
+
+        # These copies deliberately synchronize the debug path so each record
+        # reflects the metadata already materialized on the device.
+        query_start_loc_cpu = self.query_start_loc.np[: num_reqs + 1].astype(
+            np.int64, copy=True
+        ).tolist()
+        query_start_loc_device = (
+            self.query_start_loc.gpu[: num_reqs + 1]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .tolist()
+        )
+        computed_device = (
+            self.num_computed_tokens[:num_reqs]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .tolist()
+        )
+        scheduled_device = (
+            self.num_scheduled_tokens.gpu[:num_reqs]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .tolist()
+        )
+        seq_lens_device = (
+            self.seq_lens[:num_reqs]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .tolist()
+        )
+        positions_device = (
+            self.positions[:total_num_scheduled_tokens]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .tolist()
+        )
+        pp_group = get_pp_group()
+        pp_rank = getattr(pp_group, "rank_in_group", 0)
+
+        for req_idx in traced_req_indices:
+            req_id = self.input_batch.req_ids[req_idx]
+            query_start = int(query_start_loc_cpu[req_idx])
+            query_end = int(query_start_loc_cpu[req_idx + 1])
+            computed = int(computed_cpu[req_idx])
+            prompt = int(prompt_cpu[req_idx])
+            scheduled = int(num_scheduled_tokens[req_idx])
+            positions_cpu_req = (
+                positions_np[query_start:query_end]
+                .astype(np.int64, copy=False)
+                .tolist()
+            )
+            positions_device_req = positions_device[query_start:query_end]
+            logger.info(
+                "attention_metadata_trace component=PREFILL_ATTENTION "
+                "record=REQUEST phase=PRE_FORWARD request_id=%s "
+                "rank=(dp=%d,tp=%d,pcp=%d,dcp=%d,pp=%d) req_index=%d "
+                "continuation=%s num_computed_cpu=%d num_computed_device=%d "
+                "num_prompt=%d num_scheduled_cpu=%d num_scheduled_device=%d "
+                "seq_len_cpu=%d seq_len_device=%d query_slice=(%d,%d) "
+                "query_start_loc_cpu=%s query_start_loc_device=%s "
+                "positions_cpu=%s positions_device=%s",
+                req_id,
+                self.dp_rank,
+                self.tp_rank,
+                self.pcp_rank,
+                self.dcp_rank,
+                pp_rank,
+                req_idx,
+                computed > 0,
+                computed,
+                int(computed_device[req_idx]),
+                prompt,
+                scheduled,
+                int(scheduled_device[req_idx]),
+                computed + scheduled,
+                int(seq_lens_device[req_idx]),
+                query_start,
+                query_end,
+                query_start_loc_cpu,
+                query_start_loc_device,
+                positions_cpu_req,
+                positions_device_req,
+            )
+
+            for kv_cache_gid, block_table in enumerate(
+                self.input_batch.block_table.block_tables
+            ):
+                if block_table.is_mamba_group:
+                    continue
+                num_blocks = int(block_table.num_blocks_per_row[req_idx])
+                block_table_cpu = (
+                    block_table.get_numpy_array()[req_idx, :num_blocks]
+                    .astype(np.int64, copy=True)
+                    .tolist()
+                )
+                block_table_device = (
+                    block_table.get_device_tensor()[req_idx, :num_blocks]
+                    .detach()
+                    .cpu()
+                    .to(torch.int64)
+                    .tolist()
+                )
+                slot_mapping = (
+                    block_table.slot_mapping.gpu[query_start:query_end]
+                    .detach()
+                    .cpu()
+                    .to(torch.int64)
+                    .tolist()
+                )
+                owned_slot_pairs = [
+                    (position, slot)
+                    for position, slot in zip(
+                        positions_device_req, slot_mapping, strict=True
+                    )
+                    if slot >= 0
+                ]
+                logger.info(
+                    "attention_metadata_trace component=PREFILL_ATTENTION "
+                    "record=KV_GROUP phase=PRE_FORWARD request_id=%s "
+                    "rank=(dp=%d,tp=%d,pcp=%d,dcp=%d,pp=%d) req_index=%d "
+                    "kv_cache_gid=%d storage_layout=%s uses_unified_host_view=%s "
+                    "physical_block_size=%d logical_block_size=%d "
+                    "blocks_per_phys_block=%d cp_kv_cache_interleave_size=%d "
+                    "num_blocks=%d block_table_cpu=%s block_table_device=%s "
+                    "slot_mapping=%s owned_count=%d masked_count=%d "
+                    "owned_slot_pairs=%s",
+                    req_id,
+                    self.dp_rank,
+                    self.tp_rank,
+                    self.pcp_rank,
+                    self.dcp_rank,
+                    pp_rank,
+                    req_idx,
+                    kv_cache_gid,
+                    block_table.storage_layout,
+                    block_table.uses_unified_host_view,
+                    block_table.physical_block_size,
+                    block_table.block_size,
+                    block_table.blocks_per_phys_block,
+                    block_table.cp_kv_cache_interleave_size,
+                    num_blocks,
+                    block_table_cpu,
+                    block_table_device,
+                    slot_mapping,
+                    len(owned_slot_pairs),
+                    len(slot_mapping) - len(owned_slot_pairs),
+                    owned_slot_pairs,
+                )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1317,6 +1500,13 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
             )
+
+        self._trace_prefill_attention_metadata(
+            num_reqs,
+            total_num_scheduled_tokens,
+            num_scheduled_tokens,
+            positions_np,
+        )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
