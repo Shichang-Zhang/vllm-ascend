@@ -242,7 +242,64 @@ def build_component_read(
     if statistics is not None:
         statistics["entries_before"] = statistics.get("entries_before", 0) + len(result[0])
         statistics["entries_after"] = statistics.get("entries_after", 0) + len(merged[0])
+    expected_tokens = _expected_component_tokens(
+        start_token,
+        end_token,
+        local_block_tokens=local.block_tokens,
+        remote_block_tokens=remote.block_tokens,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        writer_size=writer_size,
+        writer_rank=writer_rank,
+        indexer=indexer,
+    )
+    actual_bytes = sum(merged[2])
+    expected_bytes = expected_tokens * token_bytes
+    if actual_bytes != expected_bytes:
+        raise AssertionError(
+            "DSA component transfer coverage mismatch: "
+            f"layer={local.layer_name}, position={local.position}, "
+            f"indexer={indexer}, token_range=[{start_token}, {end_token}), "
+            f"expected_bytes={expected_bytes}, actual_bytes={actual_bytes}"
+        )
     return merged
+
+
+def _expected_component_tokens(
+    start_token: int,
+    end_token: int,
+    *,
+    local_block_tokens: int,
+    remote_block_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+    writer_size: int,
+    writer_rank: int,
+    indexer: bool,
+) -> int:
+    """Count tokens owned by one source shard and destination writer.
+
+    This deliberately checks ownership at manager-block boundaries rather
+    than reproducing the physical-page address calculation above. It is used
+    as an independent assertion that a successful transfer plan neither drops
+    nor duplicates bytes.
+    """
+    if indexer:
+        return end_token - start_token
+    selected_tokens = 0
+    token = start_token
+    while token < end_token:
+        remote_block, remote_offset = divmod(token, remote_block_tokens)
+        local_block, local_offset = divmod(token, local_block_tokens)
+        count = min(
+            end_token - token,
+            remote_block_tokens - remote_offset,
+            local_block_tokens - local_offset,
+        )
+        if remote_block % cp_size == cp_rank and local_block % writer_size == writer_rank:
+            selected_tokens += count
+        token += count
+    return selected_tokens
 
 
 def coalesce_transfer_lists(local, remote, lengths):

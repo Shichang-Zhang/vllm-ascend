@@ -89,6 +89,33 @@ def test_each_rank_receives_full_indexer_pages(cp, dtype, token_bytes):
     assert byte_pairs(plans[0]) == expected
 
 
+def test_component_coverage_assertion_handles_unaligned_partial_blocks():
+    local = DsaCacheLayout("main", 0, 1000, 16, 24, 1, 8, "bf16")
+    remote = DsaCacheLayout("main", 0, 10000, 8, 16, 1, 4, "bf16")
+    source = tuple(range(20))
+    destination = tuple(range(20, 40))
+
+    plans = [
+        build_component_read(
+            local,
+            remote,
+            source,
+            destination,
+            3,
+            37,
+            cp_size=2,
+            cp_rank=cp_rank,
+            writer_rank=writer_rank,
+            writer_size=3,
+            indexer=False,
+        )
+        for writer_rank in range(3)
+        for cp_rank in range(2)
+    ]
+
+    assert sum(sum(plan[2]) for plan in plans) == (37 - 3) * 2
+
+
 @pytest.mark.parametrize("change", [{"dtype": "int8"}, {"block_bytes": 7}, {"scale": 3}, {"stride": 1}])
 def test_incompatible_geometry_fails_before_transfer(change):
     layout = DsaCacheLayout("main", 0, 1000, 8, 8, 1, 4, "bf16")

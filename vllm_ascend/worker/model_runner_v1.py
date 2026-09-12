@@ -1986,6 +1986,28 @@ class NPUModelRunner(GPUModelRunner):
                             common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
                         )
                     )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        corrected_seq_lens = common_attn_metadata.seq_lens.clone()
+                        if num_rejected_tokens_gpu is not None:
+                            corrected_seq_lens[: num_rejected_tokens_gpu.shape[0]].sub_(
+                                num_rejected_tokens_gpu
+                            )
+                        logger.debug(
+                            "[spec/dfx] verification result: req_ids=%s "
+                            "valid_sampled_counts=%s rejected_counts=%s "
+                            "observed_seq_lens=%s corrected_seq_lens=%s "
+                            "token_indices_to_sample=%s",
+                            self.input_batch.req_ids,
+                            valid_sampled_tokens_count.tolist(),
+                            (
+                                None
+                                if num_rejected_tokens_gpu is None
+                                else num_rejected_tokens_gpu.tolist()
+                            ),
+                            common_attn_metadata.seq_lens.tolist(),
+                            corrected_seq_lens.tolist(),
+                            token_indices_to_sample.tolist(),
+                        )
                 target_token_ids = self.input_ids.gpu[token_indices]
                 target_positions = self._get_positions(token_indices)
                 if self.use_aux_hidden_state_outputs:
@@ -2021,6 +2043,14 @@ class NPUModelRunner(GPUModelRunner):
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[spec/dfx] draft result: req_ids=%s next_token_ids=%s "
+                    "draft_token_ids=%s",
+                    self.input_batch.req_ids,
+                    next_token_ids.tolist(),
+                    draft_token_ids.tolist(),
+                )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 

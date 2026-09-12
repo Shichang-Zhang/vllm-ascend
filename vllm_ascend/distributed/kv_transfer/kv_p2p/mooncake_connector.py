@@ -683,6 +683,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.dsa_failure_phases: dict[str, DsaTransferPhase] = {}
         self.invalid_block_ids: set[int] = set()
         self.failed_recv_requests_lock = threading.Lock()
+        self._dsa_local_tensors: dict[tuple[bool, str, int], torch.Tensor] = {}
 
         self.num_draft_layers = 0
         if self.vllm_config.speculative_config is not None:
@@ -855,6 +856,7 @@ class KVCacheRecvingThread(threading.Thread):
                 continue
             combined = ([], [], [])
             statistics = {}
+            component_coverage = []
             for local in layout:
                 transformer_layer = self._dsa_transformer_layers[local.layer_name]
                 if not first <= transformer_layer < last:
@@ -892,21 +894,40 @@ class KVCacheRecvingThread(threading.Thread):
                     indexer=indexer,
                     statistics=statistics,
                 )
+                component_bytes = sum(part[2])
+                component_coverage.append(
+                    (
+                        local.layer_name,
+                        local.position,
+                        component_bytes,
+                        len(part[0]),
+                        part[0][0] if part[0] else None,
+                        part[2][0] if part[2] else 0,
+                    )
+                )
                 for output, values in zip(combined, part):
                     output.extend(values)
-            plans.append((indexer, combined, statistics))
+            plans.append((indexer, combined, statistics, component_coverage))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "DSA built transfer plans request=%s decode_rank=%s phases=%s token_range=[%s,%s) pp_layers=[%s,%s)",
                 command.request_id,
                 self.tp_rank,
-                [("indexer" if indexer else "main", len(plan[0]), sum(plan[2])) for indexer, plan, _ in plans],
+                [
+                    (
+                        "indexer" if indexer else "main",
+                        len(plan[0]),
+                        sum(plan[2]),
+                        self._summarize_dsa_component_coverage(coverage),
+                    )
+                    for indexer, plan, _, coverage in plans
+                ],
                 start,
                 end,
                 first,
                 last,
             )
-        for indexer, plan, statistics in plans:
+        for indexer, plan, statistics, component_coverage in plans:
             if task["cancelled"].is_set():
                 logger.debug(
                     "DSA stop remaining phases request=%s decode_rank=%s reason=cancelled",
@@ -919,7 +940,8 @@ class KVCacheRecvingThread(threading.Thread):
                 started = time.perf_counter()
                 result = self.engine.batch_transfer_sync_read(session, *plan)
                 logger.debug(
-                    "DSA receive request=%s rank=%s indexer=%s bytes=%s entries=%s seconds=%s coalescing=%s",
+                    "DSA receive request=%s rank=%s indexer=%s bytes=%s entries=%s "
+                    "seconds=%s coalescing=%s component_coverage=%s",
                     command.request_id,
                     self.tp_rank,
                     indexer,
@@ -927,9 +949,77 @@ class KVCacheRecvingThread(threading.Thread):
                     len(plan[0]),
                     time.perf_counter() - started,
                     statistics,
+                    self._summarize_dsa_component_coverage(component_coverage),
                 )
                 if result < 0:
                     raise RuntimeError(f"DSA transfer failed: {result}")
+                self._log_dsa_component_samples(indexer, component_coverage)
+
+    @staticmethod
+    def _summarize_dsa_component_coverage(
+        component_coverage: list[tuple[str, int, int, int, int | None, int]],
+    ) -> dict[str, Any]:
+        return {
+            "components": len(component_coverage),
+            "nonzero_components": sum(item[2] > 0 for item in component_coverage),
+            "total_bytes": sum(item[2] for item in component_coverage),
+            "mtp": [item[:4] for item in component_coverage if "mtp" in item[0].lower()],
+        }
+
+    def _log_dsa_component_samples(
+        self,
+        indexer: bool,
+        component_coverage: list[tuple[str, int, int, int, int | None, int]],
+    ) -> None:
+        """Fingerprint a representative target component and every MTP component."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        nonzero = [item for item in component_coverage if item[2] > 0]
+        selected = nonzero[:1]
+        selected.extend(item for item in nonzero if "mtp" in item[0].lower() and item not in selected)
+        for layer_name, position, total_bytes, entries, first_addr, first_bytes in selected:
+            if total_bytes == 0 or first_addr is None:
+                continue
+            tensor = self._dsa_local_tensors.get((indexer, layer_name, position))
+            if tensor is None:
+                raise AssertionError(
+                    "DSA diagnostic tensor is missing: "
+                    f"indexer={indexer}, layer={layer_name}, position={position}"
+                )
+            byte_offset = first_addr - tensor.data_ptr()
+            if byte_offset < 0 or byte_offset % tensor.element_size():
+                raise AssertionError(
+                    "DSA diagnostic address is outside or misaligned: "
+                    f"layer={layer_name}, position={position}, byte_offset={byte_offset}"
+                )
+            flat = tensor.reshape(-1)
+            element_offset = byte_offset // tensor.element_size()
+            sample_elements = min(
+                max(first_bytes // tensor.element_size(), 1),
+                16,
+                flat.numel() - element_offset,
+            )
+            if sample_elements <= 0:
+                raise AssertionError(
+                    "DSA diagnostic address exceeds tensor storage: "
+                    f"layer={layer_name}, position={position}, element_offset={element_offset}"
+                )
+            sample = flat.narrow(0, element_offset, sample_elements).to(torch.float32)
+            logger.debug(
+                "DSA cache fingerprint indexer=%s layer=%s position=%s "
+                "mtp=%s bytes=%s entries=%s sample_sum=%s sample_abs_max=%s "
+                "sample_finite=%s sample=%s",
+                indexer,
+                layer_name,
+                position,
+                "mtp" in layer_name.lower(),
+                total_bytes,
+                entries,
+                sample.sum().item(),
+                sample.abs().max().item(),
+                torch.isfinite(sample).all().item(),
+                sample.tolist(),
+            )
 
     def _handle_dsa_request(self, task: dict[str, Any]) -> None:
         command = task["dsa_command"]
@@ -3460,10 +3550,12 @@ class MooncakeConnectorWorker:
         }
         manager = get_sparse_kv_offload_manager()
         indexer, main = [], []
+        self._dsa_local_tensors = {}
         for name, caches in kv_caches.items():
             is_indexer = "indexer" in name.lower()
             tensors = self._as_kv_cache_tuple(caches) if is_indexer else manager.get_local_host_kv_views(name)
             for position, tensor in enumerate(tensors):
+                self._dsa_local_tensors[(is_indexer, name, position)] = tensor
                 if tensor.shape[0] % self.num_blocks:
                     raise ValueError("DSA tensor pages must divide manager blocks")
                 scale = tensor.shape[0] // self.num_blocks
@@ -3483,11 +3575,22 @@ class MooncakeConnectorWorker:
                 (indexer if is_indexer else main).append(entry)
         if not indexer or not main:
             raise ValueError("DSA requires Main and Indexer component layouts")
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method == "mtp":
+            mtp_main = [layout for layout in main if "mtp" in layout.layer_name.lower()]
+            if not mtp_main:
+                raise AssertionError("DSA MTP is enabled but no MTP Main cache component was registered")
         logger.debug(
-            "DSA local layouts ready decode_rank=%s indexer_components=%s main_components=%s",
+            "DSA local layouts ready decode_rank=%s indexer_components=%s "
+            "main_components=%s mtp_main_components=%s",
             self.tp_rank,
             len(indexer),
             len(main),
+            [
+                (layout.layer_name, layout.position, layout.block_bytes, layout.stride)
+                for layout in main
+                if "mtp" in layout.layer_name.lower()
+            ],
         )
         return indexer, main
 
@@ -3653,6 +3756,7 @@ class MooncakeConnectorWorker:
                     self.kv_recv_thread._dsa_main_local_layout,
                 ) = dsa_local_layouts
                 self.kv_recv_thread._dsa_transformer_layers = self._dsa_transformer_layers
+                self.kv_recv_thread._dsa_local_tensors = self._dsa_local_tensors
             self.kv_recv_thread.start()
         start_wait_time = time.time()
         thread = self.kv_send_thread if self.kv_role == "kv_producer" else self.kv_recv_thread
