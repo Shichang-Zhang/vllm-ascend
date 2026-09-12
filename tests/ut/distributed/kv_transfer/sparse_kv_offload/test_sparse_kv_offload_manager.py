@@ -826,9 +826,17 @@ class TestRegisterKvCachesBackendBranch(unittest.TestCase):
         kv_caches = {"host.0": (MagicMock(), MagicMock(), k_cpu, v_cpu, topk, topk)}
         manager = object.__new__(SparseKVOffloadManager)
         manager.host_backend = host_backend
-        manager._host_kv_allocator = None  # 分支只看配置，与 allocator 实例无关
+        manager._host_kv_allocator = None
+        if host_backend == "mooncake":
+            allocator = object.__new__(MooncakeHostPool)
+            allocator.topology = SimpleNamespace(tp_size=1)
+            allocator.describe_local_views = MagicMock(
+                return_value=(0, 128, (("host.0", "k", 0),))
+            )
+            manager._host_kv_allocator = allocator
         manager._register_offload_layers = MagicMock()
         manager.offload_layer_names = ["host.0"]
+        manager.layer_name_to_offload_id = {"host.0": 0}
         manager.num_layers = 1
         manager.tp_size = 2
         manager.kv_cache_config = SimpleNamespace(num_blocks=8)

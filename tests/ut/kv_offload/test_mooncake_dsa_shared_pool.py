@@ -506,7 +506,11 @@ def test_dsa_main_and_indexer_have_distinct_metadata_indices():
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="deepseek_v3"))
     )
     names = [MAIN, "model.layers.0.self_attn.indexer.k_cache", "model.mtp.layers.0.attn"]
-    worker.kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=names)])
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=names, kv_cache_spec=SimpleNamespace(num_kv_heads=1))
+        ]
+    )
     worker._get_layer_spec = lambda name: SimpleNamespace(num_kv_heads=1)
     worker._get_spec_total_num_kv_heads = lambda spec, index: 1
     groups = worker._build_kv_group2layeridx()
