@@ -57,3 +57,7 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 
 import vllm_ascend.patch.platform.patch_fused_moe  # noqa
 import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+
+# PD disaggregation: tolerate duplicate/late KV-transfer receive terminals
+# (see patch_pd_xfer_terminal.py).
+import vllm_ascend.patch.platform.patch_pd_xfer_terminal  # noqa
