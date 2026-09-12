@@ -69,10 +69,23 @@ class GlobalTE:
             if self.is_register_buffer:
                 return
 
-            for ptr, size, location in regions:
-                ret_value = self.transfer_engine.register_memory(ptr, size, location)
-                if ret_value != 0:
-                    raise RuntimeError("Mooncake memory registration failed.")
+            registered_regions: list[tuple[int, int, str]] = []
+            try:
+                for ptr, size, location in regions:
+                    ret_value = self.transfer_engine.register_memory(ptr, size, location)
+                    if ret_value != 0:
+                        raise RuntimeError("Mooncake memory registration failed.")
+                    registered_regions.append((ptr, size, location))
+            except Exception as exc:
+                failed_regions, failure_messages = self._unregister_regions(registered_regions)
+                self._registered_regions = failed_regions
+                self.is_register_buffer = bool(failed_regions)
+                if failure_messages:
+                    raise RuntimeError(
+                        "Mooncake memory registration failed and rollback failed "
+                        "for regions: " + "; ".join(failure_messages)
+                    ) from exc
+                raise
             self._registered_regions = regions
             self.is_register_buffer = True
 
