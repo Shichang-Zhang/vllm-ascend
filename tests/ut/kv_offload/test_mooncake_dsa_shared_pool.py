@@ -543,7 +543,7 @@ def test_remote_group_and_layer_order_does_not_change_component_addresses():
     assert all(10000 <= src < 30000 for src in main_call.args[2])
 
 
-def test_dsa_mtp_partial_tail_asserts_before_transfer_submission():
+def test_dsa_mtp_partial_tail_warns_and_submits_transfer(caplog):
     _, thread, command = make_worker()
     thread._dsa_mtp_enabled = True
     thread.num_layers = 1
@@ -560,7 +560,10 @@ def test_dsa_mtp_partial_tail_asserts_before_transfer_submission():
         "cancelled": threading.Event(),
     }
 
-    with pytest.raises(AssertionError, match=r"token_range=\[0,31\)"):
+    with caplog.at_level("INFO"):
         thread._execute_dsa_receive(task)
 
-    thread.engine.batch_transfer_sync_read.assert_not_called()
+    assert "token_range=[0,31)" in caplog.text
+    assert "DSA MTP component plan" in caplog.text
+    assert "expected_tokens=4 expected_bytes=8" in caplog.text
+    assert thread.engine.batch_transfer_sync_read.call_count == 2

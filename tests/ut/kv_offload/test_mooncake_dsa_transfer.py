@@ -8,10 +8,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_transfer import (
     MAX_REGISTER_MEMORY_BYTES,
     DsaCacheLayout,
     DsaRegisterAtom,
+    assert_component_read_coverage,
     assert_mtp_main_layout_complete,
-    assert_mtp_tail_block_coverage,
     build_component_read,
     collect_bounded_register_regions,
+    describe_mtp_tail_block_difference,
     split_transfer_lists_at_region_boundaries,
 )
 
@@ -35,28 +36,80 @@ def test_mtp_main_layout_must_contain_each_draft_layer():
 def test_mtp_main_partial_tail_exposes_exact_range_hypothesis():
     local = DsaCacheLayout("model.layers.78.attn", 0, 1000, 8, 8, 1, 4, "bf16")
     remote = replace(local, block_tokens=8)
-    with pytest.raises(AssertionError, match=r"token_range=\[4,7\).+local_aligned_end=8") as error:
-        assert_mtp_tail_block_coverage(
-            local,
-            remote,
-            request_id="request",
-            start_token=4,
-            end_token=7,
-        )
-    assert "model.layers.78.attn" in str(error.value)
-    assert "remote_aligned_end=8" in str(error.value)
-
-
-def test_mtp_main_block_aligned_range_passes_tail_assertion():
-    local = DsaCacheLayout("model.layers.78.attn", 0, 1000, 8, 8, 1, 4, "bf16")
-    remote = replace(local, block_tokens=8)
-    assert_mtp_tail_block_coverage(
+    warning = describe_mtp_tail_block_difference(
         local,
         remote,
         request_id="request",
-        start_token=0,
-        end_token=8,
+        start_token=4,
+        end_token=7,
     )
+    assert warning is not None
+    assert "token_range=[4,7)" in warning
+    assert "model.layers.78.attn" in warning
+    assert "local_aligned_end=8" in warning
+    assert "remote_aligned_end=8" in warning
+
+
+def test_mtp_main_block_aligned_range_has_no_tail_warning():
+    local = DsaCacheLayout("model.layers.78.attn", 0, 1000, 8, 8, 1, 4, "bf16")
+    remote = replace(local, block_tokens=8)
+    assert (
+        describe_mtp_tail_block_difference(
+            local,
+            remote,
+            request_id="request",
+            start_token=0,
+            end_token=8,
+        )
+        is None
+    )
+
+
+def test_component_read_coverage_counts_cp_and_writer_ownership():
+    local = DsaCacheLayout("mtp", 0, 1000, 8, 8, 1, 4, "bf16")
+    remote = DsaCacheLayout("mtp", 0, 10000, 8, 8, 1, 4, "bf16")
+    plan = build_component_read(
+        local,
+        remote,
+        (10, 11, 12),
+        (20, 21, 22, 23, 24),
+        1,
+        18,
+        cp_size=2,
+        cp_rank=0,
+        writer_rank=0,
+        writer_size=2,
+        indexer=False,
+    )
+    assert assert_component_read_coverage(
+        plan,
+        local,
+        remote,
+        1,
+        18,
+        cp_size=2,
+        cp_rank=0,
+        writer_rank=0,
+        writer_size=2,
+        indexer=False,
+    ) == (9, 18)
+
+
+def test_component_read_coverage_rejects_silent_short_plan():
+    layout = DsaCacheLayout("mtp", 0, 1000, 8, 8, 1, 4, "bf16")
+    with pytest.raises(AssertionError, match="expected_bytes=8, actual_bytes=6"):
+        assert_component_read_coverage(
+            ([1000], [2000], [6]),
+            layout,
+            layout,
+            0,
+            4,
+            cp_size=1,
+            cp_rank=0,
+            writer_rank=0,
+            writer_size=1,
+            indexer=False,
+        )
 
 
 @pytest.mark.parametrize("cp,writers", [(1, 1), (1, 4), (8, 4), (16, 8), (2, 4), (4, 8)])

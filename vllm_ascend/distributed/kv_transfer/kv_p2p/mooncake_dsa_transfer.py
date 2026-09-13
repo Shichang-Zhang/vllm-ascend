@@ -72,27 +72,28 @@ def assert_mtp_main_layout_complete(
         )
 
 
-def assert_mtp_tail_block_coverage(
+def describe_mtp_tail_block_difference(
     local: DsaCacheLayout,
     remote: DsaCacheLayout,
     *,
     request_id: str,
     start_token: int,
     end_token: int,
-) -> None:
-    """Expose DSA exact-range transfers that leave an MTP tail partial.
+) -> str | None:
+    """Describe an MTP tail that MemFabric and DSA copy differently.
 
     MemFabric copies the complete final physical block, while DSA currently
-    copies only ``[start_token, end_token)``. Until the MTP cache consumer's
-    tail semantics are proven equivalent, make that difference observable at
-    runtime instead of allowing potentially stale tail slots to be consumed.
+    copies only ``[start_token, end_token)``. This is a diagnostic condition,
+    not an invalid request: ordinary prompts frequently end inside a block.
     """
+    if local.block_tokens <= 0 or remote.block_tokens <= 0:
+        raise ValueError("invalid DSA token geometry")
     local_remainder = end_token % local.block_tokens
     remote_remainder = end_token % remote.block_tokens
     if local_remainder or remote_remainder:
         local_aligned_end = end_token + (-end_token % local.block_tokens)
         remote_aligned_end = end_token + (-end_token % remote.block_tokens)
-        raise AssertionError(
+        return (
             "Mooncake MTP receive ends inside a cache block while MemFabric "
             "copies the complete final block: "
             f"request={request_id}, token_range=[{start_token},{end_token}), "
@@ -102,6 +103,73 @@ def assert_mtp_tail_block_coverage(
             f"remote_block_tokens={remote.block_tokens}, "
             f"remote_aligned_end={remote_aligned_end}"
         )
+    return None
+
+
+def assert_component_read_coverage(
+    plan: tuple[list[int], list[int], list[int]],
+    local: DsaCacheLayout,
+    remote: DsaCacheLayout,
+    start_token: int,
+    end_token: int,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    writer_rank: int,
+    writer_size: int,
+    indexer: bool,
+) -> tuple[int, int]:
+    """Independently verify bytes selected by a component read plan.
+
+    Returns the expected selected token and byte counts for diagnostics.
+    Ownership is counted at local/remote block boundaries rather than by
+    replaying the physical-page mapping used by ``build_component_read``.
+    """
+    if cp_size <= 0 or not 0 <= cp_rank < cp_size:
+        raise ValueError("invalid source CP geometry")
+    if writer_size <= 0 or not 0 <= writer_rank < writer_size:
+        raise ValueError("invalid Main writer geometry")
+    if start_token < 0 or end_token < start_token:
+        raise ValueError("invalid request token interval")
+    if remote.block_tokens <= 0:
+        raise ValueError("invalid remote DSA token geometry")
+    destinations, sources, lengths = plan
+    if len(destinations) != len(sources) or len(destinations) != len(lengths):
+        raise AssertionError("Mooncake DSA component plan list lengths differ")
+    if local.scale <= 0 or local.block_tokens <= 0 or local.block_tokens % local.scale:
+        raise ValueError("invalid local DSA token geometry")
+    local_page_tokens = local.block_tokens // local.scale
+    if local.block_bytes % local_page_tokens:
+        raise ValueError("local DSA component bytes do not divide token geometry")
+    token_bytes = local.block_bytes // local_page_tokens
+
+    expected_tokens = 0
+    token = start_token
+    while token < end_token:
+        source_block = token // remote.block_tokens
+        destination_block = token // local.block_tokens
+        chunk_end = min(
+            end_token,
+            (source_block + 1) * remote.block_tokens,
+            (destination_block + 1) * local.block_tokens,
+        )
+        if indexer or (source_block % cp_size == cp_rank and destination_block % writer_size == writer_rank):
+            expected_tokens += chunk_end - token
+        token = chunk_end
+
+    expected_bytes = expected_tokens * token_bytes
+    actual_bytes = sum(lengths)
+    if actual_bytes != expected_bytes:
+        raise AssertionError(
+            "Mooncake DSA component plan byte coverage mismatch: "
+            f"layer={local.layer_name}, position={local.position}, "
+            f"token_range=[{start_token},{end_token}), "
+            f"expected_tokens={expected_tokens}, "
+            f"expected_bytes={expected_bytes}, actual_bytes={actual_bytes}, "
+            f"cp_rank={cp_rank}/{cp_size}, "
+            f"writer_rank={writer_rank}/{writer_size}, indexer={indexer}"
+        )
+    return expected_tokens, expected_bytes
 
 
 def collect_bounded_register_regions(

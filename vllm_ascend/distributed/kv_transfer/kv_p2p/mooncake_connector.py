@@ -95,10 +95,11 @@ from .mooncake_dsa_metadata import (
 from .mooncake_dsa_transfer import (
     DsaCacheLayout,
     DsaRegisterAtom,
+    assert_component_read_coverage,
     assert_mtp_main_layout_complete,
-    assert_mtp_tail_block_coverage,
     build_component_read,
     collect_bounded_register_regions,
+    describe_mtp_tail_block_difference,
     layout_span_bytes,
 )
 
@@ -884,14 +885,19 @@ class KVCacheRecvingThread(threading.Thread):
                     dtypes[remote_layer][position],
                     remote_capacity,
                 )
-                if self._dsa_mtp_enabled and not indexer and transformer_layer >= self.num_layers:
-                    assert_mtp_tail_block_coverage(
+                is_mtp_main = self._dsa_mtp_enabled and not indexer and transformer_layer >= self.num_layers
+                if is_mtp_main:
+                    tail_difference = describe_mtp_tail_block_difference(
                         local,
                         remote,
                         request_id=command.request_id,
                         start_token=start,
                         end_token=end,
                     )
+                    if tail_difference is not None:
+                        logger.warning("%s, decode_rank=%s", tail_difference, self.tp_rank)
+                component_entries_before = statistics.get("entries_before", 0)
+                component_entries_after = statistics.get("entries_after", 0)
                 part = build_component_read(
                     local,
                     remote,
@@ -906,6 +912,87 @@ class KVCacheRecvingThread(threading.Thread):
                     indexer=indexer,
                     statistics=statistics,
                 )
+                if is_mtp_main:
+                    expected_tokens, expected_bytes = assert_component_read_coverage(
+                        part,
+                        local,
+                        remote,
+                        start,
+                        end,
+                        cp_size=source.remote_pcp_size * source.remote_dcp_size,
+                        cp_rank=task["cp_rank"],
+                        writer_rank=self.tp_rank,
+                        writer_size=self.vllm_config.parallel_config.tensor_parallel_size,
+                        indexer=False,
+                    )
+                    entries_before = statistics["entries_before"] - component_entries_before
+                    entries_after = statistics["entries_after"] - component_entries_after
+                    actual_bytes = sum(part[2])
+                    source_ids = source.main_block_ids
+                    destination_ids = command.main_host_block_ids
+                    reference = next(
+                        (
+                            candidate
+                            for candidate in self._dsa_main_local_layout
+                            if self._dsa_transformer_layers[candidate.layer_name] == self.num_layers - 1
+                            and candidate.position == local.position
+                        ),
+                        None,
+                    )
+                    logger.info(
+                        "DSA MTP component plan request=%s decode_rank=%s "
+                        "cp_rank=%s layer=%s position=%s token_range=[%s,%s) "
+                        "expected_tokens=%s expected_bytes=%s actual_bytes=%s "
+                        "entries_before=%s entries_after=%s "
+                        "local_geometry=(block_bytes=%s,stride=%s,scale=%s,block_tokens=%s,dtype=%s) "
+                        "remote_geometry=(block_bytes=%s,stride=%s,scale=%s,block_tokens=%s,dtype=%s) "
+                        "reference_target_geometry=%s source_blocks=(count=%s,first=%s,last=%s) "
+                        "destination_blocks=(count=%s,first=%s,last=%s) "
+                        "offset_span=(first_dst=%s,last_dst_end=%s,first_src=%s,last_src_end=%s)",
+                        command.request_id,
+                        self.tp_rank,
+                        task["cp_rank"],
+                        local.layer_name,
+                        local.position,
+                        start,
+                        end,
+                        expected_tokens,
+                        expected_bytes,
+                        actual_bytes,
+                        entries_before,
+                        entries_after,
+                        local.block_bytes,
+                        local.stride,
+                        local.scale,
+                        local.block_tokens,
+                        local.dtype,
+                        remote.block_bytes,
+                        remote.stride,
+                        remote.scale,
+                        remote.block_tokens,
+                        remote.dtype,
+                        (
+                            None
+                            if reference is None
+                            else (
+                                reference.block_bytes,
+                                reference.stride,
+                                reference.scale,
+                                reference.block_tokens,
+                                reference.dtype,
+                            )
+                        ),
+                        len(source_ids),
+                        source_ids[0] if source_ids else None,
+                        source_ids[-1] if source_ids else None,
+                        len(destination_ids),
+                        destination_ids[0] if destination_ids else None,
+                        destination_ids[-1] if destination_ids else None,
+                        part[0][0] - local.base if part[0] else None,
+                        part[0][-1] + part[2][-1] - local.base if part[0] else None,
+                        part[1][0] - remote.base if part[1] else None,
+                        part[1][-1] + part[2][-1] - remote.base if part[1] else None,
+                    )
                 for output, values in zip(combined, part):
                     output.extend(values)
             plans.append((indexer, combined, statistics))
