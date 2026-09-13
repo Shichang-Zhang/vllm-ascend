@@ -56,6 +56,10 @@ from vllm_ascend.models.kimi_k3_dspark import K3DSparkForCausalLM
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.mtp_diagnostics import (
+    assert_mtp_index_cache_state,
+    assert_mtp_topk_rows_front_aligned,
+)
 from vllm_ascend.spec_decode.utils import (
     SlidingWindowAdapter,
     _disable_flash_comm_v1_context,
@@ -63,7 +67,7 @@ from vllm_ascend.spec_decode.utils import (
     build_parallel_draft_seq_lens_cpu,
     patch_tensor_parallel_group,
 )
-from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable
+from vllm_ascend.utils import check_gdn_layer, enable_dsa_cp, enable_sp, lmhead_tp_enable
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
@@ -1339,6 +1343,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_model = getattr(self.model, "model", None)
         if self._share_mtp_indices and draft_model is not None and hasattr(draft_model, "set_skip_topk"):
             draft_model.set_skip_topk(False)
+            assert_mtp_index_cache_state(
+                draft_model,
+                expected_skip_topk=False,
+                phase="draft step 0",
+            )
 
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
@@ -1347,10 +1356,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             last_hidden_states, hidden_states = ret_hidden_states
 
+        if self._share_mtp_indices and draft_model is not None and not enable_dsa_cp():
+            assert_mtp_topk_rows_front_aligned(
+                draft_model,
+                token_indices_to_sample,
+            )
+
         # step 1+ skip indexer
         draft_model = getattr(self.model, "model", None)
         if self._share_mtp_indices and draft_model is not None and hasattr(draft_model, "set_skip_topk"):
             draft_model.set_skip_topk(True)
+            assert_mtp_index_cache_state(
+                draft_model,
+                expected_skip_topk=True,
+                phase="draft steps 1+",
+            )
 
         if self.method != "dflash":
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
