@@ -541,3 +541,26 @@ def test_remote_group_and_layer_order_does_not_change_component_addresses():
     indexer_call, main_call = thread.engine.batch_transfer_sync_read.call_args_list
     assert all(src >= 30000 for src in indexer_call.args[2])
     assert all(10000 <= src < 30000 for src in main_call.args[2])
+
+
+def test_dsa_mtp_partial_tail_asserts_before_transfer_submission():
+    _, thread, command = make_worker()
+    thread._dsa_mtp_enabled = True
+    thread.num_layers = 1
+    thread.num_draft_layers = 1
+    thread._dsa_transformer_layers[MAIN] = 1
+    command = replace(command, source=replace(command.source, num_external_tokens=31))
+    task = {
+        "dsa_command": command,
+        "dsa_remote_endpoint": command.source.endpoints_by_prefill_rank[0],
+        "cp_rank": 0,
+        "pp_rank": 0,
+        "include_indexer": True,
+        "expected": 1,
+        "cancelled": threading.Event(),
+    }
+
+    with pytest.raises(AssertionError, match=r"token_range=\[0,31\)"):
+        thread._execute_dsa_receive(task)
+
+    thread.engine.batch_transfer_sync_read.assert_not_called()

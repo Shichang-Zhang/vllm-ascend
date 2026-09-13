@@ -95,6 +95,8 @@ from .mooncake_dsa_metadata import (
 from .mooncake_dsa_transfer import (
     DsaCacheLayout,
     DsaRegisterAtom,
+    assert_mtp_main_layout_complete,
+    assert_mtp_tail_block_coverage,
     build_component_read,
     collect_bounded_register_regions,
     layout_span_bytes,
@@ -679,10 +681,12 @@ class KVCacheRecvingThread(threading.Thread):
         self.failed_recv_requests_lock = threading.Lock()
 
         self.num_draft_layers = 0
+        self._dsa_mtp_enabled = False
         if self.vllm_config.speculative_config is not None:
             if self.vllm_config.speculative_config.method == "mtp":
                 # all MTP layer use the same kv cache layer, so only need to transfer once
                 self.num_draft_layers = 1
+                self._dsa_mtp_enabled = True
             elif (
                 hasattr(self.vllm_config.speculative_config.draft_model_config, "hf_config")
                 and getattr(self.vllm_config.speculative_config.draft_model_config.hf_config, "num_hidden_layers", None)
@@ -841,6 +845,14 @@ class KVCacheRecvingThread(threading.Thread):
         first, last = self.pp_layer_indices[task["pp_rank"]]
         if task["pp_rank"] == self._prefill_pp_size - 1:
             last += self.num_draft_layers
+            if self._dsa_mtp_enabled:
+                assert_mtp_main_layout_complete(
+                    self._dsa_main_local_layout,
+                    self._dsa_transformer_layers,
+                    request_id=command.request_id,
+                    num_model_layers=self.num_layers,
+                    num_draft_layers=self.num_draft_layers,
+                )
         # Assemble both phases before Transfer Engine submission so missing components cannot
         # silently yield a partial successful transfer. No device reformat for Host.
         plans = []
@@ -872,6 +884,14 @@ class KVCacheRecvingThread(threading.Thread):
                     dtypes[remote_layer][position],
                     remote_capacity,
                 )
+                if self._dsa_mtp_enabled and not indexer and transformer_layer >= self.num_layers:
+                    assert_mtp_tail_block_coverage(
+                        local,
+                        remote,
+                        request_id=command.request_id,
+                        start_token=start,
+                        end_token=end,
+                    )
                 part = build_component_read(
                     local,
                     remote,

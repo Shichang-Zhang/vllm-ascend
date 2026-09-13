@@ -47,6 +47,63 @@ def layout_span_bytes(layout: DsaCacheLayout) -> int:
     return (physical_pages - 1) * layout.stride + layout.block_bytes
 
 
+def assert_mtp_main_layout_complete(
+    layouts: list[DsaCacheLayout],
+    transformer_layers: dict[str, int],
+    *,
+    request_id: str,
+    num_model_layers: int,
+    num_draft_layers: int,
+) -> None:
+    """Assert that each configured draft layer has a DSA Main layout."""
+    expected_layers = set(range(num_model_layers, num_model_layers + num_draft_layers))
+    layouts_by_layer: dict[int, list[DsaCacheLayout]] = {}
+    for layout in layouts:
+        transformer_layer = transformer_layers[layout.layer_name]
+        if transformer_layer in expected_layers:
+            layouts_by_layer.setdefault(transformer_layer, []).append(layout)
+
+    missing_layers = expected_layers - layouts_by_layer.keys()
+    if missing_layers:
+        raise AssertionError(
+            "Mooncake MTP Main layout is incomplete: "
+            f"request={request_id}, missing_layers={sorted(missing_layers)}, "
+            f"expected_layers={sorted(expected_layers)}"
+        )
+
+
+def assert_mtp_tail_block_coverage(
+    local: DsaCacheLayout,
+    remote: DsaCacheLayout,
+    *,
+    request_id: str,
+    start_token: int,
+    end_token: int,
+) -> None:
+    """Expose DSA exact-range transfers that leave an MTP tail partial.
+
+    MemFabric copies the complete final physical block, while DSA currently
+    copies only ``[start_token, end_token)``. Until the MTP cache consumer's
+    tail semantics are proven equivalent, make that difference observable at
+    runtime instead of allowing potentially stale tail slots to be consumed.
+    """
+    local_remainder = end_token % local.block_tokens
+    remote_remainder = end_token % remote.block_tokens
+    if local_remainder or remote_remainder:
+        local_aligned_end = end_token + (-end_token % local.block_tokens)
+        remote_aligned_end = end_token + (-end_token % remote.block_tokens)
+        raise AssertionError(
+            "Mooncake MTP receive ends inside a cache block while MemFabric "
+            "copies the complete final block: "
+            f"request={request_id}, token_range=[{start_token},{end_token}), "
+            f"layer={local.layer_name}, position={local.position}, "
+            f"local_block_tokens={local.block_tokens}, "
+            f"local_aligned_end={local_aligned_end}, "
+            f"remote_block_tokens={remote.block_tokens}, "
+            f"remote_aligned_end={remote_aligned_end}"
+        )
+
+
 def collect_bounded_register_regions(
     atoms: list[DsaRegisterAtom],
     *,
