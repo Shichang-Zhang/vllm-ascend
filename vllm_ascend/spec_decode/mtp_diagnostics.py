@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
@@ -87,3 +87,46 @@ def assert_mtp_topk_rows_front_aligned(
                 f"{token_indices_to_sample}. Compact the selected rows before "
                 "enabling skip_topk."
             )
+
+
+def assert_greedy_rejection_matches_reference(
+    actual_token_ids: torch.Tensor,
+    reference_token_ids: torch.Tensor,
+) -> None:
+    """Synchronously compare Triton rejection output with its safe reference."""
+    if actual_token_ids.shape != reference_token_ids.shape:
+        raise AssertionError(
+            "[DEBUG] Ascend greedy rejection output shape differs from the "
+            "PyTorch reference: "
+            f"actual={tuple(actual_token_ids.shape)}, "
+            f"reference={tuple(reference_token_ids.shape)}."
+        )
+    # torch.equal returns a Host bool and intentionally synchronizes the NPU.
+    if not torch.equal(actual_token_ids, reference_token_ids):
+        mismatch = actual_token_ids != reference_token_ids
+        mismatch_count = int(mismatch.sum().item())
+        first_mismatch = mismatch.nonzero(as_tuple=False)[0].tolist()
+        row, column = first_mismatch
+        raise AssertionError(
+            "[DEBUG] Ascend Triton greedy rejection differs from the safe "
+            "PyTorch reference; this run may be affected by the lane-zero "
+            "prefix read fixed by 8e8d1cb28: "
+            f"mismatches={mismatch_count}, first=({row}, {column}), "
+            f"actual_token={int(actual_token_ids[row, column].item())}, "
+            f"reference_token={int(reference_token_ids[row, column].item())}."
+        )
+
+
+def assert_rejection_kernel_completed(
+    kernel_name: str,
+    synchronize: Callable[[], None],
+) -> None:
+    """Surface an asynchronous rejection-kernel device fault at its caller."""
+    try:
+        synchronize()
+    except RuntimeError as error:
+        raise AssertionError(
+            "[DEBUG] Ascend rejection sampling failed while synchronizing "
+            f"immediately after {kernel_name}; this run may have triggered "
+            "the out-of-bounds prefix read fixed by 8e8d1cb28."
+        ) from error

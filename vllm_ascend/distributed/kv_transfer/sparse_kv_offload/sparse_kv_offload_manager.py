@@ -1626,6 +1626,40 @@ class SparseKVOffloadManager:
             self.max_d2h_index_copy_tokens,
         )
 
+    @staticmethod
+    def _assert_eager_mtp_index_copy_contents(
+        *,
+        flat_host_k: torch.Tensor,
+        flat_host_v: torch.Tensor,
+        destinations: torch.Tensor,
+        expected_k: torch.Tensor,
+        expected_v: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        """Synchronously verify eager MTP writes for temporary diagnosis."""
+        actual_k = flat_host_k.index_select(0, destinations)
+        actual_v = flat_host_v.index_select(0, destinations)
+        failed_components: list[str] = []
+        # torch.equal returns a Host bool and therefore synchronizes the NPU.
+        # This is intentionally limited to the explicitly marked debug path.
+        if not torch.equal(actual_k, expected_k):
+            failed_components.append("k")
+        if not torch.equal(actual_v, expected_v):
+            failed_components.append("v")
+        if failed_components:
+            raise AssertionError(
+                "[DEBUG] Mooncake eager MTP current-KV index_copy content "
+                "mismatch: "
+                f"layer={layer_name}, components={failed_components}, "
+                f"rows={destinations.numel()}"
+            )
+        logger.info(
+            "[DEBUG] Mooncake eager MTP current-KV index_copy content "
+            "verified: layer=%s rows=%s",
+            layer_name,
+            destinations.numel(),
+        )
+
     def _offload_new_kv_via_index_copy(
         self,
         *,
@@ -1711,16 +1745,27 @@ class SparseKVOffloadManager:
         if valid_indices.numel() == 0:
             return
         destinations = slots.index_select(0, valid_indices)
+        selected_k = k_rows.index_select(0, valid_indices)
+        selected_v = v_rows.index_select(0, valid_indices)
         flat_host_k.index_copy_(
             0,
             destinations,
-            k_rows.index_select(0, valid_indices),
+            selected_k,
         )
         flat_host_v.index_copy_(
             0,
             destinations,
-            v_rows.index_select(0, valid_indices),
+            selected_v,
         )
+        if is_mtp_cache:
+            self._assert_eager_mtp_index_copy_contents(
+                flat_host_k=flat_host_k,
+                flat_host_v=flat_host_v,
+                destinations=destinations,
+                expected_k=selected_k,
+                expected_v=selected_v,
+                layer_name=self.offload_layer_names[mtp_layer_id],
+            )
 
     def onload_topk_kv(
         self,

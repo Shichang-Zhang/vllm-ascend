@@ -32,6 +32,10 @@ from vllm_ascend.ops.triton.reject_sample import (
 )
 from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+from vllm_ascend.spec_decode.mtp_diagnostics import (
+    assert_greedy_rejection_matches_reference,
+    assert_rejection_kernel_completed,
+)
 
 
 class AscendRejectionSampler(RejectionSampler):
@@ -581,6 +585,43 @@ def rejection_sample(
                 synthetic_conditional_rates=synthetic_conditional_rates,
                 synthetic_mode=synthetic_mode,
             )
+            assert_rejection_kernel_completed(
+                "rejection_greedy_sample_with_triton",
+                torch.npu.current_stream().synchronize,
+            )
+            reference_token_ids = torch.full_like(
+                output_token_ids,
+                PLACEHOLDER_TOKEN_ID,
+            )
+            if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and sampling_metadata.all_greedy:
+                rejection_greedy_sample_spec_len_1_pytorch(
+                    reference_token_ids,
+                    draft_token_ids,
+                    target_argmax,
+                    bonus_token_ids,
+                    uniform_probs=uniform_probs_for_greedy,
+                    synthetic_conditional_rates=synthetic_conditional_rates,
+                    synthetic_mode=synthetic_mode,
+                )
+            else:
+                rejection_greedy_sample_pytorch(
+                    reference_token_ids,
+                    cu_num_draft_tokens,
+                    draft_token_ids,
+                    target_argmax,
+                    bonus_token_ids,
+                    num_draft_tokens,
+                    max_spec_len,
+                    is_greedy,
+                    uniform_probs=uniform_probs_for_greedy,
+                    synthetic_conditional_rates=synthetic_conditional_rates,
+                    synthetic_mode=synthetic_mode,
+                )
+            assert_greedy_rejection_matches_reference(
+                output_token_ids,
+                reference_token_ids,
+            )
+            logger.info_once("[DEBUG] Ascend Triton greedy rejection matches the safe PyTorch reference.")
         else:
             if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and sampling_metadata.all_greedy:
                 rejection_greedy_sample_spec_len_1_pytorch(
@@ -674,6 +715,10 @@ def rejection_sample(
                     POSTERIOR_ALPHA=posterior_alpha,
                     SUB_BLOCK=4 * 1024,
                     EPSILON=1e-10,
+                )
+                assert_rejection_kernel_completed(
+                    "rejection_random_sample_kernel(reduce_sample=True)",
+                    torch.npu.current_stream().synchronize,
                 )
             else:
                 rejection_random_sample_pytorch(
@@ -821,6 +866,10 @@ def rejection_sample(
                     SUB_BLOCK=4 * 1024,
                     EPSILON=1e-10,
                 )
+                assert_rejection_kernel_completed(
+                    "rejection_random_sample_kernel(reduce_sample=False)",
+                    torch.npu.current_stream().synchronize,
+                )
             else:
                 rejection_random_sample_pytorch(
                     output_token_ids,
@@ -930,6 +979,10 @@ def expand_batch_to_tokens(
     expanded_x = x.new_empty(num_tokens)
     if HAS_TRITON:
         expand_triton(batch_size, expanded_x, x, cu_num_tokens, replace_from, replace_to, max_num_tokens=MAX_SPEC_LEN)
+        assert_rejection_kernel_completed(
+            "expand_kernel",
+            torch.npu.current_stream().synchronize,
+        )
     else:
         expand_pytorch(
             expanded_x,
@@ -992,6 +1045,10 @@ def sample_recovered_tokens(
             SUB_BLOCK=4 * 1024,
             # TODO: enable multibuffer when accuracy problem is solved.
             multibuffer=False,
+        )
+        assert_rejection_kernel_completed(
+            "sample_recovered_tokens_kernel",
+            torch.npu.current_stream().synchronize,
         )
     elif use_block_verify:
         sample_recovered_tokens_blockwise_pytorch(

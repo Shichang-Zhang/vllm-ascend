@@ -56,6 +56,35 @@ def test_eager_current_kv_index_copy_filters_invalid_slots():
     assert torch.count_nonzero(host_v[0]).item() == 0
 
 
+def test_eager_mtp_index_copy_content_verification_rejects_mismatch():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    with pytest.raises(AssertionError, match=r"components=\['k', 'v'\]"):
+        manager._assert_eager_mtp_index_copy_contents(
+            flat_host_k=torch.zeros((2, 2), dtype=torch.bfloat16),
+            flat_host_v=torch.zeros((2, 1), dtype=torch.bfloat16),
+            destinations=torch.tensor([1], dtype=torch.int64),
+            expected_k=torch.ones((1, 2), dtype=torch.bfloat16),
+            expected_v=torch.ones((1, 1), dtype=torch.bfloat16),
+            layer_name="mtp.layer",
+        )
+
+
+def test_eager_mtp_index_copy_content_verification_accepts_exact_copy(caplog):
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    host_k = torch.tensor([[0, 0], [1, 2]], dtype=torch.bfloat16)
+    host_v = torch.tensor([[0], [3]], dtype=torch.bfloat16)
+    with caplog.at_level("INFO"):
+        manager._assert_eager_mtp_index_copy_contents(
+            flat_host_k=host_k,
+            flat_host_v=host_v,
+            destinations=torch.tensor([1], dtype=torch.int64),
+            expected_k=torch.tensor([[1, 2]], dtype=torch.bfloat16),
+            expected_v=torch.tensor([[3]], dtype=torch.bfloat16),
+            layer_name="mtp.layer",
+        )
+    assert "content verified" in caplog.text
+
+
 def test_graph_mooncake_writeback_waits_for_save_stream():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.tp_rank = 0

@@ -18,6 +18,8 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 assert_mtp_index_cache_state = _MODULE.assert_mtp_index_cache_state
 assert_mtp_topk_rows_front_aligned = _MODULE.assert_mtp_topk_rows_front_aligned
+assert_greedy_rejection_matches_reference = _MODULE.assert_greedy_rejection_matches_reference
+assert_rejection_kernel_completed = _MODULE.assert_rejection_kernel_completed
 
 
 class FakeMTPAttention(nn.Module):
@@ -118,3 +120,32 @@ def test_accepts_forwarded_state_and_compacted_rows():
         model,
         torch.tensor([3, 7], dtype=torch.int32),
     )
+
+
+def test_greedy_rejection_reference_comparison_accepts_equal_outputs():
+    token_ids = torch.tensor([[1, 2, -1], [3, -1, -1]], dtype=torch.int32)
+
+    assert_greedy_rejection_matches_reference(token_ids, token_ids.clone())
+
+
+def test_greedy_rejection_reference_comparison_reports_first_mismatch():
+    actual = torch.tensor([[1, 2, -1], [3, -1, -1]], dtype=torch.int32)
+    reference = actual.clone()
+    reference[1, 0] = 4
+
+    with pytest.raises(AssertionError, match="8e8d1cb28"):
+        assert_greedy_rejection_matches_reference(actual, reference)
+
+
+def test_rejection_kernel_completion_accepts_successful_sync():
+    assert_rejection_kernel_completed("test_kernel", lambda: None)
+
+
+def test_rejection_kernel_completion_reports_device_error():
+    def fail_sync():
+        raise RuntimeError("device error 507035")
+
+    with pytest.raises(AssertionError, match="8e8d1cb28") as error:
+        assert_rejection_kernel_completed("test_kernel", fail_sync)
+
+    assert isinstance(error.value.__cause__, RuntimeError)
