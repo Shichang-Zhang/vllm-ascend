@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -492,6 +493,9 @@ struct CurrentKvIndexCopyPayload {
   int64_t max_num_tokens;
   int64_t num_host_slots;
   bool delete_after_run;
+  bool validate_only;
+  std::string label;
+  uint64_t invocation_count;
 };
 
 std::unique_ptr<CurrentKvIndexCopyPayload> make_current_kv_index_copy_payload(
@@ -513,7 +517,7 @@ std::unique_ptr<CurrentKvIndexCopyPayload> make_current_kv_index_copy_payload(
 
   return std::make_unique<CurrentKvIndexCopyPayload>(CurrentKvIndexCopyPayload{
       slot_mapping, src_idx_buffer, dst_idx_buffer, count_buffer, num_actual_tokens, max_num_tokens, num_host_slots,
-      false});
+      false, false, "", 0});
 }
 
 void build_current_kv_index_copy_descriptors(CurrentKvIndexCopyPayload* payload) noexcept {
@@ -548,6 +552,87 @@ void build_current_kv_index_copy_descriptors(CurrentKvIndexCopyPayload* payload)
     std::fill_n(dst_idx, payload->max_num_tokens, 0);
   }
   count[0] = num_copies;
+}
+
+bool validate_current_kv_index_copy_descriptors(CurrentKvIndexCopyPayload* payload) noexcept {
+  if (payload == nullptr) {
+    return false;
+  }
+  const auto* slots = payload->slot_mapping.data_ptr<int64_t>();
+  const auto* src_idx = payload->src_idx_buffer.data_ptr<int64_t>();
+  const auto* dst_idx = payload->dst_idx_buffer.data_ptr<int64_t>();
+  const auto descriptor_count = payload->count_buffer.data_ptr<int32_t>()[0];
+  int64_t expected_count = 0;
+  int64_t first_mismatch = -1;
+  int64_t first_expected_src = -1;
+  int64_t first_expected_dst = -1;
+  int64_t last_expected_src = 0;
+  int64_t last_expected_dst = 0;
+
+  for (int64_t token_idx = 0; token_idx < payload->num_actual_tokens; ++token_idx) {
+    const int64_t slot = slots[token_idx];
+    if (slot < 0 || slot >= payload->num_host_slots) {
+      continue;
+    }
+    if (first_mismatch < 0 &&
+        (src_idx[expected_count] != token_idx || dst_idx[expected_count] != slot)) {
+      first_mismatch = expected_count;
+      first_expected_src = token_idx;
+      first_expected_dst = slot;
+    }
+    last_expected_src = token_idx;
+    last_expected_dst = slot;
+    ++expected_count;
+  }
+
+  for (int64_t i = expected_count; i < payload->max_num_tokens; ++i) {
+    const int64_t expected_src = expected_count > 0 ? last_expected_src : 0;
+    const int64_t expected_dst = expected_count > 0 ? last_expected_dst : 0;
+    if (first_mismatch < 0 &&
+        (src_idx[i] != expected_src || dst_idx[i] != expected_dst)) {
+      first_mismatch = i;
+      first_expected_src = expected_src;
+      first_expected_dst = expected_dst;
+    }
+  }
+
+  const bool count_matches = descriptor_count == expected_count;
+  const bool descriptors_match = count_matches && first_mismatch < 0;
+  ++payload->invocation_count;
+  const bool periodic_sample = payload->invocation_count <= 8 ||
+                               (payload->invocation_count & (payload->invocation_count - 1)) == 0;
+  if (descriptors_match && !periodic_sample) {
+    return true;
+  }
+  std::cerr << (descriptors_match ? "INFO" : "ERROR")
+            << " Mooncake current-KV index_copy runtime validation: layer=" << payload->label
+            << ", invocation=" << payload->invocation_count
+            << ", token_count=" << payload->num_actual_tokens
+            << ", expected_valid=" << expected_count
+            << ", reused_valid=" << descriptor_count
+            << ", descriptor_match=" << (descriptors_match ? "true" : "false");
+  if (!descriptors_match) {
+    std::cerr << ", first_mismatch=" << first_mismatch;
+    if (first_mismatch >= 0) {
+      std::cerr << ", expected_src=" << first_expected_src
+                << ", reused_src=" << src_idx[first_mismatch]
+                << ", expected_dst=" << first_expected_dst
+                << ", reused_dst=" << dst_idx[first_mismatch];
+    }
+  }
+  std::cerr << std::endl;
+  return descriptors_match;
+}
+
+bool compute_current_kv_index_copy_validation(
+    const at::Tensor& slot_mapping, int64_t num_actual_tokens, int64_t max_num_tokens, int64_t num_host_slots,
+    const at::Tensor& src_idx_buffer, const at::Tensor& dst_idx_buffer, const at::Tensor& count_buffer,
+    const std::string& label) {
+  auto payload = make_current_kv_index_copy_payload(slot_mapping, num_actual_tokens, max_num_tokens, num_host_slots,
+                                                    src_idx_buffer, dst_idx_buffer, count_buffer);
+  payload->validate_only = true;
+  payload->label = label;
+  return validate_current_kv_index_copy_descriptors(payload.get());
 }
 
 int64_t compute_current_kv_index_copy_descriptors(
@@ -616,10 +701,46 @@ CurrentKvIndexCopyPayload* retain_current_kv_index_copy_graph_payload(
 
 void current_kv_index_copy_descriptor_callback(void* args) noexcept {
   auto* payload = static_cast<CurrentKvIndexCopyPayload*>(args);
-  build_current_kv_index_copy_descriptors(payload);
+  if (payload->validate_only) {
+    validate_current_kv_index_copy_descriptors(payload);
+  } else {
+    build_current_kv_index_copy_descriptors(payload);
+  }
   if (payload->delete_after_run) {
     delete payload;
   }
+}
+
+void enqueue_current_kv_index_copy_validation(
+    const at::Tensor& slot_mapping, int64_t num_actual_tokens, int64_t max_num_tokens, int64_t num_host_slots,
+    const at::Tensor& src_idx_buffer, const at::Tensor& dst_idx_buffer, const at::Tensor& count_buffer,
+    const std::string& label) {
+  auto payload = make_current_kv_index_copy_payload(slot_mapping, num_actual_tokens, max_num_tokens, num_host_slots,
+                                                    src_idx_buffer, dst_idx_buffer, count_buffer);
+  payload->validate_only = true;
+  payload->label = label;
+  const auto stream = c10_npu::getCurrentNPUStream().stream();
+  aclmdlRICaptureStatus capture_status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI model_ri = nullptr;
+  const aclError capture_ret = aclmdlRICaptureGetInfo(stream, &capture_status, &model_ri);
+  TORCH_CHECK(capture_ret == ACL_SUCCESS,
+              "aclmdlRICaptureGetInfo for current KV index_copy validation failed, error code: ", capture_ret);
+  TORCH_CHECK(capture_status != ACL_MODEL_RI_CAPTURE_STATUS_INVALIDATED,
+              "current KV index_copy validation cannot enqueue on an invalidated graph capture");
+  const bool graph_lifetime = capture_status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+  TORCH_CHECK(!graph_lifetime || model_ri != nullptr, "active graph capture returned a null model runtime instance");
+
+  payload->delete_after_run = !graph_lifetime;
+  auto* raw_payload = payload.get();
+  if (graph_lifetime) {
+    raw_payload = retain_current_kv_index_copy_graph_payload(model_ri, std::move(payload));
+  }
+  const aclError ret = aclrtLaunchHostFunc(stream, current_kv_index_copy_descriptor_callback, raw_payload);
+  if (ret == ACL_SUCCESS && !graph_lifetime) {
+    payload.release();
+  }
+  TORCH_CHECK(ret == ACL_SUCCESS, "aclrtLaunchHostFunc for current KV index_copy validation failed, error code: ",
+              ret);
 }
 
 void enqueue_current_kv_index_copy_descriptors(
@@ -856,7 +977,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Create a non-owning CPU int16 tensor view for a shared GVA");
   m.def("compute_current_kv_index_copy_descriptors", &compute_current_kv_index_copy_descriptors,
         "Build compact source/destination index_copy descriptors on CPU");
+  m.def("compute_current_kv_index_copy_validation", &compute_current_kv_index_copy_validation,
+        "Compare current KV index_copy descriptors on CPU");
   m.def("enqueue_current_kv_index_copy_descriptors", &enqueue_current_kv_index_copy_descriptors,
         "Enqueue graph-safe current KV index_copy descriptor generation");
+  m.def("enqueue_current_kv_index_copy_validation", &enqueue_current_kv_index_copy_validation,
+        "Compare graph-safe MTP current KV index_copy descriptors at runtime");
 
 }

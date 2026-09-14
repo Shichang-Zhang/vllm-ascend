@@ -1035,8 +1035,16 @@ class SparseKVOffloadManager:
             self.fused_plan_status_npu = self.fused_plan_metadata_npu[:1]
             self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            self._d2h_index_copy_descriptors_enqueued = False
+            self._d2h_index_copy_num_slots: int | None = None
             if self._uses_mooncake_host_pool() and self.tp_rank == 0:
                 self.d2h_slot_mapping_cpu = torch.zeros(
+                    self.max_d2h_index_copy_tokens,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.d2h_validation_slot_mapping_cpu = torch.zeros(
                     self.max_d2h_index_copy_tokens,
                     dtype=torch.int64,
                     device="cpu",
@@ -1074,6 +1082,15 @@ class SparseKVOffloadManager:
                     1,
                     dtype=torch.int32,
                     device=device,
+                )
+                logger.info(
+                    "Mooncake decode current-KV index_copy writeback enabled: "
+                    "tp_rank=%s descriptor_owner_layer=0 mtp_layer=%s "
+                    "descriptor_capacity=%s host_slots=%s",
+                    self.tp_rank,
+                    self.mtp_layer_id,
+                    self.max_d2h_index_copy_tokens,
+                    self.k_caches_cpu[0].shape[0] * self.k_caches_cpu[0].shape[1],
                 )
         self.d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
         self.d2h_token_indices_npu = torch.arange(self.max_num_tokens, dtype=torch.int64, device=device)
@@ -1537,6 +1554,8 @@ class SparseKVOffloadManager:
         token_count: int,
         num_slots: int,
     ) -> None:
+        self._d2h_index_copy_descriptors_enqueued = True
+        self._d2h_index_copy_num_slots = num_slots
         self.d2h_slot_mapping_cpu[:token_count].copy_(
             slots,
             non_blocking=True,
@@ -1561,6 +1580,50 @@ class SparseKVOffloadManager:
         self.d2h_index_count_npu.copy_(
             self.d2h_index_count_cpu,
             non_blocking=True,
+        )
+
+    def _enqueue_mtp_index_copy_validation(
+        self,
+        *,
+        slots: torch.Tensor,
+        token_count: int,
+        num_slots: int,
+        layer_name: str,
+    ) -> None:
+        if not self._d2h_index_copy_descriptors_enqueued:
+            raise AssertionError(
+                "Mooncake MTP current-KV index_copy attempted to reuse descriptors "
+                "before target layer 0 prepared them"
+            )
+        if self._d2h_index_copy_num_slots != num_slots:
+            raise AssertionError(
+                "Mooncake MTP current-KV index_copy host geometry differs from "
+                "the descriptor owner: "
+                f"owner_slots={self._d2h_index_copy_num_slots}, mtp_slots={num_slots}"
+            )
+        validation_slots = self.d2h_validation_slot_mapping_cpu
+        if validation_slots.numel() < token_count:
+            raise AssertionError(
+                "Mooncake MTP current-KV index_copy validation buffer is too small: "
+                f"tokens={token_count}, capacity={validation_slots.numel()}"
+            )
+        validation_slots[:token_count].copy_(slots, non_blocking=True)
+        self.sparse_kv_offload_cpp.enqueue_current_kv_index_copy_validation(
+            validation_slots,
+            token_count,
+            self.max_d2h_index_copy_tokens,
+            num_slots,
+            self.d2h_src_idx_cpu,
+            self.d2h_dst_idx_cpu,
+            self.d2h_index_count_cpu,
+            layer_name,
+        )
+        logger.info_once(
+            "Mooncake MTP current-KV index_copy runtime descriptor validation "
+            "enabled: layer=%s token_count=%s descriptor_capacity=%s",
+            layer_name,
+            token_count,
+            self.max_d2h_index_copy_tokens,
         )
 
     def _offload_new_kv_via_index_copy(
@@ -1606,12 +1669,27 @@ class SparseKVOffloadManager:
         if num_slots != flat_host_v.shape[0] or num_slots <= 0:
             raise ValueError("Mooncake Host K/V pools have incompatible token capacities")
 
+        mtp_layer_id = getattr(self, "mtp_layer_id", -1)
+        is_mtp_cache = (
+            0 <= mtp_layer_id < len(getattr(self, "k_caches_cpu", ()))
+            and k_cache_cpu.data_ptr() == self.k_caches_cpu[mtp_layer_id].data_ptr()
+        )
+        if is_mtp_cache and v_cache_cpu.data_ptr() != self.v_caches_cpu[mtp_layer_id].data_ptr():
+            raise AssertionError("Mooncake MTP current-KV index_copy K/V layer identities differ")
+
         if capturing:
             if prepare_descriptors:
                 self._prepare_current_kv_index_copy_descriptors(
                     slots=slots,
                     token_count=token_count,
                     num_slots=num_slots,
+                )
+            elif is_mtp_cache:
+                self._enqueue_mtp_index_copy_validation(
+                    slots=slots,
+                    token_count=token_count,
+                    num_slots=num_slots,
+                    layer_name=self.offload_layer_names[mtp_layer_id],
                 )
             current_kv_ready = torch_npu.npu.current_stream().record_event()
             with torch_npu.npu.stream(self.current_kv_save_stream):
@@ -2042,6 +2120,11 @@ class SparseKVOffloadManager:
     def wait_for_current_kv_writeback(self, capturing: bool = False) -> None:
         if self.use_fused_overlap and capturing and self.tp_rank == 0:
             torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
+            if self._uses_mooncake_host_pool():
+                logger.info_once(
+                    "Mooncake fused attention waits for the decode current-KV "
+                    "index_copy save stream before completing the layer"
+                )
 
     def _onload_topk_kv_cpu(self, args):
         # code that is incompatible with graph mode, compute here outside graph

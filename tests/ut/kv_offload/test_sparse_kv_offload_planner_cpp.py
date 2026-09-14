@@ -194,6 +194,47 @@ def test_current_kv_index_copy_descriptors_pad_last_valid(planner_helper):
     assert dst_idx.tolist() == [7, 3, 3, 3, 3, 3]
 
 
+def test_current_kv_index_copy_validation_detects_reused_mtp_slots(
+    planner_helper,
+):
+    owner_slots = torch.tensor([7, -1, 3, 99], dtype=torch.int64)
+    mtp_slots = torch.tensor([7, -1, 4, 99], dtype=torch.int64)
+    max_num_tokens = 6
+    src_idx = torch.full((max_num_tokens,), -1, dtype=torch.int64)
+    dst_idx = torch.full((max_num_tokens,), -1, dtype=torch.int64)
+    count = torch.zeros(1, dtype=torch.int32)
+    planner_helper.compute_current_kv_index_copy_descriptors(
+        owner_slots,
+        4,
+        max_num_tokens,
+        16,
+        src_idx,
+        dst_idx,
+        count,
+    )
+
+    assert planner_helper.compute_current_kv_index_copy_validation(
+        owner_slots,
+        4,
+        max_num_tokens,
+        16,
+        src_idx,
+        dst_idx,
+        count,
+        "target",
+    )
+    assert not planner_helper.compute_current_kv_index_copy_validation(
+        mtp_slots,
+        4,
+        max_num_tokens,
+        16,
+        src_idx,
+        dst_idx,
+        count,
+        "mtp",
+    )
+
+
 def test_current_kv_index_copy_descriptors_survive_graph_replays(
     planner_helper,
 ):

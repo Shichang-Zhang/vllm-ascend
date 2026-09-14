@@ -186,6 +186,80 @@ def test_graph_mooncake_index_copy_runs_on_save_stream():
     sparse_kv_ops.enqueue_current_kv_index_copy_descriptors.assert_called_once()
 
 
+def test_graph_mooncake_mtp_validates_reused_descriptors():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.token_size_bytes_k = 2 * torch.bfloat16.itemsize
+    manager.token_size_bytes_v = torch.bfloat16.itemsize
+    manager.max_d2h_index_copy_tokens = 4
+    manager._d2h_index_copy_descriptors_enqueued = True
+    manager._d2h_index_copy_num_slots = 4
+    manager.d2h_validation_slot_mapping_cpu = torch.zeros(4, dtype=torch.int64)
+    manager.d2h_src_idx_cpu = torch.zeros(4, dtype=torch.int64)
+    manager.d2h_dst_idx_cpu = torch.full((4,), 2, dtype=torch.int64)
+    manager.d2h_index_count_cpu = torch.ones(1, dtype=torch.int32)
+    manager.d2h_src_idx_npu = torch.zeros(4, dtype=torch.int64)
+    manager.d2h_dst_idx_npu = torch.full((4,), 2, dtype=torch.int64)
+    manager.current_kv_save_stream = MagicMock()
+    manager.sparse_kv_offload_cpp = SimpleNamespace(
+        enqueue_current_kv_index_copy_validation=MagicMock(),
+    )
+    target_host_k = torch.zeros((4, 2), dtype=torch.bfloat16)
+    target_host_v = torch.zeros((4, 1), dtype=torch.bfloat16)
+    mtp_host_k = torch.zeros((4, 2), dtype=torch.bfloat16)
+    mtp_host_v = torch.zeros((4, 1), dtype=torch.bfloat16)
+    manager.k_caches_cpu = [target_host_k, mtp_host_k]
+    manager.v_caches_cpu = [target_host_v, mtp_host_v]
+    manager.offload_layer_names = ["layer.0", "mtp.layer"]
+    manager.mtp_layer_id = 1
+    current_stream = MagicMock()
+    current_stream.record_event.return_value = object()
+
+    with (
+        patch.object(manager_module.torch_npu.npu, "current_stream", return_value=current_stream),
+        patch.object(
+            manager_module.torch_npu.npu,
+            "stream",
+            side_effect=lambda _: nullcontext(),
+        ),
+    ):
+        manager._offload_new_kv_via_index_copy(
+            slot_mapping=torch.tensor([3], dtype=torch.int64),
+            k_cache_cpu=mtp_host_k,
+            v_cache_cpu=mtp_host_v,
+            k=torch.tensor([[1, 2]], dtype=torch.bfloat16),
+            v=torch.tensor([[3]], dtype=torch.bfloat16),
+            capturing=True,
+            prepare_descriptors=False,
+        )
+
+    assert manager.d2h_validation_slot_mapping_cpu.tolist() == [3, 0, 0, 0]
+    validation = manager.sparse_kv_offload_cpp.enqueue_current_kv_index_copy_validation
+    validation.assert_called_once_with(
+        manager.d2h_validation_slot_mapping_cpu,
+        1,
+        4,
+        4,
+        manager.d2h_src_idx_cpu,
+        manager.d2h_dst_idx_cpu,
+        manager.d2h_index_count_cpu,
+        "mtp.layer",
+    )
+
+
+def test_graph_mooncake_mtp_rejects_uninitialized_descriptors():
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager._d2h_index_copy_descriptors_enqueued = False
+    manager._d2h_index_copy_num_slots = None
+
+    with pytest.raises(AssertionError, match="before target layer 0 prepared"):
+        manager._enqueue_mtp_index_copy_validation(
+            slots=torch.tensor([3], dtype=torch.int64),
+            token_count=1,
+            num_slots=4,
+            layer_name="mtp.layer",
+        )
+
+
 def test_graph_mooncake_prepares_descriptors_on_first_layer_only():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.tp_rank = 0
