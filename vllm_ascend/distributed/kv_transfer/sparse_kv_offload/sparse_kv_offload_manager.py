@@ -1406,6 +1406,19 @@ class SparseKVOffloadManager:
                 capturing,
                 prepare_index_copy_descriptors,
             )
+            if (
+                use_mooncake_index_copy
+                and not has_prefill
+                and k is not None
+                and v is not None
+                and self.tp_size > 1
+            ):
+                # Ensure TP0's Decode Host-KV write is visible before peer
+                # ranks consume their local views of the shared Mooncake pool.
+                self.tp_group.broadcast(
+                    torch.empty([], dtype=torch.int8, device=k.device),
+                    src=0,
+                )
             return
 
         current_kv_ready = torch_npu.npu.current_stream().record_event()
