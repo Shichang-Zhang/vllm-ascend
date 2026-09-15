@@ -171,6 +171,7 @@ def test_nonstream_recompute_merges_one_logical_response() -> None:
                 "index": 0,
                 "message": {"role": "assistant", "reasoning": "R2", "content": "C2"},
                 "token_ids": [5, 6],
+                "prompt_token_ids": [1, 2, 3, 4],
                 "finish_reason": "stop",
                 "stop_reason": None,
             }
@@ -186,6 +187,7 @@ def test_nonstream_recompute_merges_one_logical_response() -> None:
         "content": "C1C2",
     }
     assert "token_ids" not in client_payload["choices"][0]
+    assert "prompt_token_ids" not in client_payload["choices"][0]
     assert "prompt_token_ids" not in client_payload
     assert client_payload["usage"] == {
         "prompt_tokens": 2,

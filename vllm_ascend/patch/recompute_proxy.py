@@ -125,6 +125,7 @@ class RecomputeContext:
             result.pop("prompt_token_ids", None)
             for choice in choices:
                 choice.pop("token_ids", None)
+                choice.pop("prompt_token_ids", None)
 
         usage = result.get("usage")
         if usage is not None and self.prompt_token_ids is not None:
