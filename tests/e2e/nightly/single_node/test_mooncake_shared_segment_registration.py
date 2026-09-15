@@ -23,11 +23,17 @@ import pytest
 
 GIB = 1024**3
 MIB = 1024**2
+KIB = 1024
 SHARED_SEGMENT_ALIGNMENT = 2 * MIB
 TEST_DEVICE_ID = 0
 TEST_REGISTER_LOCATION = f"npu:{TEST_DEVICE_ID}"
 MAX_REGISTER_REGION_SIZE = 64 * GIB - 2 * MIB
 LARGE_REGISTER_TOTAL_SIZE = 100 * GIB
+PMD_MAPPED_FIELDS = ("FilePmdMapped", "ShmemPmdMapped")
+SMAPS_ROLLUP_PATH = "/proc/self/smaps_rollup"
+MTHP_SIZE_BYTES = 2 * MIB
+MTHP_SYSFS_PATH = "/sys/kernel/mm/transparent_hugepage/hugepages-2048kB"
+MTHP_SHMEM_STAT_FIELDS = ("shmem_alloc", "shmem_fallback", "shmem_fallback_charge")
 
 REGISTER_REGION_SIZES = (
     pytest.param((32 * GIB,), id="32GiB"),
@@ -40,6 +46,71 @@ REGISTER_REGION_SIZES = (
         id="100GiB-split",
     ),
 )
+
+
+def _read_pmd_mapped_bytes() -> dict[str, int]:
+    """Read this process's file- and shmem-backed PMD mappings."""
+    mapped_bytes: dict[str, int] = {}
+    with open(SMAPS_ROLLUP_PATH, encoding="utf-8") as smaps_rollup:
+        for line in smaps_rollup:
+            field, separator, remainder = line.partition(":")
+            if not separator or field not in PMD_MAPPED_FIELDS:
+                continue
+            value, unit = remainder.split()
+            if unit != "kB":
+                raise RuntimeError(f"Unexpected {field} unit in {SMAPS_ROLLUP_PATH}: {unit}")
+            mapped_bytes[field] = int(value) * KIB
+
+    missing_fields = set(PMD_MAPPED_FIELDS) - mapped_bytes.keys()
+    if missing_fields:
+        raise RuntimeError(f"Missing PMD mapping counters in {SMAPS_ROLLUP_PATH}: {sorted(missing_fields)}")
+    return mapped_bytes
+
+
+def _read_mthp_shmem_stats() -> tuple[str, dict[str, int]] | None:
+    """Read the system-wide 2 MiB shmem mTHP policy and counters."""
+    policy_path = os.path.join(MTHP_SYSFS_PATH, "shmem_enabled")
+    try:
+        with open(policy_path, encoding="utf-8") as policy_file:
+            policy = policy_file.read().strip()
+    except FileNotFoundError:
+        return None
+
+    stats = {}
+    for field in MTHP_SHMEM_STAT_FIELDS:
+        stat_path = os.path.join(MTHP_SYSFS_PATH, "stats", field)
+        try:
+            with open(stat_path, encoding="utf-8") as stat_file:
+                stats[field] = int(stat_file.read())
+        except FileNotFoundError:
+            continue
+    return policy, stats
+
+
+def _log_mthp_shmem_delta(
+    before: tuple[str, dict[str, int]] | None,
+    after: tuple[str, dict[str, int]] | None,
+) -> None:
+    """Log system-wide 2 MiB shmem mTHP allocation activity."""
+    if before is None or after is None:
+        print(f"Mooncake 2 MiB shmem mTHP stats unavailable at {MTHP_SYSFS_PATH}")
+        return
+
+    policy, after_stats = after
+    _, before_stats = before
+    stat_deltas = {
+        field: after_stats[field] - before_stats[field]
+        for field in MTHP_SHMEM_STAT_FIELDS
+        if field in before_stats and field in after_stats
+    }
+    allocated_pages = stat_deltas.get("shmem_alloc")
+    allocated_gib = None if allocated_pages is None else allocated_pages * MTHP_SIZE_BYTES / GIB
+    delta_log = ", ".join(f"{field}_delta={stat_deltas.get(field, 'unavailable')}" for field in MTHP_SHMEM_STAT_FIELDS)
+    allocated_log = "unavailable" if allocated_gib is None else f"{allocated_gib:.3f} GiB"
+    print(
+        "Mooncake system-wide 2 MiB shmem mTHP activity after allocation: "
+        f"shmem_enabled={policy!r}, {delta_log}, allocated={allocated_log}"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -94,6 +165,8 @@ def test_register_large_mooncake_shared_segment(
 
     regions = []
     total_size_bytes = sum(region_sizes)
+    pmd_mapped_before = _read_pmd_mapped_bytes()
+    mthp_shmem_before = _read_mthp_shmem_stats()
     try:
         for region_index, size_bytes in enumerate(region_sizes):
             region = allocate_mooncake_host_region(
@@ -112,6 +185,20 @@ def test_register_large_mooncake_shared_segment(
             assert region.tensor.is_contiguous()
             assert region.tensor.numel() * region.tensor.element_size() == size_bytes
             assert region.tensor.data_ptr() % SHARED_SEGMENT_ALIGNMENT == 0
+
+        pmd_mapped_after = _read_pmd_mapped_bytes()
+        allocated_pmd_bytes = {
+            field: pmd_mapped_after[field] - pmd_mapped_before[field] for field in PMD_MAPPED_FIELDS
+        }
+        total_allocated_pmd_bytes = sum(allocated_pmd_bytes.values())
+        print(
+            "Mooncake shared-segment PMD allocation after allocation: "
+            f"requested={total_size_bytes / GIB:.3f} GiB, "
+            f"FilePmdMapped={allocated_pmd_bytes['FilePmdMapped'] / GIB:.3f} GiB, "
+            f"ShmemPmdMapped={allocated_pmd_bytes['ShmemPmdMapped'] / GIB:.3f} GiB, "
+            f"total={total_allocated_pmd_bytes / GIB:.3f} GiB"
+        )
+        _log_mthp_shmem_delta(mthp_shmem_before, _read_mthp_shmem_stats())
 
         # DSA Host pools use an explicit npu:<device_id> location so Mooncake
         # registers the Host VA against the die that consumes the shared pool.
