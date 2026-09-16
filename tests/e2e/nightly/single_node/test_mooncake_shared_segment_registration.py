@@ -28,7 +28,7 @@ SHARED_SEGMENT_ALIGNMENT = 2 * MIB
 TEST_DEVICE_ID = 0
 TEST_REGISTER_LOCATION = f"npu:{TEST_DEVICE_ID}"
 MAX_REGISTER_REGION_SIZE = 64 * GIB - 2 * MIB
-LARGE_REGISTER_TOTAL_SIZE = 100 * GIB
+SPLIT_REGISTER_TOTAL_SIZES = (70 * GIB, 80 * GIB, 100 * GIB)
 PMD_MAPPED_FIELDS = ("FilePmdMapped", "ShmemPmdMapped")
 SMAPS_ROLLUP_PATH = "/proc/self/smaps_rollup"
 MTHP_SIZE_BYTES = 2 * MIB
@@ -38,12 +38,15 @@ MTHP_SHMEM_STAT_FIELDS = ("shmem_alloc", "shmem_fallback", "shmem_fallback_charg
 REGISTER_REGION_SIZES = (
     pytest.param((32 * GIB,), id="32GiB"),
     pytest.param((MAX_REGISTER_REGION_SIZE,), id="64GiB-minus-2MiB"),
-    pytest.param(
-        (
-            MAX_REGISTER_REGION_SIZE,
-            LARGE_REGISTER_TOTAL_SIZE - MAX_REGISTER_REGION_SIZE,
-        ),
-        id="100GiB-split",
+    *(
+        pytest.param(
+            (
+                MAX_REGISTER_REGION_SIZE,
+                total_size - MAX_REGISTER_REGION_SIZE,
+            ),
+            id=f"{total_size // GIB}GiB-split",
+        )
+        for total_size in SPLIT_REGISTER_TOTAL_SIZES
     ),
 )
 
