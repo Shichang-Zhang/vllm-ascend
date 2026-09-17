@@ -82,6 +82,7 @@ FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT = (
 FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS = (
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
 )
+SFA_GRAPH_TRACE_LAYER_ID = 4
 
 
 _SUBSCRIBED_COMPUTE_STREAMS: set[object] = set()
@@ -527,6 +528,7 @@ class SparseKVOffloadManager:
         self.fused_overlap_membership_map: torch.Tensor | None = None
         self.fused_overlap_membership_map_rows = 0
         self.fused_overlap_membership_region: HostMemoryRegion | None = None
+        self.fused_overlap_membership_trace_cpu: torch.Tensor | None = None
         self.fused_overlap_planner_membership_map: torch.Tensor | None = None
         self.fused_overlap_membership_plan_device_staging: torch.Tensor | None = None
         self.fused_overlap_plan_owner_layer_id: int | None = None
@@ -659,6 +661,7 @@ class SparseKVOffloadManager:
             region.release()
             self.fused_overlap_membership_region = None
             self.fused_overlap_membership_map = None
+            self.fused_overlap_membership_trace_cpu = None
             self.fused_overlap_planner_membership_map = None
             self.fused_overlap_membership_plan_device_staging = None
         allocator = self._host_kv_allocator
@@ -874,6 +877,16 @@ class SparseKVOffloadManager:
             self.tp_group.barrier()
             self.fused_overlap_planner_membership_map = membership_map
 
+        if getattr(self, "index_copy_probe_enabled", False):
+            trace_host_ptr = int(membership_map.data_ptr())
+            if self._requires_fused_membership_staging():
+                trace_host_ptr = region.host_data_ptr
+                if trace_host_ptr is None or trace_host_ptr <= 0:
+                    raise RuntimeError("Mooncake membership trace requires a real CPU Host VA")
+            self.fused_overlap_membership_trace_cpu = self._restore_int16_tensor(
+                trace_host_ptr,
+                shape,
+            )
         self.fused_overlap_membership_map = membership_map
         self.fused_overlap_membership_map_rows = row_capacity
         return membership_map
@@ -1035,6 +1048,25 @@ class SparseKVOffloadManager:
             self.fused_plan_status_npu = self.fused_plan_metadata_npu[:1]
             self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            self.index_copy_probe_enabled = os.getenv(
+                "VLLM_ASCEND_SFA_INDEX_COPY_PROBE",
+                "0",
+            ).lower() in ("1", "true", "yes", "on")
+            self.index_copy_probe_slots_by_layer: dict[int, torch.Tensor] = {}
+            self.index_copy_probe_steps = 0
+            self.index_copy_probe_ready_broadcast_calls = 0
+            self.index_copy_probe_plan_calls = 0
+            if self.index_copy_probe_enabled:
+                self.graph_trace_index_compare_npu = torch.empty(
+                    2, dtype=torch.int64, device=device
+                )
+                logger.warning(
+                    "[SFA_INDEX_COPY_PROBE] enabled on tp_rank=%s; "
+                    "eager mode emits direct comparisons; graph mode emits "
+                    "bounded replay traces for index_copy, planner staging, "
+                    "shared membership, and fused-op membership inputs",
+                    self.tp_rank,
+                )
             if self._uses_mooncake_host_pool() and self.tp_rank == 0:
                 self.d2h_slot_mapping_cpu = torch.zeros(
                     self.max_d2h_index_copy_tokens,
@@ -1411,19 +1443,57 @@ class SparseKVOffloadManager:
                 capturing,
                 prepare_index_copy_descriptors,
             )
-            if (
-                use_mooncake_index_copy
-                and not has_prefill
-                and k is not None
-                and v is not None
-                and self.tp_size > 1
-            ):
-                # Ensure TP0's Decode Host-KV write is visible before peer
-                # ranks consume their local views of the shared Mooncake pool.
-                self.tp_group.broadcast(
-                    torch.empty([], dtype=torch.int8, device=k.device),
-                    src=0,
-                )
+            if use_mooncake_index_copy and not has_prefill and k is not None and v is not None:
+                # TP0 is the only rank that writes Decode K/V into the shared
+                # Mooncake Host pool.  Publish completion explicitly before any
+                # peer rank can enter the planner or read its local Device-VA
+                # view.  This mirrors the ordering broadcast used by the
+                # MemFabric sparse_copy path.
+                if self.tp_rank == 0 and not capturing:
+                    self._probe_mooncake_index_copy(
+                        layer_name,
+                        stage="tp0_post_write",
+                    )
+                if getattr(self, "index_copy_probe_enabled", False) and not capturing:
+                    self.index_copy_probe_ready_broadcast_calls += 1
+                    ready_call = self.index_copy_probe_ready_broadcast_calls
+                    logger.warning(
+                        "[SFA_READY_BCAST] ENTER call=%s layer=%s layer_id=%s "
+                        "tp_rank=%s tp_size=%s capturing=%s",
+                        ready_call,
+                        layer_name,
+                        self._get_offload_layer_id(layer_name),
+                        self.tp_rank,
+                        self.tp_size,
+                        capturing,
+                    )
+                if (
+                    self.tp_size > 1
+                    and os.getenv("VLLM_ASCEND_SFA_READY_BCAST", "1") != "0"
+                ):
+                    self.tp_group.broadcast(
+                        torch.empty([], dtype=torch.int8, device=k.device),
+                        src=0,
+                    )
+                if getattr(self, "index_copy_probe_enabled", False) and not capturing:
+                    logger.warning(
+                        "[SFA_READY_BCAST] RETURNED call=%s layer=%s layer_id=%s "
+                        "tp_rank=%s collective_executed=%s",
+                        ready_call,
+                        layer_name,
+                        self._get_offload_layer_id(layer_name),
+                        self.tp_rank,
+                        self.tp_size > 1
+                        and os.getenv("VLLM_ASCEND_SFA_READY_BCAST", "1") != "0",
+                    )
+                    # Do not stop here on failure: planner branch logs below are
+                    # still needed to determine whether can_reuse_owner_plan was
+                    # taken.  The existing all_tp_post_plan probe remains fatal.
+                    self._probe_mooncake_index_copy(
+                        layer_name,
+                        stage="all_tp_post_ready_broadcast",
+                        raise_on_failure=False,
+                    )
             return
 
         current_kv_ready = torch_npu.npu.current_stream().record_event()
@@ -1656,6 +1726,44 @@ class SparseKVOffloadManager:
             self.d2h_index_count_cpu,
             non_blocking=True,
         )
+        if getattr(self, "index_copy_probe_enabled", False):
+            layer_id = getattr(self, "graph_trace_capture_layer_id", -1)
+            self._enqueue_graph_trace_cpu(
+                "index_descriptor_src_cpu",
+                layer_id,
+                self.d2h_src_idx_cpu,
+                self.max_d2h_index_copy_tokens,
+            )
+            self._enqueue_graph_trace_cpu(
+                "index_descriptor_dst_cpu",
+                layer_id,
+                self.d2h_dst_idx_cpu,
+                self.max_d2h_index_copy_tokens,
+            )
+            self._enqueue_graph_trace_cpu(
+                "index_descriptor_count_cpu",
+                layer_id,
+                self.d2h_index_count_cpu,
+                1,
+            )
+            self._enqueue_graph_trace_cpu(
+                "index_descriptor_src_npu",
+                layer_id,
+                self.d2h_src_idx_npu,
+                self.max_d2h_index_copy_tokens,
+            )
+            self._enqueue_graph_trace_cpu(
+                "index_descriptor_dst_npu",
+                layer_id,
+                self.d2h_dst_idx_npu,
+                self.max_d2h_index_copy_tokens,
+            )
+            self._enqueue_graph_trace_cpu(
+                "index_descriptor_count_npu",
+                layer_id,
+                self.d2h_index_count_npu,
+                1,
+            )
 
     def _offload_new_kv_via_index_copy(
         self,
@@ -1720,6 +1828,27 @@ class SparseKVOffloadManager:
                     self.d2h_dst_idx_npu,
                     v_rows.index_select(0, self.d2h_src_idx_npu),
                 )
+                if getattr(self, "index_copy_probe_enabled", False):
+                    expected_k = k_rows.index_select(0, self.d2h_src_idx_npu)
+                    expected_v = v_rows.index_select(0, self.d2h_src_idx_npu)
+                    actual_k = flat_host_k.index_select(0, self.d2h_dst_idx_npu)
+                    actual_v = flat_host_v.index_select(0, self.d2h_dst_idx_npu)
+                    self.graph_trace_index_compare_npu[0].copy_(
+                        torch.count_nonzero(
+                            actual_k.view(torch.int16) != expected_k.view(torch.int16)
+                        )
+                    )
+                    self.graph_trace_index_compare_npu[1].copy_(
+                        torch.count_nonzero(
+                            actual_v.view(torch.int16) != expected_v.view(torch.int16)
+                        )
+                    )
+                    self._enqueue_graph_trace_cpu(
+                        "index_copy_host_mismatch_kv",
+                        getattr(self, "graph_trace_capture_layer_id", -1),
+                        self.graph_trace_index_compare_npu,
+                        2,
+                    )
             return
 
         valid = (slots >= 0) & (slots < num_slots)
@@ -1737,6 +1866,193 @@ class SparseKVOffloadManager:
             destinations,
             v_rows.index_select(0, valid_indices),
         )
+
+    def _assert_mooncake_device_va(
+        self,
+        mapped_host_k: torch.Tensor,
+        mapped_host_v: torch.Tensor,
+        current_k: torch.Tensor,
+        current_v: torch.Tensor,
+        *,
+        layer_name: str,
+    ) -> None:
+        """Require Mooncake shared memory to be accessed through NPU VA."""
+        if mapped_host_k.device.type == "cpu" or mapped_host_v.device.type == "cpu":
+            raise RuntimeError(
+                "[SFA_INDEX_COPY_PROBE] Mooncake shared segment must be "
+                "accessed through its NPU Device VA, not as a CPU tensor: "
+                f"layer={layer_name} tp_rank={self.tp_rank} "
+                f"k_device={mapped_host_k.device} v_device={mapped_host_v.device}"
+            )
+        if mapped_host_k.device != current_k.device or mapped_host_v.device != current_v.device:
+            raise RuntimeError(
+                "[SFA_INDEX_COPY_PROBE] mapped Host KV and current KV must be "
+                "on the same NPU device: "
+                f"layer={layer_name} tp_rank={self.tp_rank} "
+                f"mapped_k={mapped_host_k.device} current_k={current_k.device} "
+                f"mapped_v={mapped_host_v.device} current_v={current_v.device}"
+            )
+
+    def _probe_mooncake_index_copy(
+        self,
+        layer_name: str,
+        *,
+        stage: str,
+        raise_on_failure: bool = True,
+    ) -> None:
+        """Fail at the first Mooncake Decode Host-KV write mismatch."""
+        if not getattr(self, "index_copy_probe_enabled", False):
+            return
+        layer_id = self._get_offload_layer_id(layer_name)
+        current_kv = self.current_kv_by_layer.get(layer_id)
+        slot_mapping = self.index_copy_probe_slots_by_layer.get(layer_id)
+        if current_kv is None or slot_mapping is None:
+            raise RuntimeError(
+                "[SFA_INDEX_COPY_PROBE] missing current K/V or slot mapping: "
+                f"stage={stage} layer={layer_name} tp_rank={self.tp_rank}"
+            )
+
+        current_k, current_v = current_kv
+        token_dim_k = self.token_size_bytes_k // current_k.element_size()
+        token_dim_v = self.token_size_bytes_v // current_v.element_size()
+        current_k_rows = current_k.reshape(-1, token_dim_k)
+        current_v_rows = current_v.reshape(-1, token_dim_v)
+        mapped_host_k = self.k_caches_cpu[layer_id]
+        mapped_host_v = self.v_caches_cpu[layer_id]
+        self._assert_mooncake_device_va(
+            mapped_host_k,
+            mapped_host_v,
+            current_k,
+            current_v,
+            layer_name=layer_name,
+        )
+        mapped_host_k_rows = mapped_host_k.reshape(-1, token_dim_k)
+        mapped_host_v_rows = mapped_host_v.reshape(-1, token_dim_v)
+        slots = slot_mapping.reshape(-1).to(
+            device=current_k.device,
+            dtype=torch.int64,
+        )
+        token_count = slots.numel()
+        if (
+            current_k_rows.shape[0] != token_count
+            or current_v_rows.shape[0] != token_count
+        ):
+            raise RuntimeError(
+                "[SFA_INDEX_COPY_PROBE] row-count mismatch: "
+                f"stage={stage} layer={layer_name} tp_rank={self.tp_rank} "
+                f"slots={token_count} k_rows={current_k_rows.shape[0]} "
+                f"v_rows={current_v_rows.shape[0]}"
+            )
+
+        valid = (slots >= 0) & (slots < mapped_host_k_rows.shape[0])
+        source_rows = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        if source_rows.numel() == 0:
+            return
+        destinations = slots.index_select(0, source_rows)
+        if torch.unique(destinations).numel() != destinations.numel():
+            raise RuntimeError(
+                "[SFA_INDEX_COPY_PROBE] duplicate Decode destinations make "
+                "index_copy_ ordering undefined: "
+                f"stage={stage} layer={layer_name} tp_rank={self.tp_rank} "
+                f"slots={destinations.detach().cpu().tolist()}"
+            )
+
+        logger.warning(
+            "[SFA_CURRENT_HOST_READ] stage=%s step_hint=%s layer=%s "
+            "layer_id=%s tp_rank=%s kind=CURRENT_THIS_FORWARD rows=%s "
+            "source_rows=%s host_slots=%s",
+            stage, self.index_copy_probe_steps + (layer_id == 0),
+            layer_name, layer_id, self.tp_rank, token_count,
+            source_rows[:4].detach().cpu().tolist(),
+            destinations[:4].detach().cpu().tolist(),
+        )
+        expected_k = current_k_rows.index_select(0, source_rows)
+        expected_v = current_v_rows.index_select(0, source_rows)
+        # Both index_select operations dispatch to NPU. Their outputs are
+        # ordinary NPU tensors; only those copied results may later be reduced
+        # or transferred to CPU for diagnostic formatting.
+        actual_k = mapped_host_k_rows.index_select(0, destinations)
+        actual_v = mapped_host_v_rows.index_select(0, destinations)
+        # index_copy_ must preserve BF16 payloads bit-for-bit. Comparing the
+        # integer views also treats an unchanged NaN payload as a successful
+        # copy instead of reporting a false mismatch.
+        k_equal = torch.equal(
+            actual_k.view(torch.int16),
+            expected_k.view(torch.int16),
+        )
+        v_equal = torch.equal(
+            actual_v.view(torch.int16),
+            expected_v.view(torch.int16),
+        )
+        if not k_equal or not v_equal:
+            def mismatch_detail(
+                actual: torch.Tensor,
+                expected: torch.Tensor,
+                component: str,
+            ) -> str:
+                mismatch = actual.view(torch.int16) != expected.view(torch.int16)
+                first = torch.nonzero(mismatch, as_tuple=False)[0]
+                row = int(first[0].item())
+                col = int(first[1].item())
+                max_abs = float(
+                    (actual.float() - expected.float()).abs().max().item()
+                )
+                return (
+                    f"{component}:source_row={int(source_rows[row].item())},"
+                    f"slot={int(destinations[row].item())},element={col},"
+                    f"expected={float(expected[row, col].item())},"
+                    f"actual={float(actual[row, col].item())},max_abs={max_abs}"
+                )
+
+            details = []
+            if not k_equal:
+                details.append(mismatch_detail(actual_k, expected_k, "K"))
+            if not v_equal:
+                details.append(mismatch_detail(actual_v, expected_v, "V"))
+            detail = "; ".join(details)
+            logger.error(
+                "[SFA_INDEX_COPY_PROBE] FAIL stage=%s layer=%s layer_id=%s "
+                "tp_rank=%s token_count=%s %s",
+                stage,
+                layer_name,
+                layer_id,
+                self.tp_rank,
+                token_count,
+                detail,
+            )
+            if raise_on_failure:
+                raise RuntimeError(
+                    "[SFA_INDEX_COPY_PROBE] Mooncake Decode Host-KV mismatch: "
+                    f"stage={stage} layer={layer_name} layer_id={layer_id} "
+                    f"tp_rank={self.tp_rank} token_count={token_count} {detail}"
+                )
+            return
+
+        if stage == "all_tp_post_ready_broadcast":
+            logger.warning(
+                "[SFA_INDEX_COPY_PROBE] PASS stage=%s layer=%s layer_id=%s "
+                "tp_rank=%s token_count=%s slots=%s",
+                stage,
+                layer_name,
+                layer_id,
+                self.tp_rank,
+                token_count,
+                destinations.detach().cpu().tolist(),
+            )
+        elif stage == "all_tp_post_plan" and layer_id == 0:
+            self.index_copy_probe_steps += 1
+            step = self.index_copy_probe_steps
+            if step <= 8 or (step & (step - 1)) == 0 or step % 64 == 0:
+                logger.warning(
+                    "[SFA_INDEX_COPY_PROBE] PASS stage=%s step=%s layer=%s "
+                    "tp_rank=%s token_count=%s slots=%s",
+                    stage,
+                    step,
+                    layer_name,
+                    self.tp_rank,
+                    token_count,
+                    destinations.detach().cpu().tolist(),
+                )
 
     def onload_topk_kv(
         self,
@@ -1861,6 +2177,76 @@ class SparseKVOffloadManager:
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
 
+    def _enqueue_graph_trace_cpu(
+        self,
+        stage: str,
+        layer_id: int,
+        tensor: torch.Tensor,
+        logical_numel: int,
+    ) -> None:
+        if not getattr(self, "index_copy_probe_enabled", False):
+            return
+        descriptor_stage = stage.startswith("index_descriptor_")
+        if descriptor_stage:
+            if layer_id not in (0, self.mtp_layer_id):
+                return
+        elif layer_id != SFA_GRAPH_TRACE_LAYER_ID:
+            return
+        self.sparse_kv_offload_cpp.enqueue_graph_trace_tensor(
+            tensor,
+            stage,
+            layer_id,
+            self.tp_rank,
+            logical_numel,
+        )
+
+    def _trace_graph_plan_device_tensor(
+        self,
+        stage: str,
+        layer_id: int,
+        source: torch.Tensor,
+        *,
+        num_tokens: int,
+        plan_width: int,
+    ) -> None:
+        if not getattr(self, "index_copy_probe_enabled", False):
+            return
+        snapshot = source[:num_tokens, :plan_width]
+        self._enqueue_graph_trace_cpu(
+            stage,
+            layer_id,
+            snapshot,
+            num_tokens * plan_width,
+        )
+
+    def trace_graph_fused_membership_input(
+        self,
+        layer_name: str,
+        selection_membership_map: torch.Tensor,
+        *,
+        num_tokens: int,
+        capturing: bool,
+    ) -> None:
+        if not capturing or not getattr(self, "index_copy_probe_enabled", False):
+            return
+        layer_id = self._get_offload_layer_id(layer_name)
+        plan_start = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT - self.topk
+        plan_width = FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS - plan_start
+        trace_membership_map = getattr(self, "fused_overlap_membership_trace_cpu", None)
+        if trace_membership_map is not None:
+            selection_membership_map = trace_membership_map
+        plan_storage = selection_membership_map[
+            :num_tokens,
+            plan_start:FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS,
+        ]
+        self._trace_graph_plan_device_tensor(
+            "fused_membership_input",
+            layer_id,
+            plan_storage,
+            num_tokens=num_tokens,
+            plan_width=plan_width,
+        )
+
     def prepare_fused_overlap_external_plan(
         self,
         layer_name: str,
@@ -1950,8 +2336,50 @@ class SparseKVOffloadManager:
             and self.fused_overlap_plan_num_tokens == num_tokens
             and owner_map is not None
         )
+        if getattr(self, "index_copy_probe_enabled", False):
+            self.index_copy_probe_plan_calls += 1
+            plan_call = self.index_copy_probe_plan_calls
+            logger.warning(
+                "[SFA_PLAN_TRACE] DECISION call=%s layer=%s layer_id=%s "
+                "tp_rank=%s backend=%s capturing=%s skip_topk=%s "
+                "can_reuse_owner_plan=%s owner_layer_id=%s layer_gt_owner=%s "
+                "topk=%s owner_topk=%s topk_match=%s num_tokens=%s "
+                "owner_num_tokens=%s num_tokens_match=%s owner_map_present=%s "
+                "same_owner_map=%s selection_map_ptr=%s owner_map_ptr=%s",
+                plan_call,
+                layer_name,
+                layer_id,
+                self.tp_rank,
+                self.host_backend,
+                capturing,
+                skip_topk,
+                can_reuse_owner_plan,
+                owner_layer_id,
+                owner_layer_id is not None and layer_id > owner_layer_id,
+                self.topk,
+                self.fused_overlap_plan_topk,
+                self.fused_overlap_plan_topk == self.topk,
+                num_tokens,
+                self.fused_overlap_plan_num_tokens,
+                self.fused_overlap_plan_num_tokens == num_tokens,
+                owner_map is not None,
+                owner_map is not None
+                and selection_membership_map.data_ptr() == owner_map.data_ptr(),
+                selection_membership_map.data_ptr(),
+                owner_map.data_ptr() if owner_map is not None else None,
+            )
         if can_reuse_owner_plan:
             assert owner_map is not None
+            if getattr(self, "index_copy_probe_enabled", False):
+                logger.warning(
+                    "[SFA_PLAN_TRACE] REUSE_ENTER call=%s layer=%s layer_id=%s "
+                    "tp_rank=%s copy_owner_map=%s metadata_broadcast_will_run=False",
+                    plan_call,
+                    layer_name,
+                    layer_id,
+                    self.tp_rank,
+                    selection_membership_map.data_ptr() != owner_map.data_ptr(),
+                )
             if selection_membership_map.data_ptr() != owner_map.data_ptr():
                 if capturing:
                     torch_npu.npu.current_stream().wait_stream(self.fused_plan_stream)
@@ -1959,7 +2387,26 @@ class SparseKVOffloadManager:
                     owner_map[:num_tokens, plan_start:FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS],
                     non_blocking=capturing,
                 )
+            if getattr(self, "index_copy_probe_enabled", False):
+                logger.warning(
+                    "[SFA_PLAN_TRACE] REUSE_RETURN call=%s layer=%s layer_id=%s "
+                    "tp_rank=%s",
+                    plan_call,
+                    layer_name,
+                    layer_id,
+                    self.tp_rank,
+                )
             return True
+
+        if getattr(self, "index_copy_probe_enabled", False):
+            logger.warning(
+                "[SFA_PLAN_TRACE] NORMAL_PLANNER_ENTER call=%s layer=%s "
+                "layer_id=%s tp_rank=%s metadata_broadcast_will_run=True",
+                plan_call,
+                layer_name,
+                layer_id,
+                self.tp_rank,
+            )
 
         def run_planner(enqueue: bool) -> None:
             planner = (
@@ -2005,7 +2452,57 @@ class SparseKVOffloadManager:
                     self.lru_req_ids_cpu[:num_tokens].copy_(req_ids_npu, non_blocking=True)
                     self.lru_stable_prefix_lens_cpu[:num_tokens].copy_(stable_prefix_lens_npu, non_blocking=True)
                     self.lru_visible_seq_lens_cpu[:num_tokens].copy_(visible_seq_lens_npu, non_blocking=True)
+                    if getattr(self, "index_copy_probe_enabled", False):
+                        self._enqueue_graph_trace_cpu(
+                            "planner_req_ids_cpu",
+                            layer_id,
+                            self.lru_req_ids_cpu[:num_tokens],
+                            num_tokens,
+                        )
+                        self._enqueue_graph_trace_cpu(
+                            "planner_stable_prefix_cpu",
+                            layer_id,
+                            self.lru_stable_prefix_lens_cpu[:num_tokens],
+                            num_tokens,
+                        )
+                        self._enqueue_graph_trace_cpu(
+                            "planner_visible_seq_cpu",
+                            layer_id,
+                            self.lru_visible_seq_lens_cpu[:num_tokens],
+                            num_tokens,
+                        )
+                        self._enqueue_graph_trace_cpu(
+                            "planner_topk_cpu",
+                            layer_id,
+                            self.lru_topk_indices_cpu[:num_tokens],
+                            num_tokens * self.topk,
+                        )
                     run_planner(enqueue=True)
+                    if getattr(self, "index_copy_probe_enabled", False):
+                        self._enqueue_graph_trace_cpu(
+                            "planner_output_cpu",
+                            layer_id,
+                            planner_storage,
+                            num_tokens * plan_width,
+                        )
+                        self._enqueue_graph_trace_cpu(
+                            "planner_miss_count_cpu",
+                            layer_id,
+                            self.lru_miss_count_cpu_list[layer_id][:num_tokens],
+                            num_tokens,
+                        )
+                        self._enqueue_graph_trace_cpu(
+                            "planner_miss_tokens_cpu",
+                            layer_id,
+                            self.lru_miss_tokens_cpu_list[layer_id][:num_tokens],
+                            num_tokens * self.topk,
+                        )
+                        self._enqueue_graph_trace_cpu(
+                            "planner_miss_slots_cpu",
+                            layer_id,
+                            self.lru_miss_slots_cpu_list[layer_id][:num_tokens],
+                            num_tokens * self.topk,
+                        )
                     self.fused_plan_current_linear_slots_npu[:num_tokens].copy_(
                         self.lru_physical_row_workspace[
                             self.max_num_topk_rows * 2 : self.max_num_topk_rows * 2 + num_tokens
@@ -2013,8 +2510,47 @@ class SparseKVOffloadManager:
                         non_blocking=True,
                     )
                     publish_plan(non_blocking=True)
+                    self._trace_graph_plan_device_tensor(
+                        "planner_npu_staging",
+                        layer_id,
+                        self.fused_overlap_membership_plan_device_staging,
+                        num_tokens=num_tokens,
+                        plan_width=plan_width,
+                    )
+                if getattr(self, "index_copy_probe_enabled", False):
+                    logger.warning(
+                        "[SFA_PLAN_METADATA_BCAST] ENTER call=%s layer=%s "
+                        "layer_id=%s tp_rank=%s mode=capturing",
+                        plan_call,
+                        layer_name,
+                        layer_id,
+                        self.tp_rank,
+                    )
                 self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+                shared_trace_storage = plan_storage
+                trace_membership_map = getattr(self, "fused_overlap_membership_trace_cpu", None)
+                if trace_membership_map is not None:
+                    shared_trace_storage = trace_membership_map[
+                        :num_tokens,
+                        plan_start:FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS,
+                    ]
+                self._trace_graph_plan_device_tensor(
+                    "shared_membership_after_publish",
+                    layer_id,
+                    shared_trace_storage,
+                    num_tokens=num_tokens,
+                    plan_width=plan_width,
+                )
             torch_npu.npu.current_stream().wait_stream(self.fused_plan_stream)
+            if getattr(self, "index_copy_probe_enabled", False):
+                logger.warning(
+                    "[SFA_PLAN_METADATA_BCAST] RETURNED call=%s layer=%s "
+                    "layer_id=%s tp_rank=%s mode=capturing",
+                    plan_call,
+                    layer_name,
+                    layer_id,
+                    self.tp_rank,
+                )
             self.fused_overlap_plan_owner_layer_id = layer_id
             self.fused_overlap_plan_topk = self.topk
             self.fused_overlap_plan_num_tokens = num_tokens
@@ -2039,8 +2575,28 @@ class SparseKVOffloadManager:
             except Exception as exc:
                 planner_error = exc
                 self.fused_plan_status_npu.fill_(1)
+        if getattr(self, "index_copy_probe_enabled", False):
+            logger.warning(
+                "[SFA_PLAN_METADATA_BCAST] ENTER call=%s layer=%s layer_id=%s "
+                "tp_rank=%s mode=eager",
+                plan_call,
+                layer_name,
+                layer_id,
+                self.tp_rank,
+            )
         self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
-        if int(self.fused_plan_status_npu.item()) != 0:
+        plan_status = int(self.fused_plan_status_npu.item())
+        if getattr(self, "index_copy_probe_enabled", False):
+            logger.warning(
+                "[SFA_PLAN_METADATA_BCAST] RETURNED call=%s layer=%s layer_id=%s "
+                "tp_rank=%s mode=eager status=%s",
+                plan_call,
+                layer_name,
+                layer_id,
+                self.tp_rank,
+                plan_status,
+            )
+        if plan_status != 0:
             detail = (
                 f"{type(planner_error).__name__}: {planner_error}"
                 if planner_error is not None
@@ -2054,6 +2610,124 @@ class SparseKVOffloadManager:
         self.fused_overlap_plan_num_tokens = num_tokens
         self.fused_overlap_plan_membership_map = selection_membership_map
         return True
+
+    def debug_mooncake_selection(
+        self, layer_name, *, block_table, req_ids, stable_prefix_lens,
+        topk_indices, selection_kv_cache,
+        selection_k_rope, skip_topk,
+    ) -> None:
+        """Eager-only diagnostics; candidates are NOT necessarily LRU misses."""
+        if not getattr(self, "index_copy_probe_enabled", False):
+            return
+        # ForwardContext.capturing can differ from nested ACL capture state.
+        # Never execute synchronous .cpu()/.item() probes in an active capture.
+        if torch_npu.npu.is_current_stream_capturing():
+            return
+        layer_id = self._get_offload_layer_id(layer_name)
+        step = self.index_copy_probe_steps
+        if step > 16 and step % 64:
+            return
+        current_k, current_v = self.current_kv_by_layer[layer_id]
+        slots = self.index_copy_probe_slots_by_layer[layer_id].reshape(-1)
+        table = block_table.detach().cpu()
+        topk = topk_indices.reshape(topk_indices.shape[0], -1).detach().cpu()
+        owner = self.fused_overlap_plan_owner_layer_id
+        reused = owner != layer_id
+        linear = self.fused_plan_current_linear_slots_npu.reshape(-1)
+        current_k_rows = current_k.reshape(
+            -1, selection_kv_cache.shape[-1]
+        )
+        current_v_rows = current_v.reshape(
+            -1, selection_k_rope.shape[-1]
+        )
+        rows = min(
+            slots.numel(),
+            req_ids.numel(),
+            stable_prefix_lens.numel(),
+            table.shape[0],
+            topk.shape[0],
+            linear.numel(),
+            current_k_rows.shape[0],
+            current_v_rows.shape[0],
+            4,
+        )
+        stable = stable_prefix_lens[:rows].detach().cpu().tolist()
+        ids = req_ids[:rows].detach().cpu().tolist()
+        selected_k = selection_kv_cache.reshape(-1, selection_kv_cache.shape[-1]).index_select(
+            0, linear[:rows].to(torch.int64)
+        )
+        selected_v = selection_k_rope.reshape(-1, selection_k_rope.shape[-1]).index_select(
+            0, linear[:rows].to(torch.int64)
+        )
+        expected_k = current_k_rows[:rows]
+        expected_v = current_v_rows[:rows]
+        logger.warning(
+            "[SFA_KV_CONTEXT] step=%s layer=%s layer_id=%s tp_rank=%s "
+            "plan_owner=%s plan_reused=%s skip_topk=%s token_rows=%s "
+            "current_host_slots=%s current_selection_slots=%s "
+            "current_selection_k_equal=%s current_selection_v_equal=%s "
+            "host_local_va_k=%s host_local_va_v=%s",
+            step, layer_name, layer_id, self.tp_rank, owner, reused, skip_topk,
+            rows, slots[:rows].detach().cpu().tolist(),
+            linear[:rows].detach().cpu().tolist(),
+            torch.equal(selected_k.view(torch.int16), expected_k.view(torch.int16)),
+            torch.equal(selected_v.view(torch.int16), expected_v.view(torch.int16)),
+            hex(self.k_caches_cpu[layer_id].data_ptr()),
+            hex(self.v_caches_cpu[layer_id].data_ptr()),
+        )
+        for row in range(rows):
+            request_id = int(ids[row])
+            ordinal = sum(int(previous_id) == request_id for previous_id in ids[:row])
+            current_pos = int(stable[row]) + ordinal
+            history = [int(p) for p in topk[row].tolist() if 0 <= p < int(stable[row])][:4]
+            history_slots = [
+                int(table[row, p // self.block_size]) * self.block_size
+                + p % self.block_size for p in history
+                if p // self.block_size < table.shape[1]
+            ]
+            summaries = {}
+            if history_slots:
+                for name, host in (("k", self.k_caches_cpu[layer_id]),
+                                   ("v", self.v_caches_cpu[layer_id])):
+                    width = (self.token_size_bytes_k if name == "k"
+                             else self.token_size_bytes_v) // host.element_size()
+                    indices = torch.tensor(history_slots, dtype=torch.int64, device=host.device)
+                    # Gather on NPU first: never CPU-dereference a Device VA.
+                    gathered = host.reshape(-1, width).index_select(0, indices)
+                    bits = gathered.view(torch.int16)
+                    summaries[name] = {
+                        "nonzero_elements": torch.count_nonzero(bits, dim=1).cpu().tolist(),
+                        "bit_sum": bits.to(torch.int64).sum(dim=1).cpu().tolist(),
+                    }
+            misses = None
+            if self.tp_rank == 0 and not reused:
+                miss_counts = self.lru_miss_count_cpu_list[layer_id].reshape(-1)
+                miss_tokens = self.lru_miss_tokens_cpu_list[layer_id]
+                if row < miss_counts.numel() and row < miss_tokens.shape[0]:
+                    count = int(miss_counts[row])
+                    misses = {
+                        "count": count,
+                        "sample_token_positions": miss_tokens[
+                            row, :min(count, 4)
+                        ].tolist(),
+                    }
+                else:
+                    misses = {
+                        "unavailable": "planner metadata has fewer token rows",
+                        "count_rows": miss_counts.numel(),
+                        "token_rows": miss_tokens.shape[0],
+                    }
+            logger.warning(
+                "[SFA_KV_ROWS] step=%s layer_id=%s tp_rank=%s row=%s "
+                "request_id=%s request_token_ordinal=%s stable_prefix_len=%s "
+                "current_token_pos=%s current_host_slot=%s "
+                "history_topk_candidate_positions=%s history_host_slots=%s "
+                "history_candidate_payload=%s planner_misses=%s "
+                "note=candidates_include_hits_and_misses;zero_is_not_proof_of_corruption",
+                step, layer_id, self.tp_rank, row, request_id, ordinal,
+                stable[row], current_pos, int(slots[row].item()), history,
+                history_slots, summaries, misses,
+            )
 
     def _validate_fused_overlap_external_plan_inputs(
         self,
@@ -2118,6 +2792,12 @@ class SparseKVOffloadManager:
         capturing: bool = False,
     ) -> None:
         layer_id = self._get_offload_layer_id(layer_name)
+        if not capturing:
+            self._probe_mooncake_index_copy(
+                layer_name,
+                stage="all_tp_post_plan",
+                raise_on_failure=os.getenv("VLLM_ASCEND_SFA_PROBE_FAIL_FAST", "1") != "0",
+            )
         current_kv = self.current_kv_by_layer.get(layer_id)
         if current_kv is None:
             raise RuntimeError(f"current decode K/V is unavailable for fused layer {layer_name}")

@@ -46,6 +46,8 @@ class HostMemoryRegion:
     handle: Any = None
     release_callback: Callable[[Any], None] | None = None
     segment_offset: int = 0
+    # CPU mmap VA; tensor.data_ptr() may instead be a HostRegister device VA.
+    host_data_ptr: int | None = None
     _released: bool = field(default=False, init=False)
 
     def release(self) -> None:
@@ -134,6 +136,10 @@ def allocate_mooncake_host_region(
     raw = segment.tensors("pool")[0].reshape(-1)
     base_offset = _align_up(raw.data_ptr(), alignment) - raw.data_ptr()
     aligned = raw.narrow(0, base_offset, int(size_bytes))
+    # This allocation has exactly one block (pool), whose layout offset is 0.
+    host_base = int(segment.base_addr())
+    if host_base <= 0 or base_offset + int(size_bytes) > allocation_size_bytes:
+        raise RuntimeError("Mooncake shared segment exposed an invalid Host address or range")
     device = getattr(aligned, "device", None)
     if device is None or getattr(device, "type", None) == "cpu":
         raise RuntimeError(
@@ -144,6 +150,7 @@ def allocate_mooncake_host_region(
         tensor=aligned,
         handle=segment,
         segment_offset=base_offset,
+        host_data_ptr=host_base + base_offset,
     )
 
 

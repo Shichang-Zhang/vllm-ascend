@@ -10,7 +10,11 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
 #include <numeric>
+#include <sstream>
+#include <thread>
 #include <ATen/Parallel.h>
 #include <torch/script.h>
 
@@ -681,9 +685,69 @@ struct LruResidentCompactWithPlanPayload {
   bool delete_after_run;
 };
 
+struct GraphTracePayload {
+  at::Tensor cpu_tensor;
+  std::string stage;
+  int64_t layer_id;
+  int64_t tp_rank;
+  int64_t logical_numel;
+  uint64_t calls;
+  bool delete_after_run;
+};
+
+class GraphTraceSink {
+ public:
+  GraphTraceSink() {
+    std::thread([this]() { run(); }).detach();
+  }
+
+  void push(std::string record) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (records_.size() >= 8192) {
+        ++dropped_;
+        return;
+      }
+      records_.push_back(std::move(record));
+    }
+    ready_.notify_one();
+  }
+
+ private:
+  void run() {
+    while (true) {
+      std::string record;
+      uint64_t dropped = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [this]() { return !records_.empty(); });
+        record = std::move(records_.front());
+        records_.pop_front();
+        dropped = dropped_;
+        dropped_ = 0;
+      }
+      if (dropped != 0) {
+        std::cerr << "[SFA_GRAPH_TRACE] dropped=" << dropped << std::endl;
+      }
+      std::cerr << record << std::endl;
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::string> records_;
+  uint64_t dropped_ = 0;
+};
+
+GraphTraceSink& graph_trace_sink() {
+  static auto* sink = new GraphTraceSink();
+  return *sink;
+}
+
 struct LruResidentCompactGraphPayloadRegistry {
   aclmdlRI model_ri;
   std::vector<std::unique_ptr<LruResidentCompactWithPlanPayload>> payloads;
+  std::vector<std::unique_ptr<GraphTracePayload>> graph_trace_payloads;
 };
 
 std::mutex& lru_resident_compact_graph_registry_mutex() {
@@ -733,6 +797,142 @@ LruResidentCompactWithPlanPayload* retain_lru_resident_compact_graph_payload(
   }
   it->second->payloads.push_back(std::move(payload));
   return raw_payload;
+}
+
+GraphTracePayload* retain_graph_trace_payload(aclmdlRI model_ri, std::unique_ptr<GraphTracePayload> payload) {
+  auto* raw_payload = payload.get();
+  std::lock_guard<std::mutex> lock(lru_resident_compact_graph_registry_mutex());
+  auto& registries = lru_resident_compact_graph_registries();
+  auto it = registries.find(model_ri);
+  if (it == registries.end()) {
+    auto registry = std::make_unique<LruResidentCompactGraphPayloadRegistry>();
+    registry->model_ri = model_ri;
+    auto* raw_registry = registry.get();
+    it = registries.emplace(model_ri, std::move(registry)).first;
+    const aclError register_ret =
+        aclmdlRIDestroyRegisterCallback(model_ri, delete_lru_resident_compact_graph_payloads, raw_registry);
+    if (register_ret != ACL_SUCCESS) {
+      registries.erase(it);
+    }
+    TORCH_CHECK(register_ret == ACL_SUCCESS, "failed to bind graph trace payload registry to graph lifetime, error code: ",
+                register_ret);
+  }
+  it->second->graph_trace_payloads.push_back(std::move(payload));
+  return raw_payload;
+}
+
+const uint8_t* graph_trace_element_ptr(const at::Tensor& tensor, int64_t logical_index) {
+  int64_t storage_index = logical_index;
+  if (!tensor.is_contiguous()) {
+    const int64_t columns = tensor.size(1);
+    storage_index = (logical_index / columns) * tensor.stride(0) + logical_index % columns;
+  }
+  return static_cast<const uint8_t*>(tensor.data_ptr()) + storage_index * tensor.element_size();
+}
+
+template <typename T>
+void append_trace_values(std::ostringstream& out, const at::Tensor& tensor, int64_t count) {
+  out << " values=[";
+  for (int64_t index = 0; index < std::min<int64_t>(count, 8); ++index) {
+    if (index != 0) {
+      out << ',';
+    }
+    out << static_cast<int64_t>(*reinterpret_cast<const T*>(graph_trace_element_ptr(tensor, index)));
+  }
+  out << ']';
+}
+
+void graph_trace_callback(void* args) noexcept {
+  auto* payload = static_cast<GraphTracePayload*>(args);
+  const uint64_t call = ++payload->calls;
+  const bool sampled = call <= 4 || (call & (call - 1)) == 0 || call % 64 == 0;
+  if (sampled) {
+    try {
+      const auto& tensor = payload->cpu_tensor;
+      const int64_t count = std::min<int64_t>(payload->logical_numel, tensor.numel());
+      uint64_t hash = 1469598103934665603ULL;
+      for (int64_t index = 0; index < count; ++index) {
+        const auto* bytes = graph_trace_element_ptr(tensor, index);
+        for (int64_t byte = 0; byte < tensor.element_size(); ++byte) {
+          hash ^= bytes[byte];
+          hash *= 1099511628211ULL;
+        }
+      }
+      std::ostringstream out;
+      out << "[SFA_GRAPH_TRACE] stage=" << payload->stage << " call=" << call << " layer_id="
+          << payload->layer_id << " tp_rank=" << payload->tp_rank << " dtype="
+          << static_cast<int>(tensor.scalar_type())
+          << " numel=" << count << " hash=" << hash;
+      switch (tensor.scalar_type()) {
+        case at::ScalarType::Short:
+          append_trace_values<int16_t>(out, tensor, count);
+          break;
+        case at::ScalarType::Int:
+          append_trace_values<int32_t>(out, tensor, count);
+          break;
+        case at::ScalarType::Long:
+          append_trace_values<int64_t>(out, tensor, count);
+          break;
+        default:
+          break;
+      }
+      graph_trace_sink().push(out.str());
+    } catch (...) {
+      graph_trace_sink().push("[SFA_GRAPH_TRACE] callback_failed stage=" + payload->stage);
+    }
+  }
+  if (payload->delete_after_run) {
+    delete payload;
+  }
+}
+
+void enqueue_graph_trace_tensor(const at::Tensor& tensor, const std::string& stage, int64_t layer_id,
+                                int64_t tp_rank, int64_t logical_numel) {
+  TORCH_CHECK(tensor.device().is_cpu() || tensor.device().type() == c10::DeviceType::PrivateUse1,
+              "graph trace only supports CPU and NPU tensors, but got device ", tensor.device());
+  TORCH_CHECK(logical_numel >= 0 && logical_numel <= tensor.numel(), "invalid graph trace logical_numel");
+  const auto stream = c10_npu::getCurrentNPUStream().stream();
+  at::Tensor cpu_snapshot = tensor;
+  if (tensor.device().is_cpu()) {
+    TORCH_CHECK(tensor.is_contiguous() || (tensor.dim() == 2 && tensor.stride(1) == 1 && tensor.stride(0) > 0),
+                "strided CPU graph trace only supports dense rows in a 2D tensor, shape=", tensor.sizes(),
+                ", strides=", tensor.strides(), ", stage=", stage);
+  } else {
+    cpu_snapshot = at::empty(tensor.sizes(), tensor.options().device(at::kCPU).pinned_memory(true));
+    aclError memcpy_ret = ACL_SUCCESS;
+    if (tensor.is_contiguous()) {
+      const size_t num_bytes = tensor.numel() * tensor.element_size();
+      memcpy_ret = aclrtMemcpyAsync(cpu_snapshot.data_ptr(), num_bytes, tensor.data_ptr(), num_bytes,
+                                    ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    } else {
+      TORCH_CHECK(tensor.dim() == 2 && tensor.stride(1) == 1 && tensor.stride(0) > 0,
+                  "strided NPU graph trace only supports dense rows in a 2D tensor, shape=", tensor.sizes(),
+                  ", strides=", tensor.strides(), ", stage=", stage);
+      const size_t row_bytes = tensor.size(1) * tensor.element_size();
+      const size_t source_pitch = tensor.stride(0) * tensor.element_size();
+      memcpy_ret = aclrtMemcpy2dAsync(cpu_snapshot.data_ptr(), row_bytes, tensor.data_ptr(), source_pitch, row_bytes,
+                                      tensor.size(0), ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    }
+    TORCH_CHECK(memcpy_ret == ACL_SUCCESS, "graph trace D2H aclrtMemcpyAsync failed, error code: ", memcpy_ret,
+                ", stage=", stage);
+  }
+  aclmdlRICaptureStatus capture_status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI model_ri = nullptr;
+  const aclError capture_ret = aclmdlRICaptureGetInfo(stream, &capture_status, &model_ri);
+  TORCH_CHECK(capture_ret == ACL_SUCCESS, "aclmdlRICaptureGetInfo for graph trace failed, error code: ", capture_ret);
+  const bool graph_lifetime = capture_status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+  auto payload = std::make_unique<GraphTracePayload>(
+      GraphTracePayload{cpu_snapshot, stage, layer_id, tp_rank, logical_numel, 0, !graph_lifetime});
+  auto* raw_payload = payload.get();
+  if (graph_lifetime) {
+    TORCH_CHECK(model_ri != nullptr, "active graph trace capture returned a null model runtime instance");
+    raw_payload = retain_graph_trace_payload(model_ri, std::move(payload));
+  }
+  const aclError ret = aclrtLaunchHostFunc(stream, graph_trace_callback, raw_payload);
+  if (ret == ACL_SUCCESS && !graph_lifetime) {
+    payload.release();
+  }
+  TORCH_CHECK(ret == ACL_SUCCESS, "aclrtLaunchHostFunc for graph trace failed, error code: ", ret);
 }
 
 void lru_resident_compact_with_plan_callback(void* args) noexcept {
@@ -858,5 +1058,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Build compact source/destination index_copy descriptors on CPU");
   m.def("enqueue_current_kv_index_copy_descriptors", &enqueue_current_kv_index_copy_descriptors,
         "Enqueue graph-safe current KV index_copy descriptor generation");
+  m.def("enqueue_graph_trace_tensor", &enqueue_graph_trace_tensor,
+        "Enqueue a bounded graph-replay trace for a pinned CPU tensor snapshot");
 
 }

@@ -995,6 +995,34 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             selection_k_rope=selection_k_rope,
             capturing=get_forward_context().capturing,
         )
+        try:
+            # These common inputs are already expanded from requests to MTP
+            # token rows. Raw attention metadata may have returned to its
+            # per-request shape by the time a later draft layer runs.
+            manager.debug_mooncake_selection(
+                layer_name,
+                block_table=common_inputs.full_kv_block_table,
+                req_ids=common_inputs.current_req_ids,
+                stable_prefix_lens=common_inputs.stable_prefix_lens,
+                topk_indices=topk_indices_decode,
+                selection_kv_cache=selection_kv_cache,
+                selection_k_rope=selection_k_rope,
+                skip_topk=self.skip_topk,
+            )
+        except Exception:
+            # Diagnostics must never turn a valid inference into a 500.
+            logger.exception(
+                "[SFA_KV_DEBUG_ERROR] selection diagnostics failed; "
+                "continuing inference layer=%s num_tokens=%s",
+                layer_name,
+                num_tokens,
+            )
+        manager.trace_graph_fused_membership_input(
+            layer_name,
+            selection_membership_map,
+            num_tokens=num_tokens,
+            capturing=get_forward_context().capturing,
+        )
         attn_output = fused_op(**fused_inputs)
         attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
         manager.wait_for_current_kv_writeback(get_forward_context().capturing)

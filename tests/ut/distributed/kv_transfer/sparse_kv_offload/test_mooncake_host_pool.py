@@ -32,6 +32,7 @@ class TestMooncakeHostPool(unittest.TestCase):
         raw.narrow.return_value = aligned
         segment = MagicMock()
         segment.tensors.return_value = [raw]
+        segment.base_addr.return_value = 0x70000000
 
         with (
             patch.object(
@@ -88,6 +89,7 @@ class TestMooncakeHostPool(unittest.TestCase):
         raw.narrow.return_value = aligned
         segment = MagicMock()
         segment.tensors.return_value = [raw]
+        segment.base_addr.return_value = 0x70000000
 
         with (
             patch.object(
@@ -116,6 +118,8 @@ class TestMooncakeHostPool(unittest.TestCase):
         self.assertIs(region.tensor, aligned)
         self.assertEqual(region.tensor.numel(), requested_size)
         self.assertEqual(region.segment_offset, alignment - 1)
+        self.assertEqual(region.host_data_ptr, 0x70000000 + alignment - 1)
+        self.assertNotEqual(region.host_data_ptr, aligned.data_ptr())
 
     def test_host_register_sets_migratepages_guard(self):
         key = "VLLM_ASCEND_SKIP_MIGRATEPAGES"
