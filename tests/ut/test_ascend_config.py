@@ -645,10 +645,35 @@ class TestSparseKVOffloadConfig(TestBase):
                 {"enabled": "true", "host_backend": "mooncake"},
             )
 
-    def test_mooncake_host_backend_rejects_colocate_staging(self):
-        with self.assertRaisesRegex(ValueError, "keep_device_kv_cache"):
+    def test_mooncake_host_backend_allows_standalone_colocate_staging(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=128)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            kv_transfer_config=None,
+            use_v2_model_runner=False,
+        )
+
+        config = SparseKVOffloadConfig.from_additional_config(
+            vllm_config,
+            {
+                "enabled": "true",
+                "host_backend": "mooncake",
+                "use_fused_overlap": "true",
+                "keep_device_kv_cache": "true",
+            },
+        )
+
+        self.assertTrue(config.keep_device_kv_cache)
+        self.assertEqual(config.host_backend, "mooncake")
+
+    def test_mooncake_host_backend_rejects_connector_colocate_staging(self):
+        with self.assertRaisesRegex(ValueError, "without kv_transfer_config"):
             SparseKVOffloadConfig.from_additional_config(
-                SimpleNamespace(),
+                SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True)),
                 {
                     "enabled": "true",
                     "host_backend": "mooncake",

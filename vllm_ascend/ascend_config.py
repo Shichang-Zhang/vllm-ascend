@@ -1103,11 +1103,14 @@ class SparseKVOffloadConfig:
                     "sparse_kv_offload_config.host_backend='mooncake' "
                     "requires use_fused_overlap=true"
                 )
-            if self.keep_device_kv_cache:
+            if (
+                self.keep_device_kv_cache
+                and getattr(vllm_config, "kv_transfer_config", None) is not None
+            ):
                 raise ValueError(
-                    "sparse_kv_offload_config.host_backend='mooncake' is "
-                    "only supported for PD-disaggregated decode; "
-                    "keep_device_kv_cache must be false"
+                    "sparse_kv_offload_config.host_backend='mooncake' with "
+                    "keep_device_kv_cache=true is only supported for standalone "
+                    "debug without kv_transfer_config"
                 )
 
         if not self.enabled:
@@ -1127,7 +1130,7 @@ class SparseKVOffloadConfig:
                 "Init sparse KV offload with keep_device_kv_cache enabled, "
                 "in this case we will still allocate device kv cache "
                 "and can not improve sequence length or batch_size. "
-                "You should only use it for debugging in PD colocate scenario."
+                "You should only use it for standalone/colocate debugging."
             )
         else:
             if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:

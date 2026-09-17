@@ -1383,8 +1383,13 @@ class SparseKVOffloadManager:
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
-            # All decode layers share one slot mapping within a forward step.
-            prepare_index_copy_descriptors = layer_id == 0
+            if getattr(self, "index_copy_probe_enabled", False):
+                self.graph_trace_capture_layer_id = layer_id
+                if not capturing:
+                    self.index_copy_probe_slots_by_layer[layer_id] = slot_mapping
+            # Target layers share one slot mapping, while the MTP layer may
+            # use another.
+            prepare_index_copy_descriptors = layer_id in (0, self.mtp_layer_id)
         use_mooncake_index_copy = self.use_fused_overlap and self._uses_mooncake_host_pool()
         use_side_stream = (
             self.tp_rank == 0
@@ -1470,6 +1475,15 @@ class SparseKVOffloadManager:
             if k_cache_npu is None or v_cache_npu is None:
                 raise ValueError("prefill offload requires NPU paged K/V caches")
             device = k_cache_npu.device
+            if self.use_fused_overlap and self._uses_mooncake_host_pool():
+                self._offload_prefill_kv_via_index_copy(
+                    slot_mapping=slot_mapping,
+                    k_cache_cpu=k_cache_cpu,
+                    v_cache_cpu=v_cache_cpu,
+                    k_cache_npu=k_cache_npu,
+                    v_cache_npu=v_cache_npu,
+                )
+                return
         else:
             if k is None or v is None:
                 raise ValueError("decode offload requires current-token K/V")
@@ -1542,6 +1556,73 @@ class SparseKVOffloadManager:
         )
         if result not in (None, 0):
             raise RuntimeError(f"memfabric D2H sparse_copy failed with result={result}")
+
+    def _offload_prefill_kv_via_index_copy(
+        self,
+        *,
+        slot_mapping: torch.Tensor,
+        k_cache_cpu: torch.Tensor,
+        v_cache_cpu: torch.Tensor,
+        k_cache_npu: torch.Tensor,
+        v_cache_npu: torch.Tensor,
+    ) -> None:
+        """Stage local Prefill paged K/V into the Mooncake Host pool."""
+        if not k_cache_npu.is_contiguous() or not v_cache_npu.is_contiguous():
+            raise RuntimeError("Prefill NPU paged K/V caches must be contiguous")
+
+        token_dim_k = self.token_size_bytes_k // k_cache_npu.element_size()
+        token_dim_v = self.token_size_bytes_v // v_cache_npu.element_size()
+        flat_device_k = k_cache_npu.reshape(-1, token_dim_k)
+        flat_device_v = v_cache_npu.reshape(-1, token_dim_v)
+        flat_host_k = k_cache_cpu.reshape(-1, token_dim_k)
+        flat_host_v = v_cache_cpu.reshape(-1, token_dim_v)
+
+        if flat_host_k.device != flat_device_k.device or flat_host_v.device != flat_device_v.device:
+            raise RuntimeError("Mooncake Host views and Prefill paged K/V must share one NPU device")
+        if flat_host_k.dtype != flat_device_k.dtype or flat_host_v.dtype != flat_device_v.dtype:
+            raise RuntimeError("Mooncake Host views and Prefill paged K/V must have matching dtypes")
+
+        host_slots_k = flat_host_k.shape[0]
+        host_slots_v = flat_host_v.shape[0]
+        device_slots_k = flat_device_k.shape[0]
+        device_slots_v = flat_device_v.shape[0]
+        if (
+            host_slots_k <= 0
+            or host_slots_k != host_slots_v
+            or host_slots_k != device_slots_k
+            or host_slots_k != device_slots_v
+        ):
+            raise RuntimeError(
+                "Mooncake Host and Prefill NPU K/V caches have incompatible "
+                "token capacities: "
+                f"host_k={host_slots_k}, host_v={host_slots_v}, "
+                f"device_k={device_slots_k}, device_v={device_slots_v}"
+            )
+
+        slots = slot_mapping.reshape(-1).to(
+            device=k_cache_npu.device,
+            dtype=torch.int64,
+        )
+        if slots.numel() > self.max_num_tokens:
+            raise ValueError(
+                "Sparse KV offload rows exceed Prefill index_copy capacity, "
+                f"got {slots.numel()}, capacity={self.max_num_tokens}"
+            )
+        valid = (slots >= 0) & (slots < host_slots_k)
+        valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        if valid_indices.numel() == 0:
+            return
+        selected_slots = slots.index_select(0, valid_indices)
+        flat_host_k.index_copy_(
+            0,
+            selected_slots,
+            flat_device_k.index_select(0, selected_slots),
+        )
+        flat_host_v.index_copy_(
+            0,
+            selected_slots,
+            flat_device_v.index_select(0, selected_slots),
+        )
 
     def _prepare_current_kv_index_copy_descriptors(
         self,
