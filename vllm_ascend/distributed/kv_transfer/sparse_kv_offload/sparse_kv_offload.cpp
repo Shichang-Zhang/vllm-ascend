@@ -845,7 +845,24 @@ void append_trace_values(std::ostringstream& out, const at::Tensor& tensor, int6
 void graph_trace_callback(void* args) noexcept {
   auto* payload = static_cast<GraphTracePayload*>(args);
   const uint64_t call = ++payload->calls;
-  const bool sampled = call <= 4 || (call & (call - 1)) == 0 || call % 64 == 0;
+  // A nonzero single-element counter is the only signal that a race actually
+  // fired, so it must never be sampled away: the visibility probe accumulates
+  // "Host rows not written yet" there, and the sampling policy would otherwise
+  // hide it on most replays.
+  bool nonzero_counter = false;
+  {
+    const auto& counted = payload->cpu_tensor;
+    if (counted.numel() == 1) {
+      const auto* bytes = graph_trace_element_ptr(counted, 0);
+      for (int64_t byte = 0; byte < counted.element_size(); ++byte) {
+        if (bytes[byte] != 0) {
+          nonzero_counter = true;
+          break;
+        }
+      }
+    }
+  }
+  const bool sampled = nonzero_counter || call <= 4 || (call & (call - 1)) == 0 || call % 64 == 0;
   if (sampled) {
     try {
       const auto& tensor = payload->cpu_tensor;

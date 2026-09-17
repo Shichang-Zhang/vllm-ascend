@@ -1025,7 +1025,14 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         )
         attn_output = fused_op(**fused_inputs)
         attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
+        # Graph-mode probe, hugging the writeback join.  "pre_join" counts the
+        # rows of this step that are still unwritten when the operator has just
+        # finished, so a nonzero value proves the operator could read stale K/V;
+        # "post_join" must be zero and proves the join actually covers the
+        # writeback.
+        manager.trace_graph_host_kv_visibility(layer_name, stage="pre_join")
         manager.wait_for_current_kv_writeback(get_forward_context().capturing)
+        manager.trace_graph_host_kv_visibility(layer_name, stage="post_join")
         return attn_output
 
     def _execute_sparse_flash_attention_process(

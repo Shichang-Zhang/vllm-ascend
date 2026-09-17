@@ -83,6 +83,9 @@ FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS = (
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
 )
 SFA_GRAPH_TRACE_LAYER_ID = 4
+# Stages of the graph-mode Host-KV visibility probe, see
+# `trace_graph_host_kv_visibility`.  The order defines the device counter slots.
+SFA_HOST_KV_VISIBILITY_STAGES = ("pre_join", "post_join")
 
 
 _SUBSCRIBED_COMPUTE_STREAMS: set[object] = set()
@@ -1060,12 +1063,21 @@ class SparseKVOffloadManager:
                 self.graph_trace_index_compare_npu = torch.empty(
                     2, dtype=torch.int64, device=device
                 )
+                # Per-step mismatch counters of the graph-mode Host-KV
+                # visibility probe, one slot per stage.
+                self.graph_host_kv_visibility_npu = torch.zeros(
+                    len(SFA_HOST_KV_VISIBILITY_STAGES),
+                    dtype=torch.int64,
+                    device=device,
+                )
                 logger.warning(
                     "[SFA_INDEX_COPY_PROBE] enabled on tp_rank=%s; "
                     "eager mode emits direct comparisons; graph mode emits "
                     "bounded replay traces for index_copy, planner staging, "
-                    "shared membership, and fused-op membership inputs",
+                    "shared membership, fused-op membership inputs and "
+                    "graph-mode Host-KV visibility (stages=%s)",
                     self.tp_rank,
+                    ",".join(SFA_HOST_KV_VISIBILITY_STAGES),
                 )
             if self._uses_mooncake_host_pool() and self.tp_rank == 0:
                 self.d2h_slot_mapping_cpu = torch.zeros(
@@ -1417,8 +1429,12 @@ class SparseKVOffloadManager:
             self.current_kv_by_layer[layer_id] = (k, v)
             if getattr(self, "index_copy_probe_enabled", False):
                 self.graph_trace_capture_layer_id = layer_id
-                if not capturing:
-                    self.index_copy_probe_slots_by_layer[layer_id] = slot_mapping
+                # Keep the mapping for the eager probe *and* for the graph-mode
+                # visibility probe.  In graph mode this stays a reference to the
+                # static slot-mapping buffer, which the runner refills before
+                # every replay, so the probe can resolve Host rows at replay
+                # time without any host-side bookkeeping.
+                self.index_copy_probe_slots_by_layer[layer_id] = slot_mapping
             # Target layers share one slot mapping, while the MTP layer may
             # use another.
             prepare_index_copy_descriptors = layer_id in (0, self.mtp_layer_id)
@@ -1893,6 +1909,79 @@ class SparseKVOffloadManager:
                 f"mapped_v={mapped_host_v.device} current_v={current_v.device}"
             )
 
+    def trace_graph_host_kv_visibility(self, layer_name: str, *, stage: str) -> None:
+        """Report how many of this step's Host rows are not written yet.
+
+        The fused operator resolves TopK rows that are not resident in the
+        selection buffer straight from the shared Host pool, and under MTP those
+        rows include the earlier token rows of the very same step.  This probe
+        counts, at the point of interest, how many of this step's Host rows still
+        hold something other than the K/V computed for them -- that is exactly
+        what the operator would read if the writeback had not landed yet.
+
+        Two properties make it usable where the eager probe cannot be:
+
+        * it is built from device operators only (no ``.item()``, ``.cpu()`` or
+          ``torch.equal``), so graph capture stays legal;
+        * it runs on every TP rank.  Decode K/V is replicated across ranks, so
+          comparing this rank's local view of the shared pool against its own
+          K/V also detects the missing cross-rank edge (TP1-7 reading rows TP0
+          has not published yet).
+
+        The result is accumulated in a device counter and only ever leaves the
+        device through the existing trace sink (D2H + host callback on the
+        current stream), and the sink prints a nonzero counter unconditionally.
+        """
+        if not getattr(self, "index_copy_probe_enabled", False):
+            return
+        layer_id = self._get_offload_layer_id(layer_name)
+        current_kv = self.current_kv_by_layer.get(layer_id)
+        slot_mapping = self.index_copy_probe_slots_by_layer.get(layer_id)
+        counter = getattr(self, "graph_host_kv_visibility_npu", None)
+        if current_kv is None or slot_mapping is None or counter is None:
+            return
+        stage_index = SFA_HOST_KV_VISIBILITY_STAGES.index(stage)
+        if layer_id == 0 and stage_index == 0:
+            # Layer 0 opens a forward step: report per step, not cumulatively.
+            counter.zero_()
+
+        current_k, current_v = current_kv
+        device = current_k.device
+        token_dim_k = self.token_size_bytes_k // current_k.element_size()
+        token_dim_v = self.token_size_bytes_v // current_v.element_size()
+        current_k_rows = current_k.reshape(-1, token_dim_k)
+        current_v_rows = current_v.reshape(-1, token_dim_v)
+        host_k_rows = self.k_caches_cpu[layer_id].reshape(-1, token_dim_k)
+        host_v_rows = self.v_caches_cpu[layer_id].reshape(-1, token_dim_v)
+
+        slots = slot_mapping.reshape(-1).to(device=device, dtype=torch.int64)
+        token_count = slots.numel()
+        if (
+            token_count == 0
+            or current_k_rows.shape[0] != token_count
+            or current_v_rows.shape[0] != token_count
+            or host_k_rows.shape[0] != host_v_rows.shape[0]
+        ):
+            return
+        num_slots = host_k_rows.shape[0]
+        # Padded rows are excluded by a mask rather than by a slice: slicing
+        # would need the copy count on the host, which graph capture forbids.
+        valid = (slots >= 0) & (slots < num_slots)
+        safe_slots = slots.clamp(min=0, max=num_slots - 1)
+        actual_k = host_k_rows.index_select(0, safe_slots)
+        actual_v = host_v_rows.index_select(0, safe_slots)
+        mismatched_rows = (
+            (actual_k.view(torch.int16) != current_k_rows.view(torch.int16)).any(dim=-1)
+            | (actual_v.view(torch.int16) != current_v_rows.view(torch.int16)).any(dim=-1)
+        ) & valid
+        counter[stage_index].add_(torch.count_nonzero(mismatched_rows))
+        self._enqueue_graph_trace_cpu(
+            f"host_kv_visibility_{stage}",
+            layer_id,
+            counter[stage_index : stage_index + 1],
+            1,
+        )
+
     def _probe_mooncake_index_copy(
         self,
         layer_name: str,
@@ -2187,10 +2276,13 @@ class SparseKVOffloadManager:
         if not getattr(self, "index_copy_probe_enabled", False):
             return
         descriptor_stage = stage.startswith("index_descriptor_")
+        # The Host-KV visibility probe must cover every layer: the mismatch can
+        # fire on any of them, and it reports a per-step counter.
+        visibility_stage = stage.startswith("host_kv_visibility_")
         if descriptor_stage:
             if layer_id not in (0, self.mtp_layer_id):
                 return
-        elif layer_id != SFA_GRAPH_TRACE_LAYER_ID:
+        elif not visibility_stage and layer_id != SFA_GRAPH_TRACE_LAYER_ID:
             return
         self.sparse_kv_offload_cpp.enqueue_graph_trace_tensor(
             tensor,
