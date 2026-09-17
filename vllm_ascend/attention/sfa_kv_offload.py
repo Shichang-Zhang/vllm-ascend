@@ -1023,16 +1023,21 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             num_tokens=num_tokens,
             capturing=get_forward_context().capturing,
         )
-        attn_output = fused_op(**fused_inputs)
-        attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
-        # Graph-mode probe, hugging the writeback join.  "pre_join" counts the
-        # rows of this step that are still unwritten when the operator has just
-        # finished, so a nonzero value proves the operator could read stale K/V;
-        # "post_join" must be zero and proves the join actually covers the
-        # writeback.
+        # The fused operator resolves TopK rows that are not resident in the
+        # selection buffer straight from the shared Host pool.  Under MTP those
+        # rows include the earlier token rows of this very step, whose K/V is
+        # still being written back on the save stream, so the compute stream must
+        # join the writeback *before* the operator runs.
+        #
+        # The graph-mode probe hugs the join: "pre_join" counts this step's rows
+        # that were still unwritten when the operator finished (nonzero means it
+        # could read stale K/V), "post_join" must be zero and proves the join
+        # actually covers the writeback.
         manager.trace_graph_host_kv_visibility(layer_name, stage="pre_join")
         manager.wait_for_current_kv_writeback(get_forward_context().capturing)
         manager.trace_graph_host_kv_visibility(layer_name, stage="post_join")
+        attn_output = fused_op(**fused_inputs)
+        attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
         return attn_output
 
     def _execute_sparse_flash_attention_process(
