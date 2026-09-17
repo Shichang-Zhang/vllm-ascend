@@ -59,6 +59,8 @@ def test_eager_current_kv_index_copy_filters_invalid_slots():
 def test_graph_mooncake_writeback_waits_for_save_stream():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.tp_rank = 0
+    # Single rank keeps the ready broadcast out of this test's scope.
+    manager.tp_size = 1
     manager.use_fused_overlap = True
     manager.layer_name_to_offload_id = {"layer.0": 0}
     manager.current_kv_by_layer = {}
@@ -112,6 +114,49 @@ def test_graph_mooncake_writeback_waits_for_save_stream():
     current_stream.record_event.assert_not_called()
     manager.current_kv_save_stream.wait_event.assert_not_called()
     current_stream.wait_stream.assert_called_once_with(manager.current_kv_save_stream)
+
+
+def test_graph_mooncake_ready_broadcast_joins_writeback_first():
+    """TP0 has to finish its Host-KV writeback before releasing the peers.
+
+    Peers are only ordered against TP0 by the ready broadcast, so if the
+    broadcast is entered while the writeback is still in flight on the save
+    stream, every peer rank reads stale rows from the shared Host pool.
+    """
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.tp_rank = 0
+    manager.tp_size = 2
+    manager.use_fused_overlap = True
+    manager.layer_name_to_offload_id = {"layer.0": 0}
+    manager.current_kv_by_layer = {}
+    manager._offload_new_kv_on_current_stream = MagicMock()
+    _set_mooncake_allocator(manager)
+    manager.current_kv_save_stream = MagicMock()
+    manager.current_kv_writeback_on_side_stream = True
+
+    call_order = []
+    current_stream = MagicMock()
+    current_stream.wait_stream.side_effect = lambda stream: call_order.append(("wait_stream", stream))
+    manager.tp_group = MagicMock()
+    manager.tp_group.broadcast.side_effect = lambda *args, **kwargs: call_order.append(("broadcast", None))
+
+    with patch.object(manager_module.torch_npu.npu, "current_stream", return_value=current_stream):
+        manager.offload_new_kv(
+            "layer.0",
+            torch.tensor([2], dtype=torch.int64),
+            torch.zeros((4, 2), dtype=torch.bfloat16),
+            torch.zeros((4, 1), dtype=torch.bfloat16),
+            None,
+            None,
+            torch.ones((1, 2), dtype=torch.bfloat16),
+            torch.ones((1, 1), dtype=torch.bfloat16),
+            capturing=True,
+        )
+
+    assert call_order == [
+        ("wait_stream", manager.current_kv_save_stream),
+        ("broadcast", None),
+    ]
 
 
 def test_graph_mooncake_index_copy_runs_on_save_stream():

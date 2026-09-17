@@ -995,9 +995,14 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             selection_k_rope=selection_k_rope,
             capturing=get_forward_context().capturing,
         )
+        # The fused operator resolves TopK rows that are not resident in the
+        # selection buffer straight from the shared Host pool.  Under MTP those
+        # rows include the earlier token rows of this very step, whose K/V is
+        # still being written back on the save stream, so the compute stream
+        # must join the writeback *before* the operator runs.
+        manager.wait_for_current_kv_writeback(get_forward_context().capturing)
         attn_output = fused_op(**fused_inputs)
         attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
-        manager.wait_for_current_kv_writeback(get_forward_context().capturing)
         return attn_output
 
     def _execute_sparse_flash_attention_process(

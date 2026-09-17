@@ -1026,6 +1026,10 @@ class SparseKVOffloadManager:
         self.d2h_lengths_npu = torch.empty(d2h_descriptor_rows, dtype=torch.int32, device=device)
         if self.use_fused_overlap:
             self.current_kv_save_stream = torch_npu.npu.Stream()
+            # Set whenever this step's Host-KV writeback is actually forked onto
+            # `current_kv_save_stream`.  Consumers of the shared Host pool must
+            # join that stream afterwards, see `wait_for_current_kv_writeback`.
+            self.current_kv_writeback_on_side_stream = False
             self.fused_plan_stream = torch_npu.npu.Stream()
             self.fused_plan_metadata_npu = torch.zeros(
                 1 + self.max_num_topk_rows,
@@ -1383,8 +1387,14 @@ class SparseKVOffloadManager:
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
-            # All decode layers share one slot mapping within a forward step.
-            prepare_index_copy_descriptors = layer_id == 0
+            # Target layers share one slot mapping within a forward step, while
+            # the MTP layer may use another one.  The graph path reuses the
+            # descriptors generated for layer 0, so the MTP layer has to
+            # refresh them, otherwise MTP K/V rows are written to the wrong
+            # Host slots and every later read of those rows is wrong.
+            # -1 means "no separate MTP layer", see __init__.
+            mtp_layer_id = getattr(self, "mtp_layer_id", -1)
+            prepare_index_copy_descriptors = layer_id in (0, mtp_layer_id)
         use_mooncake_index_copy = self.use_fused_overlap and self._uses_mooncake_host_pool()
         use_side_stream = (
             self.tp_rank == 0
@@ -1415,6 +1425,11 @@ class SparseKVOffloadManager:
             ):
                 # Ensure TP0's Decode Host-KV write is visible before peer
                 # ranks consume their local views of the shared Mooncake pool.
+                # In the graph path that write may have been forked onto the
+                # save stream, so TP0 has to join it before entering the
+                # collective; otherwise the peers are released while the rows
+                # are still in flight and they read stale K/V.
+                self.wait_for_current_kv_writeback(capturing)
                 self.tp_group.broadcast(
                     torch.empty([], dtype=torch.int8, device=k.device),
                     src=0,
@@ -1626,6 +1641,10 @@ class SparseKVOffloadManager:
                     token_count=token_count,
                     num_slots=num_slots,
                 )
+            # From here on this step's Host-KV writeback runs on the save
+            # stream instead of the compute stream, so every later reader of
+            # the shared Host pool has to join that stream explicitly.
+            self.current_kv_writeback_on_side_stream = True
             current_kv_ready = torch_npu.npu.current_stream().record_event()
             with torch_npu.npu.stream(self.current_kv_save_stream):
                 self.current_kv_save_stream.wait_event(current_kv_ready)
@@ -2053,8 +2072,27 @@ class SparseKVOffloadManager:
         torch_npu.npu_scatter_nd_update_(flat_rope, indices, current_rope)
 
     def wait_for_current_kv_writeback(self, capturing: bool = False) -> None:
-        if self.use_fused_overlap and capturing and self.tp_rank == 0:
-            torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
+        """Order the current stream after this step's Host-KV writeback.
+
+        Decode K/V is produced by every TP rank, but only TP0 writes it into the
+        shared Host pool.  In the graph path that write is forked onto
+        ``current_kv_save_stream``, so any rank that is about to read the shared
+        pool -- the fused operator, and the TP ready broadcast that releases the
+        peer ranks -- must be ordered after that stream.  Waiting only where it
+        used to be (after the fused operator) is too late for the token rows of
+        the current step, which the operator reads straight from the Host pool
+        under MTP.
+
+        ``capturing`` reflects the caller's view of the runtime.  The recorded
+        flag additionally covers the case where the writeback really was forked
+        while the caller reports ``capturing=False`` (``_in_graph_runtime()``
+        and ``forward_context.capturing`` disagree).
+        """
+        if not self.use_fused_overlap or self.tp_rank != 0:
+            return
+        if not capturing and not getattr(self, "current_kv_writeback_on_side_stream", False):
+            return
+        torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
 
     def _onload_topk_kv_cpu(self, args):
         # code that is incompatible with graph mode, compute here outside graph
