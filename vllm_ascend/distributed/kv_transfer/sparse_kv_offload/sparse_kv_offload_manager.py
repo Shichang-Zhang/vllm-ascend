@@ -1042,6 +1042,10 @@ class SparseKVOffloadManager:
         self.d2h_lengths_npu = torch.empty(d2h_descriptor_rows, dtype=torch.int32, device=device)
         if self.use_fused_overlap:
             self.current_kv_save_stream = torch_npu.npu.Stream()
+            # Set whenever this step's Host-KV writeback is actually forked onto
+            # `current_kv_save_stream`.  Consumers of the shared Host pool must
+            # join that stream afterwards, see `wait_for_current_kv_writeback`.
+            self.current_kv_writeback_on_side_stream = False
             self.fused_plan_stream = torch_npu.npu.Stream()
             self.fused_plan_metadata_npu = torch.zeros(
                 1 + self.max_num_topk_rows,
@@ -1483,6 +1487,13 @@ class SparseKVOffloadManager:
                         self.tp_size,
                         capturing,
                     )
+                # Ensure TP0's Decode Host-KV write is visible before peer ranks
+                # consume their local views of the shared Mooncake pool.  In the
+                # graph path that write was forked onto the save stream, so TP0
+                # has to join it before entering the collective; otherwise the
+                # peers are released while the rows are still in flight and they
+                # read stale K/V.
+                self.wait_for_current_kv_writeback(capturing)
                 if (
                     self.tp_size > 1
                     and os.getenv("VLLM_ASCEND_SFA_READY_BCAST", "1") != "0"
@@ -1562,6 +1573,12 @@ class SparseKVOffloadManager:
                 raise ValueError("prefill offload requires NPU paged K/V caches")
             device = k_cache_npu.device
             if self.use_fused_overlap and self._uses_mooncake_host_pool():
+                # Standalone debug path: this step's Prefill KV is staged into
+                # the shared Host pool by TP0 only.  No explicit TP rendezvous is
+                # needed here: a Prefill batch never takes the fused-overlap
+                # operator (it requires num_prefills == 0), so the first reader
+                # of these rows is a later decode step, whose ready broadcast is
+                # already ordered after this write on TP0's compute stream.
                 self._offload_prefill_kv_via_index_copy(
                     slot_mapping=slot_mapping,
                     k_cache_cpu=k_cache_cpu,
@@ -1831,6 +1848,10 @@ class SparseKVOffloadManager:
                     token_count=token_count,
                     num_slots=num_slots,
                 )
+            # From here on this step's Host-KV writeback runs on the save stream
+            # instead of the compute stream, so every later reader of the shared
+            # Host pool has to join that stream explicitly.
+            self.current_kv_writeback_on_side_stream = True
             current_kv_ready = torch_npu.npu.current_stream().record_event()
             with torch_npu.npu.stream(self.current_kv_save_stream):
                 self.current_kv_save_stream.wait_event(current_kv_ready)
@@ -2906,8 +2927,27 @@ class SparseKVOffloadManager:
         torch_npu.npu_scatter_nd_update_(flat_rope, indices, current_rope)
 
     def wait_for_current_kv_writeback(self, capturing: bool = False) -> None:
-        if self.use_fused_overlap and capturing and self.tp_rank == 0:
-            torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
+        """Order the current stream after this step's Host-KV writeback.
+
+        Decode K/V is produced by every TP rank, but only TP0 writes it into the
+        shared Host pool.  In the graph path that write is forked onto
+        ``current_kv_save_stream``, so any rank that is about to read the shared
+        pool -- the fused operator, and the TP ready broadcast that releases the
+        peer ranks -- must be ordered after that stream.  Waiting only where it
+        used to be (after the fused operator) is too late for the token rows of
+        the current step, which the operator reads straight from the Host pool
+        under MTP.
+
+        ``capturing`` reflects the caller's view of the runtime.  The recorded
+        flag additionally covers the case where the writeback really was forked
+        while the caller reports ``capturing=False`` (``_in_graph_runtime()``
+        and ``forward_context.capturing`` disagree).
+        """
+        if not self.use_fused_overlap or self.tp_rank != 0:
+            return
+        if not capturing and not getattr(self, "current_kv_writeback_on_side_stream", False):
+            return
+        torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
 
     def _onload_topk_kv_cpu(self, args):
         # code that is incompatible with graph mode, compute here outside graph

@@ -231,6 +231,7 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
         prepare_fused_overlap_external_plan=prepare_plan,
         inject_current_kv_into_selection=inject_current,
         wait_for_current_kv_writeback=wait_for_writeback,
+        trace_graph_host_kv_visibility=lambda *_args, **_kwargs: None,
     )
 
     with (
@@ -255,11 +256,13 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
         )
 
     torch.testing.assert_close(output, ql_nope + 10)
+    # The fused operator reads MTP rows of the current step straight from the
+    # shared Host pool, so the Host-KV writeback must be joined before it runs.
     assert call_order == [
         "plan",
         "inject",
-        "fused",
         "wait_writeback",
+        "fused",
     ]
     assert fused_inputs["selection_kv_cache"].shape == (8, 4, 3)
     assert fused_inputs["selection_k_rope"].shape == (8, 4, 1)
