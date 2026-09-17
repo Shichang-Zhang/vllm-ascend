@@ -18,8 +18,8 @@ DEVICE_ID = 0
 REGISTER_LOCATION = f"npu:{DEVICE_ID}"
 
 
-@pytest.fixture(scope="module")
-def swapped_memory_transfer_engine() -> Iterator[Any]:
+@pytest.fixture(scope="module", name="swapped_memory_transfer_engine")
+def swapped_memory_engine_fixture() -> Iterator[Any]:
     """Bind one production TransferEngine to one visible NPU."""
     if os.getenv("PYTEST_XDIST_WORKER_COUNT") not in (None, "1"):
         pytest.fail("Run these large-memory cases sequentially without pytest-xdist (omit -n)")
@@ -48,7 +48,7 @@ def swapped_memory_transfer_engine() -> Iterator[Any]:
             engine.unregister_buffer()
 
 
-def register_swapped_regions(engine: Any, region_sizes: tuple[int, ...]) -> None:
+def register_swapped_regions(engine: Any, region_sizes: tuple[int, ...], dtype_name: str) -> None:
     """Allocate independent aligned Host tensors and register their exact sizes.
 
     Allocation follows _allocate_swapped_host_tensor in GitCode branch
@@ -59,16 +59,22 @@ def register_swapped_regions(engine: Any, region_sizes: tuple[int, ...]) -> None
     import torch
     import torch_npu
 
+    dtype = getattr(torch, dtype_name)
+    element_size = dtype.itemsize
+    extra_elements = (ALIGNMENT + element_size - 1) // element_size
     regions = []
     try:
         for size_bytes in region_sizes:
-            raw = torch_npu.empty_with_swapped_memory((size_bytes + ALIGNMENT,), dtype=torch.uint8, device="npu")
-            offset = (-raw.data_ptr()) % ALIGNMENT
-            regions.append(raw[offset : offset + size_bytes])
+            assert size_bytes % element_size == 0
+            num_elements = size_bytes // element_size
+            raw = torch_npu.empty_with_swapped_memory((num_elements + extra_elements,), dtype=dtype, device="npu")
+            offset = ((-raw.data_ptr()) % ALIGNMENT) // element_size
+            regions.append(raw[offset : offset + num_elements])
             # The view retains the backing storage until after unregistration.
             del raw
 
         for region, size_bytes in zip(regions, region_sizes):
+            assert region.dtype == dtype
             assert region.device.type == "npu"
             assert region.is_contiguous()
             assert region.numel() * region.element_size() == size_bytes
@@ -76,7 +82,7 @@ def register_swapped_regions(engine: Any, region_sizes: tuple[int, ...]) -> None
         del region
 
         assert not engine.is_register_buffer
-        print(f"Registering swapped Host regions: sizes={region_sizes}, location={REGISTER_LOCATION}")
+        print(f"Registering swapped Host regions: sizes={region_sizes}, dtype={dtype}, location={REGISTER_LOCATION}")
         engine.register_buffer(
             [region.data_ptr() for region in regions],
             list(region_sizes),
