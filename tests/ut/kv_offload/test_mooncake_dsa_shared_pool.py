@@ -231,31 +231,17 @@ def test_all_ranks_build_layouts_from_local_main_views_without_registration(rank
     assert indexer_layout[0].base == indexer.data_ptr()
 
 
-def test_dsa_register_regions_include_host_and_hbm_locations_once(monkeypatch):
+def test_dsa_consumer_registers_indexer_hbm_but_not_shared_main():
     worker = object.__new__(MooncakeConnectorWorker)
-    host_storage = torch.empty(256, dtype=torch.int8)
-    host_k = host_storage[:64].view(torch.bfloat16).view(4, 8)
-    host_v = host_storage[64:128].view(torch.bfloat16).view(4, 8)
     indexer = torch.empty((4, 8), dtype=torch.bfloat16)
-    pool = SimpleNamespace(
-        data_ptr=host_storage.data_ptr(),
-        nbytes=host_storage.nbytes,
-        topology=SimpleNamespace(device_id=3),
-    )
-    manager = SimpleNamespace(get_mooncake_host_pool=lambda: pool)
-    monkeypatch.setattr(mooncake_connector, "get_sparse_kv_offload_manager", lambda: manager)
     indexer_layouts = [DsaCacheLayout(INDEXER, 0, indexer.data_ptr(), 16, 16, 1, 4, "bf16", 4)]
-    main_layouts = [
-        DsaCacheLayout(MAIN, 0, host_k.data_ptr(), 16, 16, 1, 4, "bf16", 4),
-        DsaCacheLayout(MAIN, 1, host_v.data_ptr(), 16, 16, 1, 4, "bf16", 4),
-    ]
-    regions, locations = worker._dsa_consumer_register_regions(
-        {INDEXER: (indexer,)},
-        (indexer_layouts, main_layouts),
-    )
-    assert regions.ptrs == [host_k.data_ptr(), indexer.data_ptr()]
-    assert regions.lengths == [host_v.data_ptr() + host_v.nbytes - host_k.data_ptr(), indexer.nbytes]
-    assert locations == ["npu:3", "*"]
+
+    regions, locations = worker._dsa_consumer_indexer_register_regions({INDEXER: (indexer,)}, indexer_layouts)
+
+    assert regions.ptrs == [indexer.data_ptr()]
+    assert regions.lengths == [indexer.nbytes]
+    assert regions.logical_tensor_count == 1
+    assert locations == ["*"]
 
 
 def test_dsa_producer_oversized_atom_uses_layout_base_chunks():
@@ -507,9 +493,7 @@ def test_dsa_main_and_indexer_have_distinct_metadata_indices():
     )
     names = [MAIN, "model.layers.0.self_attn.indexer.k_cache", "model.mtp.layers.0.attn"]
     worker.kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[
-            SimpleNamespace(layer_names=names, kv_cache_spec=SimpleNamespace(num_kv_heads=1))
-        ]
+        kv_cache_groups=[SimpleNamespace(layer_names=names, kv_cache_spec=SimpleNamespace(num_kv_heads=1))]
     )
     worker._get_layer_spec = lambda name: SimpleNamespace(num_kv_heads=1)
     worker._get_spec_total_num_kv_heads = lambda spec, index: 1
