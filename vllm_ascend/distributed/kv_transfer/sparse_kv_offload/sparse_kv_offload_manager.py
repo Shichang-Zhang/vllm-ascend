@@ -1,5 +1,6 @@
 import contextlib
 import os
+import time
 import typing
 from dataclasses import dataclass
 from zlib import adler32
@@ -82,6 +83,42 @@ FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT = (
 FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS = (
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
 )
+
+# Stages of the graph-mode Host-KV visibility probe (adjudication experiments).
+# The order defines the device counter slots (Mooncake device-view path) and
+# follows the order in which a forward step touches them:
+#   post_write -> the Host-KV write-back of this layer has been launched
+#   pre_join   -> right before the single cross-stream join
+#   post_join  -> right after the join
+#   pre_bcast  -> right before the TP ready broadcast (Mooncake only)
+#   post_bcast -> right after the broadcast returned
+# Comparing post_write against pre_join is the core of adjudication
+# experiment 1: a mismatch that exists at post_write but has disappeared at
+# pre_join proves the join is load-bearing; a mismatch already present at
+# post_write that survives to pre_join proves the join does not cover the
+# reader on that rank.
+SFA_HOST_KV_VISIBILITY_STAGES = ("post_write", "pre_join", "post_join", "pre_bcast", "post_bcast")
+
+# Stage that opens a forward step; every earlier counter is zeroed there so a
+# Mooncake device-view counter reflects the current step only.
+SFA_HOST_KV_VISIBILITY_FRAME_OPEN_STAGE = "post_write"
+
+# Layout of the CPU planner counters (int32[4]) written by the C++ planner on
+# every call.  These measure the *size of the same-step Host-read dependency*
+# that experiment 1 compares against, and the silent-drop magnitude that long
+# sequences are suspected to suffer from:
+#   window_refs     topk slots of a row that point at a window token which is
+#                   neither the row's own token nor already stable, i.e. the
+#                   slots whose data can only come from the Host pool of the
+#                   current step
+#   window_loaded   such references that got a positive plan (served from the
+#                   selection buffer, no Host read needed)
+#   window_dropped  such references that got no plan row at all (plan stays 0
+#                   => the operator reads whatever the Host pool holds, which
+#                   is the stale/absent row)
+#   dropped_misses  miss entries dropped by the evictable-slot limit
+#                   (assign_count = min(local_miss_count, evictable_count))
+SFA_ADJ_PLANNER_STATS_LAYOUT = ("window_refs", "window_loaded", "window_dropped", "dropped_misses")
 
 
 _SUBSCRIBED_COMPUTE_STREAMS: set[object] = set()
@@ -1082,6 +1119,40 @@ class SparseKVOffloadManager:
         self.d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
         self.d2h_token_indices_npu = torch.arange(self.max_num_tokens, dtype=torch.int64, device=device)
 
+        # --- Adjudication probes (repo3), default off ---
+        # Covers experiment 1 (backend-differential visibility, Mooncake device
+        # view / MemFabric host view), experiment 2 (layer0 vs MTP slot_mapping
+        # diff) and the graph probe plumbing; experiment 3 (sparse_copy
+        # landing) hooks the eager MemFabric writeback directly.
+        self.adj_probe_enabled = os.getenv("VLLM_ASCEND_SFA_ADJ_PROBE", "0").lower() in ("1", "true", "yes", "on")
+        self.index_copy_probe_slots_by_layer: dict[int, torch.Tensor] = {}
+        self.adj_planner_stats_cpu: torch.Tensor | None = None
+        if self.adj_probe_enabled:
+            self.graph_host_kv_visibility_npu = torch.zeros(
+                len(SFA_HOST_KV_VISIBILITY_STAGES),
+                dtype=torch.int64,
+                device=device,
+            )
+            # Planner-side counters (see SFA_ADJ_PLANNER_STATS_LAYOUT): the C++
+            # planner writes them in-place, the Python side traces the buffer
+            # right after each planner call.  Pinned so the graph-replay D2H
+            # stays a cheap memcpy.
+            self.adj_planner_stats_cpu = torch.zeros(
+                len(SFA_ADJ_PLANNER_STATS_LAYOUT),
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+            self.sparse_kv_offload_cpp.set_planner_probe_stats_buffer(int(self.adj_planner_stats_cpu.data_ptr()))
+            logger.warning(
+                "[SFA_ADJ_PROBE] enabled on tp_rank=%s backend=%s; "
+                "graph/eager replay emits visibility counters at %s, slot_mapping "
+                "diffs, planner stats %s and sparse_copy landing stats",
+                self.tp_rank,
+                self.host_backend,
+                "/".join(SFA_HOST_KV_VISIBILITY_STAGES),
+                "[" + ",".join(SFA_ADJ_PLANNER_STATS_LAYOUT) + "]",
+            )
+
         pages_per_row = self.topk_buffer_size // self.block_size
         self.current_slots_npu = torch.empty(
             (self.max_num_topk_rows, self.topk),
@@ -1393,6 +1464,24 @@ class SparseKVOffloadManager:
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
+            if getattr(self, "adj_probe_enabled", False):
+                # Keep the slot-mapping reference for the probes: in graph mode
+                # this stays a reference to the static input buffer, which the
+                # runner refills before every replay, so captured probe nodes
+                # always observe the current frame.
+                self.index_copy_probe_slots_by_layer[layer_id] = slot_mapping
+                if capturing and layer_id in (0, self.mtp_layer_id):
+                    # Experiment 2: per-replay diff of the layer0 vs MTP
+                    # slot_mapping; if the hashes differ, the MTP layer really
+                    # uses another mapping and the descriptor refresh (fix A)
+                    # is load-bearing.
+                    stage = "slot_mapping_l0" if layer_id == 0 else "slot_mapping_mtp"
+                    self._enqueue_graph_trace_cpu(
+                        stage,
+                        layer_id,
+                        slot_mapping.reshape(-1).contiguous(),
+                        slot_mapping.numel(),
+                    )
             # Target layers share one slot mapping within a forward step, while
             # the MTP layer may use another one.  The graph path reuses the
             # descriptors generated for layer 0, so the MTP layer has to
@@ -1422,6 +1511,18 @@ class SparseKVOffloadManager:
                 capturing,
                 prepare_index_copy_descriptors,
             )
+            if getattr(self, "adj_probe_enabled", False) and not has_prefill and k is not None and v is not None:
+                # Experiment 1 anchor: this record is taken right after the
+                # write-back of this layer was launched (Mooncake may have
+                # forked it onto the save stream, MemFabric eager writes on the
+                # compute stream).  It is the state a same-step reader would see
+                # if the join did not exist; layer 0 also opens the probe frame.
+                site_layer_id = self._get_offload_layer_id(layer_name)
+                self._probe_host_kv_visibility(
+                    site_layer_id,
+                    "post_write",
+                    new_frame=site_layer_id == 0,
+                )
             if (
                 use_mooncake_index_copy
                 and not has_prefill
@@ -1435,11 +1536,23 @@ class SparseKVOffloadManager:
                 # save stream, so TP0 has to join it before entering the
                 # collective; otherwise the peers are released while the rows
                 # are still in flight and they read stale K/V.
+                # pre_bcast/post_bcast bracket the rendezvous.  pre_bcast is
+                # taken right after this rank's join and right before the
+                # collective, i.e. it is exactly the claim "the rows are landed,
+                # safe to release the peers".  On the peer ranks this is the
+                # missing baseline (they never fork a write-back, so their join
+                # is a no-op): pre_bcast there shows what they would read if the
+                # broadcast released them too early, and post_bcast must be 0
+                # once TP0's join made the shared rows visible.
                 self.wait_for_current_kv_writeback(capturing)
+                if getattr(self, "adj_probe_enabled", False):
+                    self._probe_host_kv_visibility(self._get_offload_layer_id(layer_name), "pre_bcast")
                 self.tp_group.broadcast(
                     torch.empty([], dtype=torch.int8, device=k.device),
                     src=0,
                 )
+                if getattr(self, "adj_probe_enabled", False):
+                    self._probe_host_kv_visibility(self._get_offload_layer_id(layer_name), "post_bcast")
             return
 
         current_kv_ready = torch_npu.npu.current_stream().record_event()
@@ -1460,6 +1573,16 @@ class SparseKVOffloadManager:
                 has_prefill,
                 capturing,
                 prepare_index_copy_descriptors,
+            )
+        if getattr(self, "adj_probe_enabled", False):
+            # Experiment 1 anchor for the MemFabric fork: the same measurement
+            # point as the Mooncake branch (write-back launched, join not yet
+            # taken), so both backends produce comparable records.
+            site_layer_id = self._get_offload_layer_id(layer_name)
+            self._probe_host_kv_visibility(
+                site_layer_id,
+                "post_write",
+                new_frame=site_layer_id == 0,
             )
 
     def _offload_new_kv_on_current_stream(
@@ -1558,6 +1681,24 @@ class SparseKVOffloadManager:
         self.d2h_lengths_npu[token_count : 2 * token_count].masked_fill_(~valid, 0)
         self.d2h_size_npu.fill_(2 * token_count)
 
+        # Experiment 3 hook: snapshot the expected K/V *before* the copy so the
+        # landing checks below never depend on a stream that includes it.
+        landing_expected = None
+        sparse_copy_started = None
+        if (
+            getattr(self, "adj_probe_enabled", False)
+            and not capturing
+            and not has_prefill
+            and self.use_fused_overlap
+        ):
+            landing_expected = (
+                k_rows.detach().to("cpu", copy=True),
+                v_rows.detach().to("cpu", copy=True),
+                slots.detach().to("cpu", copy=True),
+                valid.detach().to("cpu", copy=True),
+            )
+            sparse_copy_started = time.perf_counter()
+
         result = offload.sparse_copy(
             self.d2h_src_ptrs_npu,
             self.d2h_dst_ptrs_npu,
@@ -1567,6 +1708,77 @@ class SparseKVOffloadManager:
         )
         if result not in (None, 0):
             raise RuntimeError(f"memfabric D2H sparse_copy failed with result={result}")
+
+        if landing_expected is not None:
+            self._probe_sparse_copy_landing(
+                landing_expected,
+                k_cache_cpu,
+                v_cache_cpu,
+                time.perf_counter() - sparse_copy_started,
+            )
+
+    def _probe_sparse_copy_landing(
+        self,
+        expected: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        k_cache_cpu: torch.Tensor,
+        v_cache_cpu: torch.Tensor,
+        elapsed_seconds: float,
+    ) -> None:
+        """Experiment 3: did offload.sparse_copy land the data by return time?
+
+        The expected K/V was snapshotted to the CPU before the copy, and the
+        host-pool rows are plain CPU memory, so both comparisons below are pure
+        host-side reads and never wait on the stream that ran the copy.
+
+        * immediate mismatches > 0  -> the copy returned before the data landed
+          (async primitive; explanation (a) for "MemFabric is fine" is dead).
+        * immediate == 0            -> the copy effectively completes before
+          returning (synchronous/flush-aware; explanation (a) confirmed).
+        The after-sync comparison is a sanity bound (must be 0 in both cases).
+        """
+        exp_k, exp_v, slots_cpu, valid_cpu = expected
+        token_dim_k = self.token_size_bytes_k // k_cache_cpu.element_size()
+        token_dim_v = self.token_size_bytes_v // v_cache_cpu.element_size()
+        flat_host_k = k_cache_cpu.reshape(-1, token_dim_k)
+        flat_host_v = v_cache_cpu.reshape(-1, token_dim_v)
+        valid_indices = torch.nonzero(valid_cpu, as_tuple=False).reshape(-1)
+        checked_rows = int(valid_indices.numel())
+        elapsed_ms = elapsed_seconds * 1000.0
+        if checked_rows == 0:
+            logger.warning(
+                "[SFA_ADJ_PROBE] stage=sparse_copy_landing tp_rank=%s rows=0 elapsed_ms=%.3f",
+                self.tp_rank,
+                elapsed_ms,
+            )
+            return (0, 0, 0, 0)
+        selected_slots = slots_cpu.index_select(0, valid_indices)
+
+        def count_mismatches(flat_host: torch.Tensor, expected_rows: torch.Tensor) -> int:
+            actual_rows = flat_host.index_select(0, selected_slots)
+            return int(
+                torch.count_nonzero(
+                    (actual_rows.view(torch.int16) != expected_rows.view(torch.int16)).any(dim=-1)
+                )
+            )
+
+        immediate_k = count_mismatches(flat_host_k, exp_k.reshape(-1, token_dim_k))
+        immediate_v = count_mismatches(flat_host_v, exp_v.reshape(-1, token_dim_v))
+        torch_npu.npu.synchronize()
+        after_sync_k = count_mismatches(flat_host_k, exp_k.reshape(-1, token_dim_k))
+        after_sync_v = count_mismatches(flat_host_v, exp_v.reshape(-1, token_dim_v))
+        logger.warning(
+            "[SFA_ADJ_PROBE] stage=sparse_copy_landing tp_rank=%s rows=%s "
+            "immediate_mismatch=k:%s/v:%s after_sync_mismatch=k:%s/v:%s "
+            "elapsed_ms=%.3f",
+            self.tp_rank,
+            checked_rows,
+            immediate_k,
+            immediate_v,
+            after_sync_k,
+            after_sync_v,
+            elapsed_ms,
+        )
+        return (immediate_k, immediate_v, after_sync_k, after_sync_v)
 
     def _prepare_current_kv_index_copy_descriptors(
         self,
@@ -1898,6 +2110,22 @@ class SparseKVOffloadManager:
             and self.fused_overlap_plan_num_tokens == num_tokens
             and owner_map is not None
         )
+        if capturing and self.tp_rank == 0 and getattr(self, "adj_probe_enabled", False):
+            # Capture-time only.  Records which layers reuse the layer-0 plan and
+            # therefore emit no collective at all, so in graph mode the peer
+            # ranks have nothing to synchronize on for those layers.  The set is
+            # a static property of the captured graph (Python does not re-run
+            # per replay), so one capture is enough to enumerate it.
+            logger.warning(
+                "[SFA_ADJ_PROBE] stage=plan_reuse_decision layer_id=%s skip_topk=%s reuse=%s "
+                "owner_layer_id=%s num_tokens=%s topk=%s",
+                layer_id,
+                skip_topk,
+                can_reuse_owner_plan,
+                owner_layer_id,
+                num_tokens,
+                self.topk,
+            )
         if can_reuse_owner_plan:
             assert owner_map is not None
             if selection_membership_map.data_ptr() != owner_map.data_ptr():
@@ -1943,6 +2171,7 @@ class SparseKVOffloadManager:
                 self.lru_workspace_threads,
                 self.lru_visible_seq_lens_ptr,
             )
+            self._trace_planner_stats(layer_id)
 
         if capturing:
             plan_inputs_ready = torch_npu.npu.current_stream().record_event()
@@ -2080,6 +2309,189 @@ class SparseKVOffloadManager:
         flat_rope = selection_k_rope.reshape(-1, selection_k_rope.shape[-1])
         torch_npu.npu_scatter_nd_update_(flat_kv, indices, current_k)
         torch_npu.npu_scatter_nd_update_(flat_rope, indices, current_rope)
+
+    def _enqueue_graph_trace_cpu(
+        self,
+        stage: str,
+        layer_id: int,
+        tensor: torch.Tensor,
+        logical_numel: int,
+        *,
+        new_frame: bool = False,
+    ) -> None:
+        """Enqueue a graph-safe snapshot trace (experiment 1/2 plumbing).
+
+        ``new_frame`` marks the record that opens a forward step; the C++ sink
+        then advances its frame counter so every record of the same step shares
+        one ``frame=`` id and two observation points can be compared without
+        relying on log ordering.
+        """
+        if not getattr(self, "adj_probe_enabled", False):
+            return
+        self.sparse_kv_offload_cpp.enqueue_graph_trace_tensor(
+            tensor,
+            stage,
+            layer_id,
+            self.tp_rank,
+            logical_numel,
+            new_frame,
+        )
+
+    def _trace_planner_stats(self, layer_id: int) -> None:
+        """Publish the planner counters of the call that just returned.
+
+        The C++ planner overwrites its int32[4] counter block on every call (see
+        SFA_ADJ_PLANNER_STATS_LAYOUT), so tracing the buffer right after the call
+        yields per-layer, per-step *dependency size* and silent-drop magnitude.
+        In the capture path this runs on the fused plan stream, i.e. behind the
+        planner's own host callback, so the snapshot observes this call only.
+        """
+        stats = getattr(self, "adj_planner_stats_cpu", None)
+        if stats is None:
+            return
+        self._enqueue_graph_trace_cpu("planner_stats", layer_id, stats, stats.numel())
+
+    def trace_graph_host_kv_visibility(self, layer_name: str, *, stage: str) -> None:
+        """Experiment 1: count same-step Host rows that are not landed yet.
+
+        Called around the writeback join (pre_join / post_join), right after the
+        writeback launch (post_write) and around the TP ready broadcast
+        (pre_bcast / post_bcast).  A nonzero count means the fused operator,
+        which runs next, would read stale K/V for those rows (E1 on TP0; E2 on
+        the peer ranks -- decode K/V is replicated, so every rank compares its
+        own local view against its own K/V).
+
+        Measurement domains, dispatched by backend:
+        * Mooncake: the host views are NPU-addressable device tensors, so the
+          comparison runs as device operators on the compute stream (exactly
+          what the operator will read), accumulating into a device counter.
+        * MemFabric: the host views are CPU tensors over GVA shared memory, so
+          the comparison runs in a host callback that reads the live shared
+          memory after D2H snapshots of the current K/V and slots.
+        """
+        if not getattr(self, "adj_probe_enabled", False):
+            return
+        self._probe_host_kv_visibility(self._get_offload_layer_id(layer_name), stage, new_frame=stage == "post_write")
+
+    def _probe_host_kv_visibility(self, layer_id: int, stage: str, *, new_frame: bool = False) -> None:
+        if not getattr(self, "adj_probe_enabled", False):
+            return
+        if stage not in SFA_HOST_KV_VISIBILITY_STAGES:
+            return
+        current_kv = self.current_kv_by_layer.get(layer_id)
+        slot_mapping = self.index_copy_probe_slots_by_layer.get(layer_id)
+        if current_kv is None or slot_mapping is None:
+            return
+        if self._uses_mooncake_host_pool():
+            self._trace_graph_host_kv_visibility_device(layer_id, stage, current_kv, slot_mapping, new_frame=new_frame)
+        else:
+            self._trace_graph_host_kv_visibility_hostview(
+                layer_id, stage, current_kv, slot_mapping, new_frame=new_frame
+            )
+
+    def _trace_graph_host_kv_visibility_device(
+        self,
+        layer_id: int,
+        stage: str,
+        current_kv: tuple[torch.Tensor, torch.Tensor],
+        slot_mapping: torch.Tensor,
+        *,
+        new_frame: bool = False,
+    ) -> None:
+        counter = getattr(self, "graph_host_kv_visibility_npu", None)
+        if counter is None:
+            return
+        stage_index = SFA_HOST_KV_VISIBILITY_STAGES.index(stage)
+        if layer_id == 0 and stage == SFA_HOST_KV_VISIBILITY_FRAME_OPEN_STAGE:
+            # Layer 0 write-back opens a forward step: report per step, not
+            # cumulatively.
+            counter.zero_()
+
+        current_k, current_v = current_kv
+        device = current_k.device
+        token_dim_k = self.token_size_bytes_k // current_k.element_size()
+        token_dim_v = self.token_size_bytes_v // current_v.element_size()
+        current_k_rows = current_k.reshape(-1, token_dim_k)
+        current_v_rows = current_v.reshape(-1, token_dim_v)
+        host_k_rows = self.k_caches_cpu[layer_id].reshape(-1, token_dim_k)
+        host_v_rows = self.v_caches_cpu[layer_id].reshape(-1, token_dim_v)
+
+        slots = slot_mapping.reshape(-1).to(device=device, dtype=torch.int64)
+        token_count = slots.numel()
+        if (
+            token_count == 0
+            or current_k_rows.shape[0] != token_count
+            or current_v_rows.shape[0] != token_count
+            or host_k_rows.shape[0] != host_v_rows.shape[0]
+        ):
+            return
+        num_slots = host_k_rows.shape[0]
+        # Padded rows are excluded by a mask rather than by a slice: slicing
+        # would need the copy count on the host, which graph capture forbids.
+        valid = (slots >= 0) & (slots < num_slots)
+        safe_slots = slots.clamp(min=0, max=num_slots - 1)
+        actual_k = host_k_rows.index_select(0, safe_slots)
+        actual_v = host_v_rows.index_select(0, safe_slots)
+        mismatched_rows = (
+            (actual_k.view(torch.int16) != current_k_rows.view(torch.int16)).any(dim=-1)
+            | (actual_v.view(torch.int16) != current_v_rows.view(torch.int16)).any(dim=-1)
+        ) & valid
+        counter[stage_index].add_(torch.count_nonzero(mismatched_rows))
+        self._enqueue_graph_trace_cpu(
+            f"host_kv_visibility_{stage}",
+            layer_id,
+            counter[stage_index : stage_index + 1],
+            1,
+            new_frame=new_frame,
+        )
+
+    def _trace_graph_host_kv_visibility_hostview(
+        self,
+        layer_id: int,
+        stage: str,
+        current_kv: tuple[torch.Tensor, torch.Tensor],
+        slot_mapping: torch.Tensor,
+        *,
+        new_frame: bool = False,
+    ) -> None:
+        host_k = self.k_caches_cpu[layer_id]
+        host_v = self.v_caches_cpu[layer_id]
+        if host_k.device.type != "cpu" or host_v.device.type != "cpu":
+            return
+        # new_frame only drives the C++ frame counter on the device-view path;
+        # the host-view callback stamps the frame it observes when it runs.
+        del new_frame
+        current_k, current_v = current_kv
+        token_dim_k = self.token_size_bytes_k // current_k.element_size()
+        token_dim_v = self.token_size_bytes_v // current_v.element_size()
+        host_k_rows = host_k.reshape(-1, token_dim_k)
+        host_v_rows = host_v.reshape(-1, token_dim_v)
+        current_k_rows = current_k.reshape(-1, token_dim_k)
+        current_v_rows = current_v.reshape(-1, token_dim_v)
+        num_tokens = slot_mapping.numel()
+        if (
+            num_tokens == 0
+            or current_k_rows.shape[0] != num_tokens
+            or current_v_rows.shape[0] != num_tokens
+            or host_k_rows.shape[0] != host_v_rows.shape[0]
+            or not (host_k_rows.is_contiguous() and host_v_rows.is_contiguous())
+        ):
+            return
+        # The C++ side D2H-snapshots the current K/V and the slots on the
+        # current stream, then a host callback compares bit-exactly against the
+        # live CPU host views and reports the mismatch count (nonzero always
+        # printed).  Safe in graph capture: the D2H and host func are captured
+        # with graph-lifetime payload retention.
+        self.sparse_kv_offload_cpp.enqueue_host_kv_visibility_compare_cpu(
+            host_k_rows,
+            host_v_rows,
+            current_k_rows.contiguous(),
+            current_v_rows.contiguous(),
+            slot_mapping.reshape(-1).to(dtype=torch.int64).contiguous(),
+            layer_id,
+            self.tp_rank,
+            stage,
+        )
 
     def wait_for_current_kv_writeback(self, capturing: bool = False) -> None:
         """Order the current stream after this step's Host-KV writeback.

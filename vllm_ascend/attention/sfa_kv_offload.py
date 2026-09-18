@@ -1000,7 +1000,15 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         # rows include the earlier token rows of this very step, whose K/V is
         # still being written back on the save stream, so the compute stream
         # must join the writeback *before* the operator runs.
+        #
+        # The adjudication probe hugs the join (experiment 1): "pre_join"
+        # counts this step's Host rows that are still unwritten right before
+        # the join (nonzero means the operator, which runs next, would read
+        # stale K/V), "post_join" must be zero and proves the join covers the
+        # writeback.  Emitted for every TP rank and both host backends.
+        manager.trace_graph_host_kv_visibility(layer_name, stage="pre_join")
         manager.wait_for_current_kv_writeback(get_forward_context().capturing)
+        manager.trace_graph_host_kv_visibility(layer_name, stage="post_join")
         attn_output = fused_op(**fused_inputs)
         attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
         return attn_output

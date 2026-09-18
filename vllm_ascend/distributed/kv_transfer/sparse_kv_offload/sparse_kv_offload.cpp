@@ -5,11 +5,17 @@
 #include <optional>
 #include <iostream>
 #include <chrono>
+#include <cstring>
+#include <sstream>
+#include <thread>
+#include <condition_variable>
+#include <deque>
 #include <string>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <numeric>
 #include <ATen/Parallel.h>
 #include <torch/script.h>
@@ -38,6 +44,21 @@
 
 constexpr int32_t EPOCH_RESET_THRESHOLD = 1 << 30;
 constexpr int16_t DIRECT_SELECTION_LAYOUT_MARKER = 0x5A44;
+
+// --- Adjudication probe plumbing (repo3) -------------------------------------
+// Optional per-layer counters filled by the CPU planner.  The buffer is a pinned
+// CPU int32[4] owned by the Python manager and only registered while
+// VLLM_ASCEND_SFA_ADJ_PROBE is on; 0 disables all counting, so the production
+// planner pays nothing but one relaxed load.
+//   [0] window_refs    TopK entries of this layer that point at *another* token
+//                      row of the current step (token >= stable_prefix_len,
+//                      token < visible_seq_len, token != own token)
+//   [1] window_loaded  of those, the ones served from the Host pool (plan < 0)
+//   [2] window_dropped of those, the ones silently dropped (never got a slot)
+//   [3] misses_dropped all misses that did not get a slot (plan stays 0)
+// [0]-[2] answer "is the same-step Host read a real dependency, and how big is
+// it?"; [3] answers "does the LRU cache silently drop keys?" (long sequences).
+std::atomic<uintptr_t> g_planner_probe_stats{0};
 
 FORCE_INLINE int choose_lru_resident_threads(const int num_reqs, const int workspace_threads,
                                              const int requested_threads) {
@@ -102,7 +123,7 @@ FORCE_INLINE void process_one_lru_resident_row(
     int32_t* RESTRICT miss_slots_out, int32_t* RESTRICT token_mark, int32_t* RESTRICT token_pos,
     int32_t* RESTRICT slot_workspace, int32_t* RESTRICT miss_positions, int32_t* RESTRICT epoch,
     int32_t* RESTRICT current_token_slots, int16_t* RESTRICT encoded_plan, const int32_t encoded_plan_stride,
-    const bool encode_physical_row, const int32_t* RESTRICT visible_seq_lens) {
+    const bool encode_physical_row, const int32_t* RESTRICT visible_seq_lens, int32_t* RESTRICT probe_stats) {
   int32_t* RESTRICT slot_to_token_row = slot_to_token + static_cast<int64_t>(physical_row) * capacity;
   int32_t* RESTRICT lru_slots_row = lru_slots + static_cast<int64_t>(physical_row) * capacity;
   int32_t* RESTRICT current_slots_row = current_slots + static_cast<int64_t>(logical_row) * topk;
@@ -143,11 +164,24 @@ FORCE_INLINE void process_one_lru_resident_row(
   int32_t current_token_slot = resident_capacity;
 
   const int32_t base = next_lru_resident_epoch(token_mark, token_pos, epoch, max_token);
+  // Probe: references to *other* token rows of the current step.  Their K/V was
+  // produced by this very step and can only come from the Host pool, so this
+  // count is the size of the same-step read-after-write dependency.
+  int32_t probe_refs = 0;
+  int32_t probe_own_token_in_topk = 0;
+  const bool probe_on = probe_stats != nullptr;
   for (int32_t pos = 0; pos < topk; ++pos) {
     const int32_t token = topk_row[pos];
     if (LIKELY(is_valid_lru_resident_token(token, max_token)) && token < visible_seq_len && token_mark[token] != base) {
       token_mark[token] = base;
       token_pos[token] = pos;
+      if (probe_on && token >= stable_prefix_len) {
+        if (token == visible_seq_len - 1) {
+          ++probe_own_token_in_topk;
+        } else {
+          ++probe_refs;
+        }
+      }
     }
   }
 
@@ -211,6 +245,22 @@ FORCE_INLINE void process_one_lru_resident_row(
     miss_count[logical_row] = miss_idx + 1;
   }
 
+  int32_t probe_window_loaded = 0;
+  int32_t probe_window_dropped = 0;
+  if (probe_on) {
+    for (int32_t miss_idx = 0; miss_idx < local_miss_count; ++miss_idx) {
+      const int32_t token = miss_tokens_row[miss_idx];
+      if (token < stable_prefix_len || token >= visible_seq_len || token == visible_seq_len - 1) {
+        continue;
+      }
+      if (miss_idx < assign_count) {
+        ++probe_window_loaded;
+      } else {
+        ++probe_window_dropped;
+      }
+    }
+  }
+
   int32_t write_pos = 0;
   for (int32_t idx = assign_count; idx < evictable_count; ++idx) {
     lru_slots_row[write_pos] = evictable_slots[idx];
@@ -226,6 +276,18 @@ FORCE_INLINE void process_one_lru_resident_row(
   }
   if (current_token_slots != nullptr) {
     current_token_slots[logical_row] = physical_row * capacity + current_token_slot;
+  }
+  if (probe_stats != nullptr) {
+    const int32_t probe_dropped_misses = local_miss_count - assign_count;
+#pragma omp atomic
+    probe_stats[0] += probe_refs;
+#pragma omp atomic
+    probe_stats[1] += probe_window_loaded;
+#pragma omp atomic
+    probe_stats[2] += probe_window_dropped;
+#pragma omp atomic
+    probe_stats[3] += probe_dropped_misses;
+    (void)probe_own_token_in_topk;
   }
 }
 
@@ -258,6 +320,12 @@ HOT_FUNCTION void lru_resident_compact_impl(
   auto* RESTRICT epochs = reinterpret_cast<int32_t*>(epochs_ptr);
   auto* RESTRICT encoded_plan = reinterpret_cast<int16_t*>(encoded_plan_ptr);
   auto* RESTRICT physical_row_workspace = reinterpret_cast<int32_t*>(physical_row_workspace_ptr);
+  auto* RESTRICT probe_stats = reinterpret_cast<int32_t*>(g_planner_probe_stats.load(std::memory_order_relaxed));
+  if (probe_stats != nullptr) {
+    // Per-layer counters: this call overwrites them, the caller traces the
+    // buffer right after the planner returns.
+    std::fill(probe_stats, probe_stats + 4, 0);
+  }
 
   const int num_reqs_int = static_cast<int>(num_reqs);
   const int topk_int = static_cast<int>(topk);
@@ -322,7 +390,7 @@ HOT_FUNCTION void lru_resident_compact_impl(
                                    miss_count, miss_tokens, miss_slots, token_mark_workspace, token_pos_workspace,
                                    slot_workspace, miss_position_workspace, epochs, current_token_slots, encoded_plan,
                                    static_cast<int32_t>(encoded_plan_stride), logical_to_physical != nullptr,
-                                   visible_seq_lens);
+                                   visible_seq_lens, probe_stats);
     }
     return;
   }
@@ -341,7 +409,7 @@ HOT_FUNCTION void lru_resident_compact_impl(
                                    topk_indices, stable_prefix_lens, slot_to_token, lru_slots, current_slots,
                                    miss_count, miss_tokens, miss_slots, token_mark, token_pos, slots, miss_positions,
                                    epoch, current_token_slots, encoded_plan, static_cast<int32_t>(encoded_plan_stride),
-                                   logical_to_physical != nullptr, visible_seq_lens);
+                                   logical_to_physical != nullptr, visible_seq_lens, probe_stats);
     }
   }
 }
@@ -828,6 +896,439 @@ at::Tensor restore_tensor(uintptr_t ptr_val, const std::vector<int64_t>& shape,
   return torch::from_blob(reinterpret_cast<void*>(ptr_val), shape, options);
 }
 
+// ============================================================================
+// Adjudication probes (repo3), enabled by VLLM_ASCEND_SFA_ADJ_PROBE.
+// Python only calls these entry points when the probe is enabled, so the
+// production paths stay untouched when it is off.
+//   * enqueue_graph_trace_tensor: graph-safe snapshot trace of a CPU tensor
+//     (live pointer) or a device tensor (D2H snapshot + host callback).
+//   * enqueue_host_kv_visibility_compare_cpu: MemFabric host-view visibility
+//     check.  D2H-snapshots the current K/V and slot_mapping on the current
+//     stream, then a host callback compares them bit-exactly against the live
+//     CPU host-pool views (GVA memory readable from the host) and reports the
+//     number of "same-step rows not landed yet" at the observation point.
+// ============================================================================
+
+class GraphTraceSink {
+ public:
+  GraphTraceSink() {
+    std::thread([this]() { run(); }).detach();
+  }
+
+  void push(std::string record) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (records_.size() >= 8192) {
+        ++dropped_;
+        return;
+      }
+      records_.push_back(std::move(record));
+    }
+    ready_.notify_one();
+  }
+
+ private:
+  void run() {
+    while (true) {
+      std::string record;
+      uint64_t dropped = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [this]() { return !records_.empty(); });
+        record = std::move(records_.front());
+        records_.pop_front();
+        dropped = dropped_;
+        dropped_ = 0;
+      }
+      if (dropped != 0) {
+        std::cerr << "[SFA_ADJ_PROBE] dropped=" << dropped << std::endl;
+      }
+      std::cerr << record << std::endl;
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::string> records_;
+  uint64_t dropped_ = 0;
+};
+
+GraphTraceSink& adj_trace_sink() {
+  static auto* sink = new GraphTraceSink();
+  return *sink;
+}
+
+struct GraphTracePayload {
+  at::Tensor cpu_tensor;  // live CPU view, or pinned D2H snapshot of a device tensor
+  std::string stage;
+  int64_t layer_id;
+  int64_t tp_rank;
+  int64_t logical_numel;
+  uint64_t calls;
+  bool delete_after_run;
+  // True only for the record that opens a forward step (layer 0 write-back).
+  // The sink stamps that record and every following one with the same frame id,
+  // so records from different observation points can be grouped per step.
+  bool new_frame;
+};
+
+// Frame id shared by all adjudication records of one process.
+std::atomic<uint64_t>& adj_frame_id() {
+  static auto* frame = new std::atomic<uint64_t>(0);
+  return *frame;
+}
+
+// Monotonic timestamp (microseconds since the first adjudication record) so two
+// observation points can be compared without relying on print ordering.
+int64_t adj_trace_timestamp_us() {
+  static const auto epoch = std::chrono::steady_clock::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - epoch).count();
+}
+
+const uint8_t* adj_trace_element_ptr(const at::Tensor& tensor, int64_t logical_index) {
+  int64_t storage_index = logical_index;
+  if (!tensor.is_contiguous()) {
+    const int64_t columns = tensor.size(1);
+    storage_index = (logical_index / columns) * tensor.stride(0) + logical_index % columns;
+  }
+  return static_cast<const uint8_t*>(tensor.data_ptr()) + storage_index * tensor.element_size();
+}
+
+template <typename T>
+void append_adj_trace_values(std::ostringstream& out, const at::Tensor& tensor, int64_t count) {
+  out << " values=[";
+  for (int64_t index = 0; index < std::min<int64_t>(count, 8); ++index) {
+    if (index != 0) {
+      out << ',';
+    }
+    out << static_cast<int64_t>(*reinterpret_cast<const T*>(adj_trace_element_ptr(tensor, index)));
+  }
+  out << ']';
+}
+
+void graph_trace_callback(void* args) noexcept {
+  auto* payload = static_cast<GraphTracePayload*>(args);
+  const uint64_t call = ++payload->calls;
+  if (payload->new_frame) {
+    adj_frame_id().fetch_add(1, std::memory_order_relaxed);
+  }
+  const uint64_t frame = adj_frame_id().load(std::memory_order_relaxed);
+  const int64_t timestamp_us = adj_trace_timestamp_us();
+  // A nonzero single-element counter is the only signal that a race actually
+  // fired, so it must never be sampled away.
+  bool nonzero_counter = false;
+  {
+    const auto& counted = payload->cpu_tensor;
+    if (counted.numel() == 1) {
+      const auto* bytes = adj_trace_element_ptr(counted, 0);
+      for (int64_t byte = 0; byte < counted.element_size(); ++byte) {
+        if (bytes[byte] != 0) {
+          nonzero_counter = true;
+          break;
+        }
+      }
+    }
+  }
+  const bool sampled = nonzero_counter || call <= 4 || (call & (call - 1)) == 0 || call % 64 == 0;
+  if (sampled) {
+    try {
+      const auto& tensor = payload->cpu_tensor;
+      const int64_t count = std::min<int64_t>(payload->logical_numel, tensor.numel());
+      uint64_t hash = 1469598103934665603ULL;
+      for (int64_t index = 0; index < count; ++index) {
+        const auto* bytes = adj_trace_element_ptr(tensor, index);
+        for (int64_t byte = 0; byte < tensor.element_size(); ++byte) {
+          hash ^= bytes[byte];
+          hash *= 1099511628211ULL;
+        }
+      }
+      std::ostringstream out;
+      out << "[SFA_ADJ_PROBE] stage=" << payload->stage << " frame=" << frame << " t_us=" << timestamp_us
+          << " call=" << call << " layer_id=" << payload->layer_id << " tp_rank=" << payload->tp_rank
+          << " dtype=" << static_cast<int>(tensor.scalar_type()) << " numel=" << count << " hash=" << hash;
+      switch (tensor.scalar_type()) {
+        case at::ScalarType::Short:
+          append_adj_trace_values<int16_t>(out, tensor, count);
+          break;
+        case at::ScalarType::Int:
+          append_adj_trace_values<int32_t>(out, tensor, count);
+          break;
+        case at::ScalarType::Long:
+          append_adj_trace_values<int64_t>(out, tensor, count);
+          break;
+        default:
+          break;
+      }
+      adj_trace_sink().push(out.str());
+    } catch (...) {
+      adj_trace_sink().push("[SFA_ADJ_PROBE] callback_failed stage=" + payload->stage);
+    }
+  }
+  if (payload->delete_after_run) {
+    delete payload;
+  }
+}
+
+template <typename PayloadT>
+struct AdjGraphPayloadRegistry {
+  aclmdlRI model_ri;
+  std::vector<std::unique_ptr<PayloadT>> payloads;
+};
+
+template <typename PayloadT>
+std::mutex& adj_graph_registry_mutex() {
+  static auto* mutex = new std::mutex();
+  return *mutex;
+}
+
+template <typename PayloadT>
+std::unordered_map<aclmdlRI, std::unique_ptr<AdjGraphPayloadRegistry<PayloadT>>>& adj_graph_registries() {
+  static auto* registries = new std::unordered_map<aclmdlRI, std::unique_ptr<AdjGraphPayloadRegistry<PayloadT>>>();
+  return *registries;
+}
+
+template <typename PayloadT>
+void delete_adj_graph_payloads(void* args) noexcept {
+  auto* registry = static_cast<AdjGraphPayloadRegistry<PayloadT>*>(args);
+  std::unique_ptr<AdjGraphPayloadRegistry<PayloadT>> owned_registry;
+  {
+    std::lock_guard<std::mutex> lock(adj_graph_registry_mutex<PayloadT>());
+    auto& registries = adj_graph_registries<PayloadT>();
+    const auto it = registries.find(registry->model_ri);
+    if (it != registries.end() && it->second.get() == registry) {
+      owned_registry = std::move(it->second);
+      registries.erase(it);
+    }
+  }
+}
+
+template <typename PayloadT>
+PayloadT* retain_adj_graph_payload(aclmdlRI model_ri, std::unique_ptr<PayloadT> payload) {
+  auto* raw_payload = payload.get();
+  std::lock_guard<std::mutex> lock(adj_graph_registry_mutex<PayloadT>());
+  auto& registries = adj_graph_registries<PayloadT>();
+  auto it = registries.find(model_ri);
+  if (it == registries.end()) {
+    auto registry = std::make_unique<AdjGraphPayloadRegistry<PayloadT>>();
+    registry->model_ri = model_ri;
+    auto* raw_registry = registry.get();
+    it = registries.emplace(model_ri, std::move(registry)).first;
+    const aclError register_ret =
+        aclmdlRIDestroyRegisterCallback(model_ri, delete_adj_graph_payloads<PayloadT>, raw_registry);
+    if (register_ret != ACL_SUCCESS) {
+      registries.erase(it);
+    }
+    TORCH_CHECK(register_ret == ACL_SUCCESS,
+                "failed to bind adjudication probe payload registry to graph lifetime, error code: ", register_ret);
+  }
+  it->second->payloads.push_back(std::move(payload));
+  return raw_payload;
+}
+
+void enqueue_graph_trace_tensor(const at::Tensor& tensor, const std::string& stage, int64_t layer_id,
+                                int64_t tp_rank, int64_t logical_numel, bool new_frame) {
+  TORCH_CHECK(tensor.device().is_cpu() || tensor.device().type() == c10::DeviceType::PrivateUse1,
+              "adj trace only supports CPU and NPU tensors, but got device ", tensor.device());
+  TORCH_CHECK(logical_numel >= 0 && logical_numel <= tensor.numel(), "invalid adj trace logical_numel");
+  const auto stream = c10_npu::getCurrentNPUStream().stream();
+  at::Tensor cpu_snapshot = tensor;
+  if (tensor.device().is_cpu()) {
+    TORCH_CHECK(tensor.is_contiguous() || (tensor.dim() == 2 && tensor.stride(1) == 1 && tensor.stride(0) > 0),
+                "strided CPU adj trace only supports dense rows in a 2D tensor, shape=", tensor.sizes(),
+                ", strides=", tensor.strides(), ", stage=", stage);
+  } else {
+    cpu_snapshot = at::empty(tensor.sizes(), tensor.options().device(at::kCPU).pinned_memory(true));
+    aclError memcpy_ret = ACL_SUCCESS;
+    if (tensor.is_contiguous()) {
+      const size_t num_bytes = tensor.numel() * tensor.element_size();
+      memcpy_ret = aclrtMemcpyAsync(cpu_snapshot.data_ptr(), num_bytes, tensor.data_ptr(), num_bytes,
+                                    ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    } else {
+      TORCH_CHECK(tensor.dim() == 2 && tensor.stride(1) == 1 && tensor.stride(0) > 0,
+                  "strided NPU adj trace only supports dense rows in a 2D tensor, shape=", tensor.sizes(),
+                  ", strides=", tensor.strides(), ", stage=", stage);
+      const size_t row_bytes = tensor.size(1) * tensor.element_size();
+      const size_t source_pitch = tensor.stride(0) * tensor.element_size();
+      memcpy_ret = aclrtMemcpy2dAsync(cpu_snapshot.data_ptr(), row_bytes, tensor.data_ptr(), source_pitch, row_bytes,
+                                      tensor.size(0), ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    }
+    TORCH_CHECK(memcpy_ret == ACL_SUCCESS, "adj trace D2H aclrtMemcpyAsync failed, error code: ", memcpy_ret,
+                ", stage=", stage);
+  }
+  aclmdlRICaptureStatus capture_status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI model_ri = nullptr;
+  const aclError capture_ret = aclmdlRICaptureGetInfo(stream, &capture_status, &model_ri);
+  TORCH_CHECK(capture_ret == ACL_SUCCESS, "aclmdlRICaptureGetInfo for adj trace failed, error code: ", capture_ret);
+  const bool graph_lifetime = capture_status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+  auto payload = std::make_unique<GraphTracePayload>(
+      GraphTracePayload{cpu_snapshot, stage, layer_id, tp_rank, logical_numel, 0, !graph_lifetime, new_frame});
+  auto* raw_payload = payload.get();
+  if (graph_lifetime) {
+    TORCH_CHECK(model_ri != nullptr, "active graph capture returned a null model runtime instance");
+    raw_payload = retain_adj_graph_payload<GraphTracePayload>(model_ri, std::move(payload));
+  }
+  const aclError ret = aclrtLaunchHostFunc(stream, graph_trace_callback, raw_payload);
+  if (ret == ACL_SUCCESS && !graph_lifetime) {
+    payload.release();
+  }
+  TORCH_CHECK(ret == ACL_SUCCESS, "aclrtLaunchHostFunc for adj trace failed, error code: ", ret);
+}
+
+struct HostKvVisibilityCpuPayload {
+  at::Tensor host_k;       // CPU bf16 [num_slots, dim_k], live shared-pool memory
+  at::Tensor host_v;       // CPU bf16 [num_slots, dim_v], live shared-pool memory
+  at::Tensor expected_k;   // pinned bf16 [num_tokens, dim_k], D2H snapshot of current K
+  at::Tensor expected_v;   // pinned bf16 [num_tokens, dim_v], D2H snapshot of current V
+  at::Tensor slots;        // pinned int64 [num_tokens], D2H snapshot of slot_mapping
+  int64_t num_tokens;
+  int64_t dim_k;
+  int64_t dim_v;
+  int64_t num_host_slots;
+  int64_t layer_id;
+  int64_t tp_rank;
+  std::string stage;
+  uint64_t calls;
+  bool delete_after_run;
+};
+
+void host_kv_visibility_cpu_callback(void* args) noexcept {
+  auto* payload = static_cast<HostKvVisibilityCpuPayload*>(args);
+  const uint64_t call = ++payload->calls;
+  int64_t mismatches = 0;
+  int64_t valid_rows = 0;
+  int64_t first_bad_token = -1;
+  bool compare_failed = false;
+  try {
+    const auto* slots = payload->slots.data_ptr<int64_t>();
+    const auto* expected_k = static_cast<const uint16_t*>(payload->expected_k.data_ptr());
+    const auto* expected_v = static_cast<const uint16_t*>(payload->expected_v.data_ptr());
+    const auto* host_k = static_cast<const uint16_t*>(payload->host_k.data_ptr());
+    const auto* host_v = static_cast<const uint16_t*>(payload->host_v.data_ptr());
+    for (int64_t token = 0; token < payload->num_tokens; ++token) {
+      const int64_t slot = slots[token];
+      if (slot < 0 || slot >= payload->num_host_slots) {
+        continue;
+      }
+      ++valid_rows;
+      const uint16_t* host_k_row = host_k + slot * payload->dim_k;
+      const uint16_t* expected_k_row = expected_k + token * payload->dim_k;
+      const bool k_mismatch =
+          std::memcmp(host_k_row, expected_k_row, static_cast<size_t>(payload->dim_k) * sizeof(uint16_t)) != 0;
+      bool v_mismatch = false;
+      if (!k_mismatch) {
+        const uint16_t* host_v_row = host_v + slot * payload->dim_v;
+        const uint16_t* expected_v_row = expected_v + token * payload->dim_v;
+        v_mismatch =
+            std::memcmp(host_v_row, expected_v_row, static_cast<size_t>(payload->dim_v) * sizeof(uint16_t)) != 0;
+      }
+      if (k_mismatch || v_mismatch) {
+        ++mismatches;
+        if (first_bad_token < 0) {
+          first_bad_token = token;
+        }
+      }
+    }
+  } catch (...) {
+    compare_failed = true;
+  }
+  const bool sampled = compare_failed || mismatches > 0 || call <= 4 || (call & (call - 1)) == 0 || call % 64 == 0;
+  if (sampled) {
+    const uint64_t frame = adj_frame_id().load(std::memory_order_relaxed);
+    const int64_t timestamp_us = adj_trace_timestamp_us();
+    std::ostringstream out;
+    if (compare_failed) {
+      out << "[SFA_ADJ_PROBE] stage=host_kv_visibility_hostview_" << payload->stage
+          << " frame=" << frame << " t_us=" << timestamp_us
+          << " call=" << call << " layer_id=" << payload->layer_id << " tp_rank=" << payload->tp_rank
+          << " error=compare_failed";
+    } else {
+      out << "[SFA_ADJ_PROBE] stage=host_kv_visibility_hostview_" << payload->stage
+          << " frame=" << frame << " t_us=" << timestamp_us
+          << " call=" << call << " layer_id=" << payload->layer_id << " tp_rank=" << payload->tp_rank
+          << " mismatches=" << mismatches << "/" << valid_rows;
+      if (first_bad_token >= 0) {
+        out << " first_bad_token=" << first_bad_token;
+      }
+    }
+    adj_trace_sink().push(out.str());
+  }
+  if (payload->delete_after_run) {
+    delete payload;
+  }
+}
+
+void enqueue_host_kv_visibility_compare_cpu(const at::Tensor& host_k, const at::Tensor& host_v,
+                                            const at::Tensor& current_k, const at::Tensor& current_v,
+                                            const at::Tensor& slot_mapping, int64_t layer_id, int64_t tp_rank,
+                                            const std::string& stage) {
+  TORCH_CHECK(host_k.device().is_cpu() && host_v.device().is_cpu(),
+              "adj visibility host views must be CPU tensors, got ", host_k.device(), " / ", host_v.device());
+  TORCH_CHECK(!current_k.device().is_cpu() && !current_v.device().is_cpu(),
+              "adj visibility current K/V must be device tensors, got ", current_k.device(), " / ",
+              current_v.device());
+  TORCH_CHECK(host_k.scalar_type() == torch::kBFloat16 && host_v.scalar_type() == torch::kBFloat16 &&
+                  current_k.scalar_type() == torch::kBFloat16 && current_v.scalar_type() == torch::kBFloat16,
+              "adj visibility requires bf16 tensors");
+  TORCH_CHECK(slot_mapping.scalar_type() == torch::kInt64, "adj visibility requires an int64 slot_mapping");
+  TORCH_CHECK(host_k.dim() == 2 && host_v.dim() == 2 && current_k.dim() == 2 && current_v.dim() == 2,
+              "adj visibility requires 2D [rows, dim] tensors");
+  const int64_t num_tokens = current_k.size(0);
+  TORCH_CHECK(num_tokens > 0, "adj visibility requires a positive token count");
+  TORCH_CHECK(current_v.size(0) == num_tokens && slot_mapping.numel() == num_tokens,
+              "adj visibility row-count mismatch: k=", num_tokens, " v=", current_v.size(0),
+              " slots=", slot_mapping.numel());
+  TORCH_CHECK(current_k.size(1) == host_k.size(1) && current_v.size(1) == host_v.size(1),
+              "adj visibility dim mismatch against host views");
+  TORCH_CHECK(host_k.is_contiguous() && host_v.is_contiguous() && current_k.is_contiguous() &&
+                  current_v.is_contiguous() && slot_mapping.is_contiguous(),
+              "adj visibility requires contiguous tensors");
+  const int64_t num_host_slots = host_k.size(0);
+  TORCH_CHECK(num_host_slots > 0, "adj visibility requires a positive host slot count");
+
+  auto expected_k = at::empty(current_k.sizes(), current_k.options().device(at::kCPU).pinned_memory(true));
+  auto expected_v = at::empty(current_v.sizes(), current_v.options().device(at::kCPU).pinned_memory(true));
+  auto slots_snapshot = at::empty(slot_mapping.sizes(), slot_mapping.options().device(at::kCPU).pinned_memory(true));
+
+  auto payload = std::make_unique<HostKvVisibilityCpuPayload>(HostKvVisibilityCpuPayload{
+      host_k, host_v, expected_k, expected_v, slots_snapshot, num_tokens, current_k.size(1), current_v.size(1),
+      num_host_slots, layer_id, tp_rank, stage, 0, false});
+
+  const auto stream = c10_npu::getCurrentNPUStream().stream();
+  aclmdlRICaptureStatus capture_status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI model_ri = nullptr;
+  const aclError capture_ret = aclmdlRICaptureGetInfo(stream, &capture_status, &model_ri);
+  TORCH_CHECK(capture_ret == ACL_SUCCESS,
+              "aclmdlRICaptureGetInfo for adj visibility failed, error code: ", capture_ret);
+  TORCH_CHECK(capture_status != ACL_MODEL_RI_CAPTURE_STATUS_INVALIDATED,
+              "adj visibility cannot enqueue on an invalidated graph capture");
+  const bool graph_lifetime = capture_status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+  payload->delete_after_run = !graph_lifetime;
+  auto* raw_payload = payload.get();
+  if (graph_lifetime) {
+    TORCH_CHECK(model_ri != nullptr, "active graph capture returned a null model runtime instance");
+    raw_payload = retain_adj_graph_payload<HostKvVisibilityCpuPayload>(model_ri, std::move(payload));
+  }
+
+  const size_t k_bytes = current_k.numel() * current_k.element_size();
+  const size_t v_bytes = current_v.numel() * current_v.element_size();
+  const size_t slot_bytes = slot_mapping.numel() * slot_mapping.element_size();
+  aclError memcpy_ret = aclrtMemcpyAsync(expected_k.data_ptr(), k_bytes, current_k.data_ptr(), k_bytes,
+                                         ACL_MEMCPY_DEVICE_TO_HOST, stream);
+  TORCH_CHECK(memcpy_ret == ACL_SUCCESS, "adj visibility K snapshot failed, error code: ", memcpy_ret);
+  memcpy_ret = aclrtMemcpyAsync(expected_v.data_ptr(), v_bytes, current_v.data_ptr(), v_bytes,
+                                ACL_MEMCPY_DEVICE_TO_HOST, stream);
+  TORCH_CHECK(memcpy_ret == ACL_SUCCESS, "adj visibility V snapshot failed, error code: ", memcpy_ret);
+  memcpy_ret = aclrtMemcpyAsync(slots_snapshot.data_ptr(), slot_bytes, slot_mapping.data_ptr(), slot_bytes,
+                                ACL_MEMCPY_DEVICE_TO_HOST, stream);
+  TORCH_CHECK(memcpy_ret == ACL_SUCCESS, "adj visibility slots snapshot failed, error code: ", memcpy_ret);
+
+  const aclError ret = aclrtLaunchHostFunc(stream, host_kv_visibility_cpu_callback, raw_payload);
+  if (ret == ACL_SUCCESS && !graph_lifetime) {
+    payload.release();
+  }
+  TORCH_CHECK(ret == ACL_SUCCESS, "aclrtLaunchHostFunc for adj visibility failed, error code: ", ret);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
   m.def("warmup_lru_resident_threads", &warmup_lru_resident_threads,
@@ -858,5 +1359,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Build compact source/destination index_copy descriptors on CPU");
   m.def("enqueue_current_kv_index_copy_descriptors", &enqueue_current_kv_index_copy_descriptors,
         "Enqueue graph-safe current KV index_copy descriptor generation");
+  m.def("enqueue_graph_trace_tensor", &enqueue_graph_trace_tensor,
+        "Enqueue a graph-replay trace snapshot for a CPU or device tensor", py::arg("tensor"), py::arg("stage"),
+        py::arg("layer_id"), py::arg("tp_rank"), py::arg("logical_numel"), py::arg("new_frame") = false);
+  m.def("enqueue_host_kv_visibility_compare_cpu", &enqueue_host_kv_visibility_compare_cpu,
+        "Enqueue a MemFabric host-view Host-KV visibility compare (D2H snapshot + host callback)");
+  m.def("set_planner_probe_stats_buffer",
+        [](uintptr_t ptr_val) { g_planner_probe_stats.store(ptr_val, std::memory_order_relaxed); },
+        "Register (or clear with 0) the CPU planner adjudication counters");
 
 }
