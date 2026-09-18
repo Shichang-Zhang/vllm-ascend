@@ -232,6 +232,7 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
         inject_current_kv_into_selection=inject_current,
         wait_for_current_kv_writeback=wait_for_writeback,
         trace_graph_host_kv_visibility=lambda *_args, **_kwargs: None,
+        trace_graph_fused_membership_input=lambda *_args, **_kwargs: None,
     )
 
     with (

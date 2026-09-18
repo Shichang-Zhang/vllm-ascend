@@ -29,6 +29,7 @@ def _make_plan_manager():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.use_fused_overlap = True
     manager.tp_rank = 0
+    manager.tp_size = 1
     manager.topk = 4
     manager.topk_buffer_size = 8
     manager.max_model_len = 64

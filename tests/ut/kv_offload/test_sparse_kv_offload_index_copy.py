@@ -311,7 +311,6 @@ def test_graph_mooncake_writeback_waits_for_save_stream():
             current_v,
             capturing=True,
         )
-        manager.wait_for_current_kv_writeback(capturing=True)
 
     manager._offload_new_kv_on_current_stream.assert_called_once_with(
         slot_mapping,
@@ -453,6 +452,7 @@ def test_graph_mooncake_prepares_descriptors_on_first_layer_only():
         "layer.1": 1,
     }
     manager.current_kv_by_layer = {}
+    manager.current_kv_save_stream = MagicMock()
     manager._offload_new_kv_on_current_stream = MagicMock()
     _set_mooncake_allocator(manager)
 
@@ -462,33 +462,39 @@ def test_graph_mooncake_prepares_descriptors_on_first_layer_only():
     current_k = torch.ones((1, 2), dtype=torch.bfloat16)
     current_v = torch.ones((1, 1), dtype=torch.bfloat16)
 
-    for layer_name in ("layer.0", "layer.1"):
-        manager.offload_new_kv(
-            layer_name,
-            slot_mapping,
-            host_k,
-            host_v,
-            None,
-            None,
-            current_k,
-            current_v,
-            capturing=True,
-        )
+    with patch.object(
+        manager_module.torch_npu.npu,
+        "current_stream",
+        return_value=MagicMock(),
+    ):
+        for layer_name in ("layer.0", "layer.1"):
+            manager.offload_new_kv(
+                layer_name,
+                slot_mapping,
+                host_k,
+                host_v,
+                None,
+                None,
+                current_k,
+                current_v,
+                capturing=True,
+            )
 
-    assert manager._offload_new_kv_on_current_stream.call_count == 2
-    first_call, second_call = (
-        manager._offload_new_kv_on_current_stream.call_args_list
-    )
-    assert first_call.args[-3:] == (
-        False,
-        True,
-        True,
-    )
-    assert second_call.args[-3:] == (
-        False,
-        True,
-        False,
-    )
+        assert manager._offload_new_kv_on_current_stream.call_count == 2
+        first_call, second_call = (
+            manager._offload_new_kv_on_current_stream.call_args_list
+        )
+        assert first_call.args[-3:] == (
+            False,
+            True,
+            True,
+        )
+        assert second_call.args[-3:] == (
+            False,
+            True,
+            False,
+        )
+        assert [call.args[-1] for call in (first_call, second_call)] == [True, False]
 
 
 def test_eager_selection_probe_skips_actual_acl_capture():
@@ -517,6 +523,7 @@ def test_graph_mooncake_prepares_descriptors_again_for_mtp_layer():
     }
     manager.mtp_layer_id = 2
     manager.current_kv_by_layer = {}
+    manager.current_kv_save_stream = MagicMock()
     manager._offload_new_kv_on_current_stream = MagicMock()
     _set_mooncake_allocator(manager)
 
@@ -527,24 +534,30 @@ def test_graph_mooncake_prepares_descriptors_again_for_mtp_layer():
     current_k = torch.ones((1, 2), dtype=torch.bfloat16)
     current_v = torch.ones((1, 1), dtype=torch.bfloat16)
 
-    for layer_name, slot_mapping in (
-        ("layer.0", target_slot_mapping),
-        ("layer.1", target_slot_mapping),
-        ("mtp", mtp_slot_mapping),
+    with patch.object(
+        manager_module.torch_npu.npu,
+        "current_stream",
+        return_value=MagicMock(),
     ):
-        manager.offload_new_kv(
-            layer_name,
-            slot_mapping,
-            host_k,
-            host_v,
-            None,
-            None,
-            current_k,
-            current_v,
-            capturing=True,
-        )
+        for layer_name, slot_mapping in (
+            ("layer.0", target_slot_mapping),
+            ("layer.1", target_slot_mapping),
+            ("mtp", mtp_slot_mapping),
+        ):
+            manager.offload_new_kv(
+                layer_name,
+                slot_mapping,
+                host_k,
+                host_v,
+                None,
+                None,
+                current_k,
+                current_v,
+                capturing=True,
+            )
 
-    calls = manager._offload_new_kv_on_current_stream.call_args_list
-    assert len(calls) == 3
-    assert [call.args[-1] for call in calls] == [True, False, True]
-    assert torch.equal(calls[0].args[0], target_slot_mapping)
+        calls = manager._offload_new_kv_on_current_stream.call_args_list
+        assert len(calls) == 3
+        assert [call.args[-1] for call in calls] == [True, False, True]
+        assert calls[2].args[-1] is True
+        assert torch.equal(calls[0].args[0], target_slot_mapping)

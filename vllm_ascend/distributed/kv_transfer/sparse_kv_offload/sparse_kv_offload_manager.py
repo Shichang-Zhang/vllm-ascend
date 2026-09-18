@@ -1055,6 +1055,7 @@ class SparseKVOffloadManager:
             self.fused_plan_status_npu = self.fused_plan_metadata_npu[:1]
             self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            self.last_d2h_slot_mapping: tuple[int, ...] | None = None
             self.index_copy_probe_enabled = os.getenv(
                 "VLLM_ASCEND_SFA_INDEX_COPY_PROBE",
                 "0",
@@ -1427,21 +1428,19 @@ class SparseKVOffloadManager:
         has_prefill: bool = False,
         capturing: bool = False,
     ) -> None:
+        self.current_kv_writeback_on_side_stream = False
         prepare_index_copy_descriptors = True
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
             if getattr(self, "index_copy_probe_enabled", False):
                 self.graph_trace_capture_layer_id = layer_id
-                # Keep the mapping for the eager probe *and* for the graph-mode
-                # visibility probe.  In graph mode this stays a reference to the
-                # static slot-mapping buffer, which the runner refills before
-                # every replay, so the probe can resolve Host rows at replay
-                # time without any host-side bookkeeping.
                 self.index_copy_probe_slots_by_layer[layer_id] = slot_mapping
-            # Target layers share one slot mapping, while the MTP layer may
-            # use another.
-            prepare_index_copy_descriptors = layer_id in (0, self.mtp_layer_id)
+            slot_mapping_values = tuple(slot_mapping.reshape(-1).tolist())
+            prepare_index_copy_descriptors = slot_mapping_values != getattr(
+                self, "last_d2h_slot_mapping", None
+            )
+            self.last_d2h_slot_mapping = slot_mapping_values
         use_mooncake_index_copy = self.use_fused_overlap and self._uses_mooncake_host_pool()
         use_side_stream = (
             self.tp_rank == 0
@@ -1523,6 +1522,7 @@ class SparseKVOffloadManager:
                     )
             return
 
+        self.current_kv_writeback_on_side_stream = True
         current_kv_ready = torch_npu.npu.current_stream().record_event()
         with torch_npu.npu.stream(self.current_kv_save_stream):
             self.current_kv_save_stream.wait_event(current_kv_ready)
