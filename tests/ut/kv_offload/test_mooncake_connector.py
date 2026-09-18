@@ -2574,6 +2574,30 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertIsNone(worker.kv_send_thread)
         self.assertIsNotNone(worker.kv_recv_thread)
 
+    def test_dsa_consumer_does_not_register_destination_memory(self):
+        self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
+        worker._dsa_decode = True
+        worker._dsa_transformer_layers = {"model.layers.0.self_attn": 0}
+        layouts = ([MagicMock()], [MagicMock()])
+        with (
+            patch.object(worker, "_build_dsa_local_layouts", return_value=layouts) as build_layouts,
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer"
+            ) as register_buffer,
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.validate_register_region_count"
+            ) as validate_regions,
+        ):
+            worker.register_kv_caches(self.kv_caches)
+
+        build_layouts.assert_called_once_with(self.kv_caches)
+        register_buffer.assert_not_called()
+        validate_regions.assert_not_called()
+        self.assertIsNotNone(worker.kv_recv_thread)
+        self.assertEqual(worker.kv_recv_thread._dsa_indexer_local_layout, layouts[0])
+        self.assertEqual(worker.kv_recv_thread._dsa_main_local_layout, layouts[1])
+
     def test_register_kv_caches_mla_case(self):
         self.vllm_config.model_config.is_deepseek_mla = True
         mla_caches = {"model.layers.0.self_attn": make_cpu_kv_cache(kv_heads=1)}

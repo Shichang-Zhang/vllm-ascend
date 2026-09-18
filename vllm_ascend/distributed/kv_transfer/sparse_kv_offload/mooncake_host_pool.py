@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -58,7 +57,7 @@ class HostMemoryRegion:
 
 
 def _select_shared_segment_mode() -> tuple[bool, bool]:
-    """Select a Mooncake mode that exposes an NPU-addressable Host VA."""
+    """Select Ascend VMM shared memory with an NPU-addressable SVM VA."""
     try:
         from mooncake.shared_segment import shared_segment_supported
     except ImportError as exc:
@@ -66,9 +65,9 @@ def _select_shared_segment_mode() -> tuple[bool, bool]:
             "Mooncake shared_segment support is required for sparse KV offload with the Mooncake Host backend"
         ) from exc
 
-    if shared_segment_supported(mmap=True, host_register=True):
-        return True, True
-    raise RuntimeError("Mooncake shared_segment cannot expose an NPU-addressable address")
+    if shared_segment_supported(mmap=False, host_register=False):
+        return False, False
+    raise RuntimeError("Mooncake shared_segment requires Ascend VMM support for an NPU-addressable address")
 
 
 def allocate_mooncake_host_region(
@@ -124,13 +123,10 @@ def allocate_mooncake_host_region(
         rank_id=topology.tp_rank,
         owner_rank=topology.owner_rank,
         device_id=topology.device_id,
-        tp_group=topology.tp_group,
+        comm_group=topology.tp_group,
         mmap=mmap,
         host_register=host_register,
     )
-    if host_register and os.getenv("VLLM_ASCEND_SKIP_MIGRATEPAGES") is None:
-        os.environ["VLLM_ASCEND_SKIP_MIGRATEPAGES"] = "1"
-
     raw = segment.tensors("pool")[0].reshape(-1)
     base_offset = _align_up(raw.data_ptr(), alignment) - raw.data_ptr()
     aligned = raw.narrow(0, base_offset, int(size_bytes))

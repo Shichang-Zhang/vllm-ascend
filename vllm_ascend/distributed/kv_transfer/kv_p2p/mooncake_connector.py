@@ -97,7 +97,6 @@ from .mooncake_dsa_transfer import (
     DsaRegisterAtom,
     build_component_read,
     collect_bounded_register_regions,
-    layout_span_bytes,
 )
 
 # isort: off
@@ -2086,14 +2085,8 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
         main_block_ids = groups[self.main_group_idx]
         if num_external_tokens > 0 and bound_blocks > len(main_block_ids):
             raise ValueError("vLLM has not allocated enough Main Host blocks")
-        unhashed_block_ids = (
-            blocks.get_unhashed_block_ids_all_groups()
-            if num_external_tokens > 0
-            else ()
-        )
-        invalid_block_ids = (
-            tuple(unhashed_block_ids[0]) if unhashed_block_ids else ()
-        )
+        unhashed_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else ()
+        invalid_block_ids = tuple(unhashed_block_ids[0]) if unhashed_block_ids else ()
         tracker.source = replace(tracker.source, num_external_tokens=num_external_tokens)
         tracker.allocated = True
         tracker.notify_only = num_external_tokens == 0
@@ -3249,62 +3242,6 @@ class MooncakeConnectorWorker:
 
         return ptrs, lengths
 
-    def _dsa_consumer_register_regions(
-        self,
-        kv_caches: dict[str, torch.Tensor],
-        layouts: tuple[list[DsaCacheLayout], list[DsaCacheLayout]],
-    ) -> tuple[RegisterRegions, list[str]]:
-        """Collect Host Main and HBM Indexer atoms for one TE registration."""
-        indexer_layouts, main_layouts = layouts
-        manager = get_sparse_kv_offload_manager()
-        pool = manager.get_mooncake_host_pool()
-        pool_start = pool.data_ptr
-        pool_end = pool_start + pool.nbytes
-        host_location = f"npu:{pool.topology.device_id}"
-        atoms: list[DsaRegisterAtom] = []
-
-        for layout in main_layouts:
-            end = layout.base + layout_span_bytes(layout)
-            if layout.base < pool_start or end > pool_end:
-                raise ValueError(f"DSA Host component {layout.layer_name} is outside the Mooncake Host pool")
-            atoms.append(
-                DsaRegisterAtom(
-                    layout.base,
-                    end,
-                    host_location,
-                    ("host", pool_start),
-                )
-            )
-
-        for layout in indexer_layouts:
-            tensors = self._as_kv_cache_tuple(kv_caches[layout.layer_name])
-            if layout.position >= len(tensors):
-                raise ValueError(f"missing DSA Indexer tensor position {layout.position}")
-            tensor = tensors[layout.position]
-            storage = tensor.untyped_storage()
-            storage_start = tensor_storage_key(tensor)
-            storage_end = storage_start + storage.nbytes()
-            end = layout.base + layout_span_bytes(layout)
-            if layout.base < storage_start or end > storage_end:
-                raise ValueError(f"DSA Indexer component {layout.layer_name} is outside its storage")
-            atoms.append(
-                DsaRegisterAtom(
-                    layout.base,
-                    end,
-                    "*",
-                    ("hbm", storage_start),
-                )
-            )
-
-        bounded = collect_bounded_register_regions(atoms)
-        regions = RegisterRegions(
-            ptrs=bounded.ptrs,
-            lengths=bounded.lengths,
-            logical_tensor_count=len(atoms),
-            logical_total_bytes=sum(atom.end - atom.start for atom in atoms),
-        )
-        return regions, bounded.locations
-
     def _dsa_producer_register_regions(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -3443,15 +3380,13 @@ class MooncakeConnectorWorker:
             dsa_local_layouts = self._build_dsa_local_layouts(kv_caches)
 
         register_locations = None
-        if has_mamba_group:
+        if self._dsa_decode:
+            # Decode only reads remote source regions. Its VMM Host Main
+            # and HBM Indexer destinations need no local transfer engine registration.
+            register_regions = RegisterRegions(ptrs=[], lengths=[])
+        elif has_mamba_group:
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
-        elif self._dsa_decode:
-            assert dsa_local_layouts is not None
-            register_regions, register_locations = self._dsa_consumer_register_regions(
-                kv_caches,
-                dsa_local_layouts,
-            )
         elif self._dsa_pd_offload:
             register_regions, register_locations = self._dsa_producer_register_regions(kv_caches)
         elif self.use_hybrid:
@@ -3463,16 +3398,16 @@ class MooncakeConnectorWorker:
             # storage to avoid exceeding the HCCL per-process region limit.
             register_regions = collect_storage_merged_register_regions(kv_caches)
 
-        validate_register_region_count(register_regions)
-        if register_locations is None:
-            global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
-        else:
-            global_te.register_buffer(
-                register_regions.ptrs,
-                register_regions.lengths,
-                register_locations,
-            )
-
+        if not self._dsa_decode:
+            validate_register_region_count(register_regions)
+            if register_locations is None:
+                global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+            else:
+                global_te.register_buffer(
+                    register_regions.ptrs,
+                    register_regions.lengths,
+                    register_locations,
+                )
         logger.debug(
             "Mooncake register kv caches metadata: kv_group2layeridx=%s, kv_caches_base_addr=%s, "
             "block_len_per_addr=%s, block_stride_per_addr=%s, block_shape_per_addr=%s, "
