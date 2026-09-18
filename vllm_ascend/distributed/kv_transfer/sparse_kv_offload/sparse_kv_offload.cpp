@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <numeric>
@@ -42,6 +43,23 @@
 
 constexpr int32_t EPOCH_RESET_THRESHOLD = 1 << 30;
 constexpr int16_t DIRECT_SELECTION_LAYOUT_MARKER = 0x5A44;
+
+// --- Adjudication probe plumbing (repo3) -------------------------------------
+// Optional per-layer counters filled by the CPU planner.  The buffer is a pinned
+// CPU int32[4] owned by the Python manager and only registered while
+// VLLM_ASCEND_SFA_INDEX_COPY_PROBE is on; 0 disables all counting, so the
+// production planner pays nothing but one relaxed load.
+//   [0] window_refs    TopK entries of this layer that point at *another* token
+//                      row of the current step (token >= stable_prefix_len,
+//                      token < visible_seq_len, token != own token)
+//   [1] window_loaded  of those, the ones that got a plan entry from the LRU
+//                      resident set (no Host read needed)
+//   [2] window_dropped of those, the ones silently dropped (plan stays 0, so the
+//                      operator reads whatever the Host pool holds)
+//   [3] misses_dropped all misses that did not get a slot (plan stays 0)
+// [0]-[2] answer "is the same-step Host read a real dependency, and how big is
+// it?"; [3] answers "does the LRU cache silently drop keys?" (long sequences).
+std::atomic<uintptr_t> g_planner_probe_stats{0};
 
 FORCE_INLINE int choose_lru_resident_threads(const int num_reqs, const int workspace_threads,
                                              const int requested_threads) {
@@ -106,7 +124,7 @@ FORCE_INLINE void process_one_lru_resident_row(
     int32_t* RESTRICT miss_slots_out, int32_t* RESTRICT token_mark, int32_t* RESTRICT token_pos,
     int32_t* RESTRICT slot_workspace, int32_t* RESTRICT miss_positions, int32_t* RESTRICT epoch,
     int32_t* RESTRICT current_token_slots, int16_t* RESTRICT encoded_plan, const int32_t encoded_plan_stride,
-    const bool encode_physical_row, const int32_t* RESTRICT visible_seq_lens) {
+    const bool encode_physical_row, const int32_t* RESTRICT visible_seq_lens, int32_t* RESTRICT probe_stats) {
   int32_t* RESTRICT slot_to_token_row = slot_to_token + static_cast<int64_t>(physical_row) * capacity;
   int32_t* RESTRICT lru_slots_row = lru_slots + static_cast<int64_t>(physical_row) * capacity;
   int32_t* RESTRICT current_slots_row = current_slots + static_cast<int64_t>(logical_row) * topk;
@@ -147,11 +165,24 @@ FORCE_INLINE void process_one_lru_resident_row(
   int32_t current_token_slot = resident_capacity;
 
   const int32_t base = next_lru_resident_epoch(token_mark, token_pos, epoch, max_token);
+  // Probe: references to *other* token rows of the current step.  Their K/V was
+  // produced by this very step and can only come from the Host pool, so this
+  // count is the size of the same-step read-after-write dependency.
+  int32_t probe_refs = 0;
+  int32_t probe_own_token_in_topk = 0;
+  const bool probe_on = probe_stats != nullptr;
   for (int32_t pos = 0; pos < topk; ++pos) {
     const int32_t token = topk_row[pos];
     if (LIKELY(is_valid_lru_resident_token(token, max_token)) && token < visible_seq_len && token_mark[token] != base) {
       token_mark[token] = base;
       token_pos[token] = pos;
+      if (probe_on && token >= stable_prefix_len) {
+        if (token == visible_seq_len - 1) {
+          ++probe_own_token_in_topk;
+        } else {
+          ++probe_refs;
+        }
+      }
     }
   }
 
@@ -215,6 +246,22 @@ FORCE_INLINE void process_one_lru_resident_row(
     miss_count[logical_row] = miss_idx + 1;
   }
 
+  int32_t probe_window_loaded = 0;
+  int32_t probe_window_dropped = 0;
+  if (probe_on) {
+    for (int32_t miss_idx = 0; miss_idx < local_miss_count; ++miss_idx) {
+      const int32_t token = miss_tokens_row[miss_idx];
+      if (token < stable_prefix_len || token >= visible_seq_len || token == visible_seq_len - 1) {
+        continue;
+      }
+      if (miss_idx < assign_count) {
+        ++probe_window_loaded;
+      } else {
+        ++probe_window_dropped;
+      }
+    }
+  }
+
   int32_t write_pos = 0;
   for (int32_t idx = assign_count; idx < evictable_count; ++idx) {
     lru_slots_row[write_pos] = evictable_slots[idx];
@@ -230,6 +277,18 @@ FORCE_INLINE void process_one_lru_resident_row(
   }
   if (current_token_slots != nullptr) {
     current_token_slots[logical_row] = physical_row * capacity + current_token_slot;
+  }
+  if (probe_stats != nullptr) {
+    const int32_t probe_dropped_misses = local_miss_count - assign_count;
+#pragma omp atomic
+    probe_stats[0] += probe_refs;
+#pragma omp atomic
+    probe_stats[1] += probe_window_loaded;
+#pragma omp atomic
+    probe_stats[2] += probe_window_dropped;
+#pragma omp atomic
+    probe_stats[3] += probe_dropped_misses;
+    (void)probe_own_token_in_topk;
   }
 }
 
@@ -262,6 +321,12 @@ HOT_FUNCTION void lru_resident_compact_impl(
   auto* RESTRICT epochs = reinterpret_cast<int32_t*>(epochs_ptr);
   auto* RESTRICT encoded_plan = reinterpret_cast<int16_t*>(encoded_plan_ptr);
   auto* RESTRICT physical_row_workspace = reinterpret_cast<int32_t*>(physical_row_workspace_ptr);
+  auto* RESTRICT probe_stats = reinterpret_cast<int32_t*>(g_planner_probe_stats.load(std::memory_order_relaxed));
+  if (probe_stats != nullptr) {
+    // Per-layer counters: this call overwrites them, the caller traces the
+    // buffer right after the planner returns.
+    std::fill(probe_stats, probe_stats + 4, 0);
+  }
 
   const int num_reqs_int = static_cast<int>(num_reqs);
   const int topk_int = static_cast<int>(topk);
@@ -326,7 +391,7 @@ HOT_FUNCTION void lru_resident_compact_impl(
                                    miss_count, miss_tokens, miss_slots, token_mark_workspace, token_pos_workspace,
                                    slot_workspace, miss_position_workspace, epochs, current_token_slots, encoded_plan,
                                    static_cast<int32_t>(encoded_plan_stride), logical_to_physical != nullptr,
-                                   visible_seq_lens);
+                                   visible_seq_lens, probe_stats);
     }
     return;
   }
@@ -345,7 +410,7 @@ HOT_FUNCTION void lru_resident_compact_impl(
                                    topk_indices, stable_prefix_lens, slot_to_token, lru_slots, current_slots,
                                    miss_count, miss_tokens, miss_slots, token_mark, token_pos, slots, miss_positions,
                                    epoch, current_token_slots, encoded_plan, static_cast<int32_t>(encoded_plan_stride),
-                                   logical_to_physical != nullptr, visible_seq_lens);
+                                   logical_to_physical != nullptr, visible_seq_lens, probe_stats);
     }
   }
 }
@@ -693,7 +758,25 @@ struct GraphTracePayload {
   int64_t logical_numel;
   uint64_t calls;
   bool delete_after_run;
+  // True only for the record that opens a forward step (layer 0 write-back).
+  // That record advances the frame counter, so every record of the same step
+  // shares one frame id and observation points can be compared without relying
+  // on the log ordering.
+  bool new_frame;
 };
+
+// Frame id shared by all adjudication records of one process.
+std::atomic<uint64_t>& graph_frame_id() {
+  static auto* frame = new std::atomic<uint64_t>(0);
+  return *frame;
+}
+
+// Monotonic timestamp (microseconds since the first record) so two observation
+// points can be compared even when the sink interleaves their prints.
+int64_t graph_trace_timestamp_us() {
+  static const auto epoch = std::chrono::steady_clock::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - epoch).count();
+}
 
 class GraphTraceSink {
  public:
@@ -845,6 +928,11 @@ void append_trace_values(std::ostringstream& out, const at::Tensor& tensor, int6
 void graph_trace_callback(void* args) noexcept {
   auto* payload = static_cast<GraphTracePayload*>(args);
   const uint64_t call = ++payload->calls;
+  if (payload->new_frame) {
+    graph_frame_id().fetch_add(1, std::memory_order_relaxed);
+  }
+  const uint64_t frame = graph_frame_id().load(std::memory_order_relaxed);
+  const int64_t timestamp_us = graph_trace_timestamp_us();
   // A nonzero single-element counter is the only signal that a race actually
   // fired, so it must never be sampled away: the visibility probe accumulates
   // "Host rows not written yet" there, and the sampling policy would otherwise
@@ -876,10 +964,9 @@ void graph_trace_callback(void* args) noexcept {
         }
       }
       std::ostringstream out;
-      out << "[SFA_GRAPH_TRACE] stage=" << payload->stage << " call=" << call << " layer_id="
-          << payload->layer_id << " tp_rank=" << payload->tp_rank << " dtype="
-          << static_cast<int>(tensor.scalar_type())
-          << " numel=" << count << " hash=" << hash;
+      out << "[SFA_GRAPH_TRACE] stage=" << payload->stage << " frame=" << frame << " t_us=" << timestamp_us
+          << " call=" << call << " layer_id=" << payload->layer_id << " tp_rank=" << payload->tp_rank
+          << " dtype=" << static_cast<int>(tensor.scalar_type()) << " numel=" << count << " hash=" << hash;
       switch (tensor.scalar_type()) {
         case at::ScalarType::Short:
           append_trace_values<int16_t>(out, tensor, count);
@@ -904,7 +991,7 @@ void graph_trace_callback(void* args) noexcept {
 }
 
 void enqueue_graph_trace_tensor(const at::Tensor& tensor, const std::string& stage, int64_t layer_id,
-                                int64_t tp_rank, int64_t logical_numel) {
+                                int64_t tp_rank, int64_t logical_numel, bool new_frame) {
   TORCH_CHECK(tensor.device().is_cpu() || tensor.device().type() == c10::DeviceType::PrivateUse1,
               "graph trace only supports CPU and NPU tensors, but got device ", tensor.device());
   TORCH_CHECK(logical_numel >= 0 && logical_numel <= tensor.numel(), "invalid graph trace logical_numel");
@@ -939,7 +1026,7 @@ void enqueue_graph_trace_tensor(const at::Tensor& tensor, const std::string& sta
   TORCH_CHECK(capture_ret == ACL_SUCCESS, "aclmdlRICaptureGetInfo for graph trace failed, error code: ", capture_ret);
   const bool graph_lifetime = capture_status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
   auto payload = std::make_unique<GraphTracePayload>(
-      GraphTracePayload{cpu_snapshot, stage, layer_id, tp_rank, logical_numel, 0, !graph_lifetime});
+      GraphTracePayload{cpu_snapshot, stage, layer_id, tp_rank, logical_numel, 0, !graph_lifetime, new_frame});
   auto* raw_payload = payload.get();
   if (graph_lifetime) {
     TORCH_CHECK(model_ri != nullptr, "active graph trace capture returned a null model runtime instance");
@@ -1076,6 +1163,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("enqueue_current_kv_index_copy_descriptors", &enqueue_current_kv_index_copy_descriptors,
         "Enqueue graph-safe current KV index_copy descriptor generation");
   m.def("enqueue_graph_trace_tensor", &enqueue_graph_trace_tensor,
-        "Enqueue a bounded graph-replay trace for a pinned CPU tensor snapshot");
+        "Enqueue a bounded graph-replay trace for a pinned CPU tensor snapshot", py::arg("tensor"), py::arg("stage"),
+        py::arg("layer_id"), py::arg("tp_rank"), py::arg("logical_numel"), py::arg("new_frame") = false);
+  m.def("set_planner_probe_stats_buffer",
+        [](uintptr_t ptr_val) { g_planner_probe_stats.store(ptr_val, std::memory_order_relaxed); },
+        "Register (or clear with 0) the CPU planner adjudication counters");
 
 }

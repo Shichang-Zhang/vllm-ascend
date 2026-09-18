@@ -84,8 +84,25 @@ FSA_SELECTION_MEMBERSHIP_REQUIRER_COLUMNS = (
 )
 SFA_GRAPH_TRACE_LAYER_ID = 4
 # Stages of the graph-mode Host-KV visibility probe, see
-# `trace_graph_host_kv_visibility`.  The order defines the device counter slots.
-SFA_HOST_KV_VISIBILITY_STAGES = ("pre_join", "post_join")
+# `trace_graph_host_kv_visibility`.  The order defines the device counter slots
+# and follows the order in which a forward step touches them:
+#   post_write -> this layer's Host-KV write-back has been launched
+#   pre_join   -> right before the single cross-stream join
+#   post_join  -> right after the join
+#   pre_bcast  -> right after this rank's join, right before the ready broadcast
+#   post_bcast -> right after the broadcast returned
+# post_write vs pre_join is the core of the graph-mode race adjudication: a
+# mismatch at post_write that is gone at pre_join proves the join is
+# load-bearing; a mismatch still present at pre_join proves the join does not
+# cover the reader on that rank.
+SFA_HOST_KV_VISIBILITY_STAGES = ("post_write", "pre_join", "post_join", "pre_bcast", "post_bcast")
+# Stage that opens a forward step; all counters are zeroed there so a device
+# counter always describes the current step only.
+SFA_HOST_KV_VISIBILITY_FRAME_OPEN_STAGE = "post_write"
+# Layout of the CPU planner counters (int32[4]) written by the C++ planner on
+# every call; see SFA_ADJ_PLANNER_STATS_LAYOUT in the standard branch:
+# [0] window_refs, [1] window_loaded, [2] window_dropped, [3] dropped_misses.
+SFA_ADJ_PLANNER_STATS_LAYOUT = ("window_refs", "window_loaded", "window_dropped", "dropped_misses")
 
 
 _SUBSCRIBED_COMPUTE_STREAMS: set[object] = set()
@@ -1074,6 +1091,18 @@ class SparseKVOffloadManager:
                     dtype=torch.int64,
                     device=device,
                 )
+                # Planner-side counters (see SFA_ADJ_PLANNER_STATS_LAYOUT): the
+                # C++ planner writes them in place, Python traces the buffer
+                # right after each planner call.  Pinned so the graph-replay D2H
+                # stays a cheap memcpy.
+                self.adj_planner_stats_cpu = torch.zeros(
+                    len(SFA_ADJ_PLANNER_STATS_LAYOUT),
+                    dtype=torch.int32,
+                    pin_memory=True,
+                )
+                self.sparse_kv_offload_cpp.set_planner_probe_stats_buffer(
+                    int(self.adj_planner_stats_cpu.data_ptr())
+                )
                 logger.warning(
                     "[SFA_INDEX_COPY_PROBE] enabled on tp_rank=%s; "
                     "eager mode emits direct comparisons; graph mode emits "
@@ -1469,6 +1498,24 @@ class SparseKVOffloadManager:
                 capturing,
                 prepare_index_copy_descriptors,
             )
+            if (
+                getattr(self, "index_copy_probe_enabled", False)
+                and use_mooncake_index_copy
+                and not has_prefill
+                and k is not None
+                and v is not None
+            ):
+                # Graph-mode adjudication anchor: this record is taken right
+                # after this layer's write-back was launched (Mooncake may have
+                # forked it onto the save stream), i.e. it is the Host-pool state
+                # a same-step reader would see if the join did not exist.  Layer
+                # 0 also opens the probe frame.
+                site_layer_id = self._get_offload_layer_id(layer_name)
+                self._probe_host_kv_visibility(
+                    site_layer_id,
+                    "post_write",
+                    new_frame=site_layer_id == 0,
+                )
             if use_mooncake_index_copy and not has_prefill and k is not None and v is not None:
                 # TP0 is the only rank that writes Decode K/V into the shared
                 # Mooncake Host pool.  Publish completion explicitly before any
@@ -1500,6 +1547,15 @@ class SparseKVOffloadManager:
                 # peers are released while the rows are still in flight and they
                 # read stale K/V.
                 self.wait_for_current_kv_writeback(capturing)
+                if getattr(self, "index_copy_probe_enabled", False):
+                    # Taken right after this rank's join and right before the
+                    # collective: exactly the claim "the rows are landed, safe to
+                    # release the peers".  On the peer ranks this is the missing
+                    # baseline, because they never fork a write-back and their
+                    # join is a no-op.
+                    self._probe_host_kv_visibility(
+                        self._get_offload_layer_id(layer_name), "pre_bcast"
+                    )
                 if (
                     self.tp_size > 1
                     and os.getenv("VLLM_ASCEND_SFA_READY_BCAST", "1") != "0"
@@ -1507,6 +1563,11 @@ class SparseKVOffloadManager:
                     self.tp_group.broadcast(
                         torch.empty([], dtype=torch.int8, device=k.device),
                         src=0,
+                    )
+                if getattr(self, "index_copy_probe_enabled", False):
+                    # Must be 0 once TP0's join made the shared rows visible.
+                    self._probe_host_kv_visibility(
+                        self._get_offload_layer_id(layer_name), "post_bcast"
                     )
                 if getattr(self, "index_copy_probe_enabled", False) and not capturing:
                     logger.warning(
@@ -1547,6 +1608,16 @@ class SparseKVOffloadManager:
                 has_prefill,
                 capturing,
                 prepare_index_copy_descriptors,
+            )
+        if getattr(self, "index_copy_probe_enabled", False):
+            # Same measurement point as the Mooncake branch (write-back launched,
+            # join not yet taken).  The device comparison needs NPU-addressable
+            # Host views, so `_probe_host_kv_visibility` is a no-op on MemFabric.
+            site_layer_id = self._get_offload_layer_id(layer_name)
+            self._probe_host_kv_visibility(
+                site_layer_id,
+                "post_write",
+                new_frame=site_layer_id == 0,
             )
 
     def _offload_new_kv_on_current_stream(
@@ -1940,6 +2011,18 @@ class SparseKVOffloadManager:
                 f"mapped_v={mapped_host_v.device} current_v={current_v.device}"
             )
 
+    def _trace_planner_stats(self, layer_id: int) -> None:
+        """Publish the planner counters of the call that just returned.
+
+        The C++ planner overwrites its int32[4] counter block on every call (see
+        SFA_ADJ_PLANNER_STATS_LAYOUT), so tracing the buffer right after the call
+        yields per-layer, per-step *dependency size* and silent-drop magnitude.
+        """
+        stats = getattr(self, "adj_planner_stats_cpu", None)
+        if stats is None:
+            return
+        self._enqueue_graph_trace_cpu("planner_stats", layer_id, stats, stats.numel())
+
     def trace_graph_host_kv_visibility(self, layer_name: str, *, stage: str) -> None:
         """Report how many of this step's Host rows are not written yet.
 
@@ -1965,15 +2048,34 @@ class SparseKVOffloadManager:
         """
         if not getattr(self, "index_copy_probe_enabled", False):
             return
-        layer_id = self._get_offload_layer_id(layer_name)
+        if stage not in SFA_HOST_KV_VISIBILITY_STAGES:
+            return
+        self._probe_host_kv_visibility(
+            self._get_offload_layer_id(layer_name), stage, new_frame=stage == SFA_HOST_KV_VISIBILITY_FRAME_OPEN_STAGE
+        )
+
+    def _probe_host_kv_visibility(self, layer_id: int, stage: str, *, new_frame: bool = False) -> None:
+        """Same measurement, but addressed by offload layer id (internal hook)."""
+        if not getattr(self, "index_copy_probe_enabled", False):
+            return
+        if stage not in SFA_HOST_KV_VISIBILITY_STAGES:
+            return
+        if not self._uses_mooncake_host_pool():
+            # The device-side comparison below requires NPU-addressable Host
+            # views.  MemFabric keeps a CPU pinned view on rank 0 and restored
+            # CPU GVA views on the other ranks, where these device operators
+            # would fail on a device mismatch; the eager probe covers those
+            # backends instead.
+            return
         current_kv = self.current_kv_by_layer.get(layer_id)
         slot_mapping = self.index_copy_probe_slots_by_layer.get(layer_id)
         counter = getattr(self, "graph_host_kv_visibility_npu", None)
         if current_kv is None or slot_mapping is None or counter is None:
             return
         stage_index = SFA_HOST_KV_VISIBILITY_STAGES.index(stage)
-        if layer_id == 0 and stage_index == 0:
-            # Layer 0 opens a forward step: report per step, not cumulatively.
+        if layer_id == 0 and stage == SFA_HOST_KV_VISIBILITY_FRAME_OPEN_STAGE:
+            # Layer 0 write-back opens a forward step: report per step, not
+            # cumulatively.
             counter.zero_()
 
         current_k, current_v = current_kv
@@ -2011,6 +2113,7 @@ class SparseKVOffloadManager:
             layer_id,
             counter[stage_index : stage_index + 1],
             1,
+            new_frame=new_frame,
         )
 
     def _probe_mooncake_index_copy(
@@ -2303,6 +2406,8 @@ class SparseKVOffloadManager:
         layer_id: int,
         tensor: torch.Tensor,
         logical_numel: int,
+        *,
+        new_frame: bool = False,
     ) -> None:
         if not getattr(self, "index_copy_probe_enabled", False):
             return
@@ -2313,6 +2418,9 @@ class SparseKVOffloadManager:
         if descriptor_stage:
             if layer_id not in (0, self.mtp_layer_id):
                 return
+        elif stage == "planner_stats":
+            # Per-layer planner counters, needed for every layer.
+            pass
         elif not visibility_stage and layer_id != SFA_GRAPH_TRACE_LAYER_ID:
             return
         self.sparse_kv_offload_cpp.enqueue_graph_trace_tensor(
@@ -2321,6 +2429,7 @@ class SparseKVOffloadManager:
             layer_id,
             self.tp_rank,
             logical_numel,
+            new_frame,
         )
 
     def _trace_graph_plan_device_tensor(
@@ -2565,6 +2674,7 @@ class SparseKVOffloadManager:
                 self.lru_workspace_threads,
                 self.lru_visible_seq_lens_ptr,
             )
+            self._trace_planner_stats(layer_id)
 
         if capturing:
             plan_inputs_ready = torch_npu.npu.current_stream().record_event()
