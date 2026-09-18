@@ -10,6 +10,10 @@ from typing import Any
 import torch
 from vllm.logger import logger
 
+# CANN VMM address reservations require a size that is a multiple of 1 GiB,
+# independently of the smaller physical allocation granularity.
+_ASCEND_VMM_RESERVATION_ALIGNMENT = 1 << 30
+
 
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
@@ -89,7 +93,10 @@ def allocate_mooncake_host_region(
         raise ValueError(f"size_bytes must be positive, got {size_bytes}")
     if alignment <= 0:
         raise ValueError(f"alignment must be positive, got {alignment}")
-    allocation_size_bytes = int(size_bytes) + int(alignment) - 1
+    allocation_size_bytes = _align_up(
+        int(size_bytes) + int(alignment) - 1,
+        _ASCEND_VMM_RESERVATION_ALIGNMENT,
+    )
     if topology.tp_size > 1 and topology.tp_group is None:
         raise RuntimeError(
             f"create_shared_segment requires tp_group when tp_size > 1: tp={topology.tp_rank}/{topology.tp_size}"

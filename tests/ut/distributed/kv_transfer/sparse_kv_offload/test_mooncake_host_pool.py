@@ -90,11 +90,47 @@ class TestMooncakeHostPool(unittest.TestCase):
         self.assertIn("comm_group", create_segment.call_args.kwargs)
         self.assertNotIn("tp_group", create_segment.call_args.kwargs)
         block = create_segment.call_args.kwargs["blocks"]["pool"]
-        self.assertEqual(block["shape"], (requested_size + alignment - 1,))
+        self.assertEqual(block["shape"], (1 << 30,))
         raw.narrow.assert_called_once_with(0, alignment - 1, requested_size)
         self.assertIs(region.tensor, aligned)
         self.assertEqual(region.tensor.numel(), requested_size)
         self.assertEqual(region.segment_offset, alignment - 1)
+
+    def test_vmm_reservation_size_covers_padding_and_heap_alignment(self):
+        # Include the reported failure and both sides of the 1 GiB boundary
+        # after adding the 15 bytes needed for a 16-byte-aligned tensor view.
+        cases = (
+            (0x4FFA00000, 0x500000000),
+            ((1 << 30) - 15, 1 << 30),
+            ((1 << 30) - 14, 2 << 30),
+            (1 << 30, 2 << 30),
+        )
+        for requested_size, expected_allocation in cases:
+            with self.subTest(size=requested_size):
+                raw = MagicMock()
+                raw.reshape.return_value = raw
+                raw.data_ptr.return_value = 0x1001
+                aligned = MagicMock()
+                aligned.device = SimpleNamespace(type="npu")
+                raw.narrow.return_value = aligned
+                segment = MagicMock()
+                segment.tensors.return_value = [raw]
+                with patch.object(
+                    _shared_segment_stub,
+                    "create_shared_segment",
+                    return_value=segment,
+                ) as create_segment:
+                    region = host_pool_module.allocate_mooncake_host_region(
+                        size_bytes=requested_size,
+                        alignment=16,
+                        topology=HostPoolTopology(tp_rank=0, tp_size=1),
+                    )
+
+                block = create_segment.call_args.kwargs["blocks"]["pool"]
+                self.assertEqual(block["shape"], (expected_allocation,))
+                raw.narrow.assert_called_once_with(0, 15, requested_size)
+                self.assertIs(region.tensor, aligned)
+                self.assertEqual(region.segment_offset, 15)
 
     def test_selects_vmm_without_host_registration(self):
         with patch.object(
