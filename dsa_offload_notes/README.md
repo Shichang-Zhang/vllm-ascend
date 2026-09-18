@@ -12,6 +12,9 @@
 | `3fa38c72b` | 单测改用 g++（与运行时无关） |
 | `31d2e6edc` | 让 Host-KV 可见性探针在**图模式**下可用（本分支图模式计数的来源） |
 | `2e9f6194d` | 修复：把图模式 Host-KV 写回的 join 提到读者（fused sparse attention）之前 |
+| `df3830270` | 修复（二次修正，纯代码）：`current_kv_writeback_on_side_stream` 每次调用复位；MemFabric fork 分支同样置位该标记；**不含任何探针** |
+| `4ee541a2b` | 探针：可见性探针 2 → 5 阶段、planner 计数器、`frame=`/`t_us=`（`VLLM_ASCEND_SFA_INDEX_COPY_PROBE`，默认关闭） |
+| `678dc73b0` | 文档：`dsa_offload_notes/`（本目录） |
 
 > 探针统一由 `VLLM_ASCEND_SFA_INDEX_COPY_PROBE=1` 打开（默认关闭，所有诊断短路）。
 > 另外两个开关：`VLLM_ASCEND_SFA_PROBE_FAIL_FAST`（eager 比对失败是否抛异常，默认 1）、`VLLM_ASCEND_SFA_READY_BCAST`（是否执行 TP 放行广播，默认 1）。

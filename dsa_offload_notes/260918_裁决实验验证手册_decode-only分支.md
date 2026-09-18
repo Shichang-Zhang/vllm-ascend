@@ -2,7 +2,8 @@
 
 > **给执行实验的同学**：本文只讲"要验证什么、怎么跑、日志怎么看、结论怎么下"。
 > 代码位置：`d:\hanjiang\0917mayi材料\repo3\vllm-ascend-decode-fix`
-> 分支：`fix/decode-graph-kv-probe`（= 远端 `dsa_offload_rebase_pr15642_0911_decode_test` 的 `3fa38c72b` + 探针提交 `31d2e6edc` + 修复提交 `2e9f6194d` + 本次新增的裁决探针，最后一项为工作区未提交改动）
+> 分支：本地 `fix/decode-graph-kv-probe` = 远端 **`dsa_offload_rebase_pr15642_0911_decode_fix_probe`**，基线 `3fa38c72b`
+> 提交布局：`31d2e6edc` 探针 → `2e9f6194d` 产品修复 → `df3830270` 二次修正（纯代码）→ `4ee541a2b` 探针移植 → `678dc73b0` 文档
 > 生成日期：2026-09-18
 > 配套文档：`260918_裁决实验验证手册_主干分支.md`（同一套裁决逻辑在主干分支上的版本）
 
@@ -63,10 +64,10 @@ unset VLLM_ASCEND_SFA_INDEX_COPY_PROBE   # 或确保环境里没有它
 ```bash
 cd <你的 vllm-ascend 仓>
 git rebase -i 71422442b^
-# 在编辑器里把 71422442b 那一行改为 drop，保留 3fa38c72b / 31d2e6edc / 2e9f6194d
+# 在编辑器里把 71422442b 那一行改为 drop，保留 3fa38c72b / 31d2e6edc / 2e9f6194d / df3830270 / 4ee541a2b
 ```
 
-> ⚠️ **会有冲突**：`31d2e6edc` 与 `2e9f6194d` 是在打桩代码之上写的，drop 之后会冲突。
+> ⚠️ **会有冲突**：`31d2e6edc`、`2e9f6194d`、`df3830270`、`4ee541a2b` 都是在打桩代码之上写的，drop 之后会冲突。
 > 解冲突原则：**删掉打桩新增的诊断代码，保留时序修复**（即 `wait_for_current_kv_writeback` 必须出现在 `fused_op` 之前）。
 > ⚠️ 方案 B 之后 **`[SFA_INDEX_COPY_PROBE]` / `[SFA_GRAPH_TRACE]` / `[SFA_PLAN_TRACE]` 等探针会一并消失**，本文第 4/5 节里依赖这些日志的实验将无法执行；如需保留探针请走方案 A。
 > ⚠️ `3fa38c72b`（UT 用 g++）与运行时无关，可保留可丢弃。
@@ -312,6 +313,9 @@ Select-String -Path run_r*.err,run_r*.out -Pattern 'SFA_PLAN_TRACE\] (DECISION|R
 | `3fa38c72b` | UT 用 g++（与运行时无关） |
 | `31d2e6edc` | 让 Host-KV 可见性探针在**图模式**下可用（本分支图模式计数的来源） |
 | `2e9f6194d` | **修复**：把图模式 Host-KV 写回 join 提到读者之前（`pre_join → join → post_join → fused_op`） |
+| `df3830270` | **二次修正（纯代码，无探针）**：`current_kv_writeback_on_side_stream` 每次调用复位；MemFabric fork 置位；pre_join 注释与单测修正 |
+| `4ee541a2b` | 探针移植：可见性探针 2→ 5 阶段、planner 统计、`frame=/t_us=`（开关 `VLLM_ASCEND_SFA_INDEX_COPY_PROBE`） |
+| `678dc73b0` | 文档：`dsa_offload_notes/`（含本手册） |
 
 ### C. 判定速查
 
