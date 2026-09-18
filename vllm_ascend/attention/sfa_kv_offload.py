@@ -1030,9 +1030,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         # join the writeback *before* the operator runs.
         #
         # The graph-mode probe hugs the join: "pre_join" counts this step's rows
-        # that were still unwritten when the operator finished (nonzero means it
-        # could read stale K/V), "post_join" must be zero and proves the join
-        # actually covers the writeback.
+        # that are still unwritten right before the join (nonzero means the
+        # operator, which runs next, would read stale K/V), "post_join" must be
+        # zero and proves the join actually covers the writeback.
         manager.trace_graph_host_kv_visibility(layer_name, stage="pre_join")
         manager.wait_for_current_kv_writeback(get_forward_context().capturing)
         manager.trace_graph_host_kv_visibility(layer_name, stage="post_join")

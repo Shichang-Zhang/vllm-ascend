@@ -1427,6 +1427,12 @@ class SparseKVOffloadManager:
         has_prefill: bool = False,
         capturing: bool = False,
     ) -> None:
+        # The flag describes the writeback placement of *this* call: the fused
+        # operator join and the ready broadcast below consume it right after
+        # this call returns, so start from a clean state every time.  A sticky
+        # flag would make eager callers join an idle save stream forever after
+        # the first graph capture.
+        self.current_kv_writeback_on_side_stream = False
         prepare_index_copy_descriptors = True
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
@@ -1524,6 +1530,10 @@ class SparseKVOffloadManager:
             return
 
         current_kv_ready = torch_npu.npu.current_stream().record_event()
+        # MemFabric fork: the same contract as the Mooncake index_copy fork --
+        # the writeback now runs on the save stream, so every later reader of
+        # the shared Host pool has to join this stream explicitly.
+        self.current_kv_writeback_on_side_stream = True
         with torch_npu.npu.stream(self.current_kv_save_stream):
             self.current_kv_save_stream.wait_event(current_kv_ready)
             self._offload_new_kv_on_current_stream(
