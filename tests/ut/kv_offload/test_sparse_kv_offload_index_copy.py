@@ -234,6 +234,8 @@ def test_graph_mooncake_index_copy_runs_on_save_stream():
 def test_graph_mooncake_prepares_descriptors_on_first_layer_only():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.tp_rank = 0
+    # Single rank keeps the ready broadcast (and its tp_size read) out of scope.
+    manager.tp_size = 1
     manager.use_fused_overlap = True
     manager.layer_name_to_offload_id = {
         "layer.0": 0,
@@ -276,3 +278,55 @@ def test_graph_mooncake_prepares_descriptors_on_first_layer_only():
         True,
         False,
     )
+
+
+def test_graph_mooncake_prepares_descriptors_again_for_mtp_layer():
+    """The graph path reuses layer 0 descriptors, so the MTP layer must refresh.
+
+    MTP may use a different slot mapping than the target layers, so a single
+    descriptor refresh on layer 0 would write MTP K/V to the wrong Host rows.
+    """
+    manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    manager.tp_rank = 0
+    manager.tp_size = 1
+    manager.tp_group = MagicMock()
+    manager.use_fused_overlap = True
+    manager.layer_name_to_offload_id = {
+        "layer.0": 0,
+        "layer.1": 1,
+        "mtp": 2,
+    }
+    manager.mtp_layer_id = 2
+    manager.current_kv_by_layer = {}
+    manager._offload_new_kv_on_current_stream = MagicMock()
+    _set_mooncake_allocator(manager)
+
+    target_slot_mapping = torch.tensor([2], dtype=torch.int64)
+    mtp_slot_mapping = torch.tensor([3], dtype=torch.int64)
+    host_k = torch.zeros((4, 2), dtype=torch.bfloat16)
+    host_v = torch.zeros((4, 1), dtype=torch.bfloat16)
+    current_k = torch.ones((1, 2), dtype=torch.bfloat16)
+    current_v = torch.ones((1, 1), dtype=torch.bfloat16)
+
+    for layer_name, slot_mapping in (
+        ("layer.0", target_slot_mapping),
+        ("layer.1", target_slot_mapping),
+        ("mtp", mtp_slot_mapping),
+    ):
+        manager.offload_new_kv(
+            layer_name,
+            slot_mapping,
+            host_k,
+            host_v,
+            None,
+            None,
+            current_k,
+            current_v,
+            capturing=True,
+        )
+
+    calls = manager._offload_new_kv_on_current_stream.call_args_list
+    assert len(calls) == 3
+    assert [call.args[-1] for call in calls] == [True, False, True]
+    assert torch.equal(calls[0].args[0], target_slot_mapping)
+    assert torch.equal(calls[2].args[0], mtp_slot_mapping)

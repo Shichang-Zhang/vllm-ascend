@@ -29,6 +29,9 @@ def _make_plan_manager():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.use_fused_overlap = True
     manager.tp_rank = 0
+    # Single rank: keeps the ready broadcast (and its tp_size read) out of scope
+    # for the tests that call offload_new_kv, e.g. the capture writeback test.
+    manager.tp_size = 1
     manager.topk = 4
     manager.topk_buffer_size = 8
     manager.max_model_len = 64
