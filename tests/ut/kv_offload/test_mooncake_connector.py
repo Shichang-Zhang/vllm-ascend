@@ -2574,7 +2574,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertIsNone(worker.kv_send_thread)
         self.assertIsNotNone(worker.kv_recv_thread)
 
-    def test_dsa_consumer_does_not_register_destination_memory(self):
+    def test_dsa_consumer_registers_only_indexer_destination(self):
         self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
         worker._dsa_decode = True
@@ -2582,6 +2582,11 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         layouts = ([MagicMock()], [MagicMock()])
         with (
             patch.object(worker, "_build_dsa_local_layouts", return_value=layouts) as build_layouts,
+            patch.object(
+                worker,
+                "_dsa_consumer_indexer_register_regions",
+                return_value=(MagicMock(ptrs=[123], lengths=[456]), ["*"]),
+            ) as collect_indexer,
             patch(
                 "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer"
             ) as register_buffer,
@@ -2592,8 +2597,9 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             worker.register_kv_caches(self.kv_caches)
 
         build_layouts.assert_called_once_with(self.kv_caches)
-        register_buffer.assert_not_called()
-        validate_regions.assert_not_called()
+        collect_indexer.assert_called_once_with(self.kv_caches, layouts[0])
+        register_buffer.assert_called_once_with([123], [456], ["*"])
+        validate_regions.assert_called_once()
         self.assertIsNotNone(worker.kv_recv_thread)
         self.assertEqual(worker.kv_recv_thread._dsa_indexer_local_layout, layouts[0])
         self.assertEqual(worker.kv_recv_thread._dsa_main_local_layout, layouts[1])

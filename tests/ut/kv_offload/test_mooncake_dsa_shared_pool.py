@@ -231,6 +231,19 @@ def test_all_ranks_build_layouts_from_local_main_views_without_registration(rank
     assert indexer_layout[0].base == indexer.data_ptr()
 
 
+def test_dsa_consumer_registers_indexer_hbm_but_not_shared_main():
+    worker = object.__new__(MooncakeConnectorWorker)
+    indexer = torch.empty((4, 8), dtype=torch.bfloat16)
+    indexer_layouts = [DsaCacheLayout(INDEXER, 0, indexer.data_ptr(), 16, 16, 1, 4, "bf16", 4)]
+
+    regions, locations = worker._dsa_consumer_indexer_register_regions({INDEXER: (indexer,)}, indexer_layouts)
+
+    assert regions.ptrs == [indexer.data_ptr()]
+    assert regions.lengths == [indexer.nbytes]
+    assert regions.logical_tensor_count == 1
+    assert locations == ["*"]
+
+
 def test_dsa_producer_oversized_atom_uses_layout_base_chunks():
     base = 4096
     span = MAX_REGISTER_MEMORY_BYTES + 1

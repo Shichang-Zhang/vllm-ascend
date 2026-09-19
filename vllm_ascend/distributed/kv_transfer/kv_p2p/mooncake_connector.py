@@ -97,6 +97,7 @@ from .mooncake_dsa_transfer import (
     DsaRegisterAtom,
     build_component_read,
     collect_bounded_register_regions,
+    layout_span_bytes,
 )
 
 # isort: off
@@ -3242,6 +3243,37 @@ class MooncakeConnectorWorker:
 
         return ptrs, lengths
 
+    def _dsa_consumer_indexer_register_regions(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        layouts: list[DsaCacheLayout],
+    ) -> tuple[RegisterRegions, list[str]]:
+        """Collect HBM Indexer atoms; shared VMM Main needs no registration."""
+        atoms: list[DsaRegisterAtom] = []
+        for layout in layouts:
+            tensors = self._as_kv_cache_tuple(kv_caches[layout.layer_name])
+            if layout.position >= len(tensors):
+                raise ValueError(f"missing DSA Indexer tensor position {layout.position}")
+            tensor = tensors[layout.position]
+            storage = tensor.untyped_storage()
+            storage_start = tensor_storage_key(tensor)
+            storage_end = storage_start + storage.nbytes()
+            end = layout.base + layout_span_bytes(layout)
+            if layout.base < storage_start or end > storage_end:
+                raise ValueError(f"DSA Indexer component {layout.layer_name} is outside its storage")
+            atoms.append(DsaRegisterAtom(layout.base, end, "*", ("hbm", storage_start)))
+
+        bounded = collect_bounded_register_regions(atoms)
+        return (
+            RegisterRegions(
+                ptrs=bounded.ptrs,
+                lengths=bounded.lengths,
+                logical_tensor_count=len(atoms),
+                logical_total_bytes=sum(atom.end - atom.start for atom in atoms),
+            ),
+            bounded.locations,
+        )
+
     def _dsa_producer_register_regions(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -3381,9 +3413,12 @@ class MooncakeConnectorWorker:
 
         register_locations = None
         if self._dsa_decode:
-            # Decode only reads remote source regions. Its VMM Host Main
-            # and HBM Indexer destinations need no local transfer engine registration.
-            register_regions = RegisterRegions(ptrs=[], lengths=[])
+            # Shared VMM Main is directly addressable, while ordinary HBM
+            # Indexer destinations still require local transfer engine registration.
+            assert dsa_local_layouts is not None
+            register_regions, register_locations = self._dsa_consumer_indexer_register_regions(
+                kv_caches, dsa_local_layouts[0]
+            )
         elif has_mamba_group:
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
@@ -3398,7 +3433,7 @@ class MooncakeConnectorWorker:
             # storage to avoid exceeding the HCCL per-process region limit.
             register_regions = collect_storage_merged_register_regions(kv_caches)
 
-        if not self._dsa_decode:
+        if register_regions.ptrs:
             validate_register_region_count(register_regions)
             if register_locations is None:
                 global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
