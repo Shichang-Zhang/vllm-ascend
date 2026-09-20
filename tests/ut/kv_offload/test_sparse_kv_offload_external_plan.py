@@ -439,6 +439,7 @@ def test_eager_external_plan_copies_inputs_and_preserves_cpp_argument_order():
 
 def test_capture_external_plan_side_stream_and_mooncake_writeback_wait():
     manager = _make_plan_manager()
+    manager.tp_size = 1
     manager.current_kv_save_stream = MagicMock()
     manager.fused_plan_stream = MagicMock()
     current_stream = MagicMock()

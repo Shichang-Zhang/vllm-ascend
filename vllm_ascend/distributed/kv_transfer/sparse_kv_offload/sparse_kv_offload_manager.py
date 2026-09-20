@@ -1383,8 +1383,9 @@ class SparseKVOffloadManager:
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
-            # All decode layers share one slot mapping within a forward step.
-            prepare_index_copy_descriptors = layer_id == 0
+            # Target-model layers share a slot mapping within a forward step.
+            # MTP uses its own mapping, which can change on each draft iteration.
+            prepare_index_copy_descriptors = layer_id == 0 or layer_id == self.mtp_layer_id
         use_mooncake_index_copy = self.use_fused_overlap and self._uses_mooncake_host_pool()
         use_side_stream = (
             self.tp_rank == 0
@@ -1406,19 +1407,15 @@ class SparseKVOffloadManager:
                 capturing,
                 prepare_index_copy_descriptors,
             )
-            if (
-                use_mooncake_index_copy
-                and not has_prefill
-                and k is not None
-                and v is not None
-                and self.tp_size > 1
-            ):
-                # Ensure TP0's Decode Host-KV write is visible before peer
-                # ranks consume their local views of the shared Mooncake pool.
-                self.tp_group.broadcast(
-                    torch.empty([], dtype=torch.int8, device=k.device),
-                    src=0,
-                )
+            if use_mooncake_index_copy and not has_prefill and k is not None and v is not None:
+                if capturing and self.tp_rank == 0:
+                    torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
+                # Publish Host KV only after the asynchronous save has completed.
+                if self.tp_size > 1:
+                    self.tp_group.broadcast(
+                        torch.empty([], dtype=torch.int8, device=k.device),
+                        src=0,
+                    )
             return
 
         current_kv_ready = torch_npu.npu.current_stream().record_event()
