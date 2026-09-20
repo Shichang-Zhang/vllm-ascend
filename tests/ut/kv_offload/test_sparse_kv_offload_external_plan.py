@@ -29,6 +29,7 @@ def _make_plan_manager():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.use_fused_overlap = True
     manager.tp_rank = 0
+    manager.tp_size = 1
     manager.topk = 4
     manager.topk_buffer_size = 8
     manager.max_model_len = 64
@@ -45,6 +46,8 @@ def _make_plan_manager():
     manager.lru_topk_indices_cpu = torch.empty((4, 4), dtype=torch.int32)
     manager.lru_stable_prefix_lens_cpu = torch.empty(4, dtype=torch.int32)
     manager.lru_visible_seq_lens_cpu = torch.empty(4, dtype=torch.int32)
+    manager.lru_current_token_ids_cpu = torch.empty(4, dtype=torch.int32)
+    manager.lru_current_token_ids_ptr = manager.lru_current_token_ids_cpu.data_ptr()
     manager.lru_physical_row_workspace = torch.arange(12, dtype=torch.int32)
     manager.fused_plan_metadata_npu = torch.zeros(5, dtype=torch.int32)
     manager.fused_plan_status_npu = manager.fused_plan_metadata_npu[:1]
@@ -377,7 +380,8 @@ def test_external_lru_plan_is_reused_by_three_skip_layers_and_replanned_at_owner
     assert manager.fused_overlap_plan_owner_layer_id == 4
 
 
-def test_eager_external_plan_copies_inputs_and_preserves_cpp_argument_order():
+@pytest.mark.parametrize("current_ids", [None, [5, -1]])
+def test_eager_external_plan_copies_inputs_and_preserves_cpp_argument_order(current_ids):
     manager = _make_plan_manager()
     membership = torch.full(
         (4, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT),
@@ -398,12 +402,15 @@ def test_eager_external_plan_copies_inputs_and_preserves_cpp_argument_order():
         visible_seq_lens_npu=visible_seq_lens,
         selection_membership_map=membership,
         capturing=False,
+        current_token_ids_npu=None if current_ids is None else torch.tensor(current_ids, dtype=torch.int32),
     )
 
     torch.testing.assert_close(manager.lru_topk_indices_cpu[:2], topk)
     torch.testing.assert_close(manager.lru_req_ids_cpu[:2], req_ids)
     torch.testing.assert_close(manager.lru_stable_prefix_lens_cpu[:2], stable_prefix_lens)
     torch.testing.assert_close(manager.lru_visible_seq_lens_cpu[:2], visible_seq_lens)
+    if current_ids is not None:
+        assert manager.lru_current_token_ids_cpu[:2].tolist() == current_ids
     plan_start = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT - manager.topk
     planner = manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows
     planner.assert_called_once_with(
@@ -433,6 +440,7 @@ def test_eager_external_plan_copies_inputs_and_preserves_cpp_argument_order():
         manager.lru_workspace_threads,
         manager.lru_workspace_threads,
         manager.lru_visible_seq_lens_ptr,
+        manager.lru_current_token_ids_ptr if current_ids is not None else 0,
     )
     manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_metadata_npu, src=0)
 
@@ -496,6 +504,7 @@ def test_capture_external_plan_side_stream_and_mooncake_writeback_wait():
             visible_seq_lens_npu=visible_seq_lens,
             selection_membership_map=membership,
             capturing=True,
+            current_token_ids_npu=torch.tensor([7], dtype=torch.int32),
         )
         manager.inject_current_kv_into_selection = MagicMock()
         manager.wait_for_current_kv_writeback(capturing=True)
@@ -507,6 +516,9 @@ def test_capture_external_plan_side_stream_and_mooncake_writeback_wait():
     assert writeback_args[-3:] == (False, True, True)
     planner = manager.sparse_kv_offload_cpp.enqueue_lru_resident_compact_with_plan_stable_rows
     planner.assert_called_once()
+    assert manager.lru_current_token_ids_cpu[0] == 7
+    assert len(planner.call_args.args) == 27
+    assert planner.call_args.args[-1] == manager.lru_current_token_ids_ptr
     assert planner.call_args.args[17] == planner_membership[:1].data_ptr()
     assert planner.call_args.args[18] == plan_width
     manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_metadata_npu, src=0)
@@ -621,3 +633,31 @@ def test_mooncake_local_views_and_fused_inputs_share_mapping(peer_change):
     assert manager.gvas_v_bases == [v.data_ptr()]
     assert manager.cpu_block_lens == [(8, 8)]
     manager.tp_group.broadcast.assert_not_called()
+
+
+def test_explicit_current_ids_replan_instead_of_reusing_owner():
+    manager = _make_plan_manager()
+    membership = torch.full((4, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT), -1, dtype=torch.int16)
+    common = dict(
+        num_tokens=1,
+        topk_indices_npu=torch.tensor([[3, 4, 5, 6]], dtype=torch.int32),
+        req_ids_npu=torch.tensor([101], dtype=torch.int64),
+        stable_prefix_lens_npu=torch.tensor([10], dtype=torch.int32),
+        visible_seq_lens_npu=torch.tensor([11], dtype=torch.int32),
+        selection_membership_map=membership,
+        capturing=False,
+    )
+    assert manager.prepare_fused_overlap_external_plan(layer_name="layer.0", skip_topk=False, **common)
+    assert manager.prepare_fused_overlap_external_plan(
+        layer_name="layer.1",
+        skip_topk=True,
+        current_token_ids_npu=torch.tensor([5], dtype=torch.int32),
+        **common,
+    )
+    planner = manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows
+    assert planner.call_count == 2
+    assert planner.call_args.args[4] == manager.lru_slot_to_token_ptrs[1]
+    assert planner.call_args.args[-1] == manager.lru_current_token_ids_ptr
+    assert manager.lru_current_token_ids_cpu[0] == 5
+    assert manager.fused_overlap_plan_owner_layer_id == 1
+    assert manager.tp_group.broadcast.call_count == 2

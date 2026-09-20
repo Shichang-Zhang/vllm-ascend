@@ -102,7 +102,8 @@ FORCE_INLINE void process_one_lru_resident_row(
     int32_t* RESTRICT miss_slots_out, int32_t* RESTRICT token_mark, int32_t* RESTRICT token_pos,
     int32_t* RESTRICT slot_workspace, int32_t* RESTRICT miss_positions, int32_t* RESTRICT epoch,
     int32_t* RESTRICT current_token_slots, int16_t* RESTRICT encoded_plan, const int32_t encoded_plan_stride,
-    const bool encode_physical_row, const int32_t* RESTRICT visible_seq_lens) {
+    const bool encode_physical_row, const int32_t* RESTRICT visible_seq_lens,
+    const int32_t* RESTRICT current_token_ids) {
   int32_t* RESTRICT slot_to_token_row = slot_to_token + static_cast<int64_t>(physical_row) * capacity;
   int32_t* RESTRICT lru_slots_row = lru_slots + static_cast<int64_t>(physical_row) * capacity;
   int32_t* RESTRICT current_slots_row = current_slots + static_cast<int64_t>(logical_row) * topk;
@@ -140,6 +141,12 @@ FORCE_INLINE void process_one_lru_resident_row(
   const int32_t stable_prefix_len = std::clamp(stable_prefix_lens[logical_row], 0, max_token);
   const int32_t visible_seq_len =
       visible_seq_lens == nullptr ? max_token : std::clamp(visible_seq_lens[logical_row], 0, max_token);
+  // Visibility may include retained draft suffix tokens after the actual write.
+  // Explicit -1 means padding/no current write, never logical token zero.
+  const int32_t current_token = current_token_ids == nullptr ? visible_seq_len - 1
+                                                            : current_token_ids[logical_row];
+  const bool has_current_token = current_token_ids == nullptr ||
+                                is_valid_lru_resident_token(current_token, max_token);
   int32_t current_token_slot = resident_capacity;
 
   const int32_t base = next_lru_resident_epoch(token_mark, token_pos, epoch, max_token);
@@ -167,7 +174,7 @@ FORCE_INLINE void process_one_lru_resident_row(
     if (LIKELY(is_valid_lru_resident_token(token, max_token)) && token_mark[token] == base) {
       const int32_t pos = token_pos[token];
       current_slots_row[pos] = slot;
-      if (token == visible_seq_len - 1) {
+      if (has_current_token && token == current_token) {
         current_token_slot = slot;
       }
       if (encoded_plan_row != nullptr) {
@@ -199,11 +206,12 @@ FORCE_INLINE void process_one_lru_resident_row(
     const int32_t pos = miss_positions[miss_idx];
     slot_to_token_row[slot] = token;
     current_slots_row[pos] = slot;
-    if (token == visible_seq_len - 1) {
+    if (has_current_token && token == current_token) {
       current_token_slot = slot;
     }
     if (encoded_plan_row != nullptr) {
-      const bool is_current_token = visible_seq_lens != nullptr && token == visible_seq_len - 1;
+      const bool is_current_token = (current_token_ids != nullptr || visible_seq_lens != nullptr) &&
+                                    has_current_token && token == current_token;
       encoded_plan_row[pos] = static_cast<int16_t>(is_current_token ? slot + 1 : -(slot + 1));
     }
     miss_slots_row[miss_idx] = slot;
@@ -236,7 +244,8 @@ HOT_FUNCTION void lru_resident_compact_impl(
     uintptr_t token_pos_workspace_ptr, uintptr_t slot_workspace_ptr, uintptr_t miss_position_workspace_ptr,
     uintptr_t epochs_ptr, int64_t num_reqs, int64_t topk, int64_t capacity, int64_t max_token,
     int64_t workspace_threads, int64_t requested_threads, uintptr_t encoded_plan_ptr, int64_t encoded_plan_stride,
-    uintptr_t physical_row_workspace_ptr, int64_t physical_row_capacity, uintptr_t visible_seq_lens_ptr) {
+    uintptr_t physical_row_workspace_ptr, int64_t physical_row_capacity, uintptr_t visible_seq_lens_ptr,
+    uintptr_t current_token_ids_ptr = 0) {
   if (num_reqs <= 0 || topk <= 0 || capacity <= 0 || max_token <= 0 || physical_row_capacity < num_reqs) {
     return;
   }
@@ -311,6 +320,37 @@ HOT_FUNCTION void lru_resident_compact_impl(
       physical_row_used[physical_row] = 1;
     }
   }
+  const int32_t* RESTRICT current_token_ids = reinterpret_cast<int32_t*>(current_token_ids_ptr);
+  if (current_token_ids != nullptr) {
+    // A write invalidates every resident copy owned by this request, including
+    // physical rows unused by this step. Reduce before parallel row planning.
+    // No heap allocation is required by the captured host callback.
+    for (int physical_row = 0; physical_row < physical_row_capacity; ++physical_row) {
+      const int64_t resident_req = last_req_ids[physical_row];
+      if (resident_req < 0) {
+        continue;
+      }
+      int32_t invalidate_from = max_token_int;
+      bool has_write = false;
+      for (int logical_row = 0; logical_row < num_reqs_int; ++logical_row) {
+        const int32_t current = current_token_ids[logical_row];
+        if (req_ids[logical_row] == resident_req && current >= 0) {
+          has_write = true;
+          invalidate_from = std::min(invalidate_from, current);
+          invalidate_from = std::min(invalidate_from,
+                                     std::clamp(stable_prefix_lens[logical_row], 0, max_token_int));
+        }
+      }
+      if (has_write) {
+        int32_t* row_tokens = slot_to_token + static_cast<int64_t>(physical_row) * capacity_int;
+        for (int slot = 0; slot < capacity_int; ++slot) {
+          if (row_tokens[slot] >= invalidate_from) {
+            row_tokens[slot] = -1;
+          }
+        }
+      }
+    }
+  }
   const int active_threads = choose_lru_resident_threads(num_reqs_int, static_cast<int>(workspace_threads),
                                                          static_cast<int>(requested_threads));
 
@@ -322,7 +362,7 @@ HOT_FUNCTION void lru_resident_compact_impl(
                                    miss_count, miss_tokens, miss_slots, token_mark_workspace, token_pos_workspace,
                                    slot_workspace, miss_position_workspace, epochs, current_token_slots, encoded_plan,
                                    static_cast<int32_t>(encoded_plan_stride), logical_to_physical != nullptr,
-                                   visible_seq_lens);
+                                   visible_seq_lens, current_token_ids);
     }
     return;
   }
@@ -341,7 +381,7 @@ HOT_FUNCTION void lru_resident_compact_impl(
                                    topk_indices, stable_prefix_lens, slot_to_token, lru_slots, current_slots,
                                    miss_count, miss_tokens, miss_slots, token_mark, token_pos, slots, miss_positions,
                                    epoch, current_token_slots, encoded_plan, static_cast<int32_t>(encoded_plan_stride),
-                                   logical_to_physical != nullptr, visible_seq_lens);
+                                   logical_to_physical != nullptr, visible_seq_lens, current_token_ids);
     }
   }
 }
@@ -368,7 +408,8 @@ HOT_FUNCTION void lru_resident_compact_with_plan_stable_rows(
     uintptr_t token_pos_workspace_ptr, uintptr_t slot_workspace_ptr, uintptr_t miss_position_workspace_ptr,
     uintptr_t epochs_ptr, uintptr_t physical_row_workspace_ptr, int64_t physical_row_capacity,
     uintptr_t encoded_plan_ptr, int64_t encoded_plan_stride, int64_t num_reqs, int64_t topk, int64_t capacity,
-    int64_t max_token, int64_t workspace_threads, int64_t requested_threads, uintptr_t visible_seq_lens_ptr) {
+    int64_t max_token, int64_t workspace_threads, int64_t requested_threads, uintptr_t visible_seq_lens_ptr,
+    uintptr_t current_token_ids_ptr = 0) {
   TORCH_CHECK(physical_row_workspace_ptr != 0, "stable-row planner requires physical_row_workspace_ptr");
   TORCH_CHECK(physical_row_capacity >= num_reqs, "stable-row planner capacity must cover all logical rows");
   TORCH_CHECK(physical_row_capacity <= std::numeric_limits<int16_t>::max(),
@@ -382,7 +423,7 @@ HOT_FUNCTION void lru_resident_compact_with_plan_stable_rows(
                             token_mark_workspace_ptr, token_pos_workspace_ptr, slot_workspace_ptr,
                             miss_position_workspace_ptr, epochs_ptr, num_reqs, topk, capacity, max_token,
                             workspace_threads, requested_threads, encoded_plan_ptr, encoded_plan_stride,
-                            physical_row_workspace_ptr, physical_row_capacity, visible_seq_lens_ptr);
+                            physical_row_workspace_ptr, physical_row_capacity, visible_seq_lens_ptr, current_token_ids_ptr);
 }
 
 int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tensor& miss_tokens,
@@ -672,6 +713,7 @@ struct LruResidentCompactWithPlanPayload {
   uintptr_t physical_row_workspace_ptr;
   int64_t physical_row_capacity;
   uintptr_t visible_seq_lens_ptr;
+  uintptr_t current_token_ids_ptr;
   int64_t num_reqs;
   int64_t topk;
   int64_t capacity;
@@ -744,7 +786,8 @@ void lru_resident_compact_with_plan_callback(void* args) noexcept {
       payload->token_pos_workspace_ptr, payload->slot_workspace_ptr, payload->miss_position_workspace_ptr,
       payload->epochs_ptr, payload->num_reqs, payload->topk, payload->capacity, payload->max_token,
       payload->workspace_threads, payload->requested_threads, payload->encoded_plan_ptr, payload->encoded_plan_stride,
-      payload->physical_row_workspace_ptr, payload->physical_row_capacity, payload->visible_seq_lens_ptr);
+      payload->physical_row_workspace_ptr, payload->physical_row_capacity, payload->visible_seq_lens_ptr,
+      payload->current_token_ids_ptr);
   if (payload->delete_after_run) {
     delete payload;
   }
@@ -759,7 +802,8 @@ void enqueue_lru_resident_compact_with_plan_stable_rows(
     uintptr_t token_pos_workspace_ptr, uintptr_t slot_workspace_ptr, uintptr_t miss_position_workspace_ptr,
     uintptr_t epochs_ptr, uintptr_t physical_row_workspace_ptr, int64_t physical_row_capacity,
     uintptr_t encoded_plan_ptr, int64_t encoded_plan_stride, int64_t num_reqs, int64_t topk, int64_t capacity,
-    int64_t max_token, int64_t workspace_threads, int64_t requested_threads, uintptr_t visible_seq_lens_ptr) {
+    int64_t max_token, int64_t workspace_threads, int64_t requested_threads, uintptr_t visible_seq_lens_ptr,
+    uintptr_t current_token_ids_ptr = 0) {
   TORCH_CHECK(physical_row_workspace_ptr != 0, "stable-row planner requires physical_row_workspace_ptr");
   TORCH_CHECK(physical_row_capacity >= num_reqs, "stable-row planner capacity must cover all logical rows");
   TORCH_CHECK(physical_row_capacity <= std::numeric_limits<int16_t>::max(),
@@ -801,6 +845,7 @@ void enqueue_lru_resident_compact_with_plan_stable_rows(
                                                                                             physical_row_workspace_ptr,
                                                                                             physical_row_capacity,
                                                                                             visible_seq_lens_ptr,
+                                                                                            current_token_ids_ptr,
                                                                                             num_reqs,
                                                                                             topk,
                                                                                             capacity,
@@ -835,9 +880,63 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lru_resident_compact", &lru_resident_compact,
         "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
   m.def("lru_resident_compact_with_plan_stable_rows", &lru_resident_compact_with_plan_stable_rows,
-        "CPU LRU resident compact with encoded plan and stable physical rows");
+        "CPU LRU resident compact with encoded plan and stable physical rows",
+        py::arg("req_ids_ptr"),
+        py::arg("last_req_ids_ptr"),
+        py::arg("topk_indices_ptr"),
+        py::arg("stable_prefix_lens_ptr"),
+        py::arg("slot_to_token_ptr"),
+        py::arg("lru_slots_ptr"),
+        py::arg("current_slots_ptr"),
+        py::arg("miss_count_ptr"),
+        py::arg("miss_tokens_ptr"),
+        py::arg("miss_slots_ptr"),
+        py::arg("token_mark_workspace_ptr"),
+        py::arg("token_pos_workspace_ptr"),
+        py::arg("slot_workspace_ptr"),
+        py::arg("miss_position_workspace_ptr"),
+        py::arg("epochs_ptr"),
+        py::arg("physical_row_workspace_ptr"),
+        py::arg("physical_row_capacity"),
+        py::arg("encoded_plan_ptr"),
+        py::arg("encoded_plan_stride"),
+        py::arg("num_reqs"),
+        py::arg("topk"),
+        py::arg("capacity"),
+        py::arg("max_token"),
+        py::arg("workspace_threads"),
+        py::arg("requested_threads"),
+        py::arg("visible_seq_lens_ptr"),
+        py::arg("current_token_ids_ptr") = 0);
   m.def("enqueue_lru_resident_compact_with_plan_stable_rows", &enqueue_lru_resident_compact_with_plan_stable_rows,
-        "Enqueue stable-row external LRU planning on the current NPU stream");
+        "Enqueue stable-row external LRU planning on the current NPU stream",
+        py::arg("req_ids_ptr"),
+        py::arg("last_req_ids_ptr"),
+        py::arg("topk_indices_ptr"),
+        py::arg("stable_prefix_lens_ptr"),
+        py::arg("slot_to_token_ptr"),
+        py::arg("lru_slots_ptr"),
+        py::arg("current_slots_ptr"),
+        py::arg("miss_count_ptr"),
+        py::arg("miss_tokens_ptr"),
+        py::arg("miss_slots_ptr"),
+        py::arg("token_mark_workspace_ptr"),
+        py::arg("token_pos_workspace_ptr"),
+        py::arg("slot_workspace_ptr"),
+        py::arg("miss_position_workspace_ptr"),
+        py::arg("epochs_ptr"),
+        py::arg("physical_row_workspace_ptr"),
+        py::arg("physical_row_capacity"),
+        py::arg("encoded_plan_ptr"),
+        py::arg("encoded_plan_stride"),
+        py::arg("num_reqs"),
+        py::arg("topk"),
+        py::arg("capacity"),
+        py::arg("max_token"),
+        py::arg("workspace_threads"),
+        py::arg("requested_threads"),
+        py::arg("visible_seq_lens_ptr"),
+        py::arg("current_token_ids_ptr") = 0);
   m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
         "Compute sparse H2D metadata for compact LRU resident miss loads");
   m.def(

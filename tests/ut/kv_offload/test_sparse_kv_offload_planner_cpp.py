@@ -15,7 +15,7 @@ cpp_extension = pytest.importorskip("torch.utils.cpp_extension")
 ROWS = 4
 TOPK = 8
 CAPACITY = 16
-MAX_TOKEN = 64
+MAX_TOKEN = 256
 THREADS = 1
 MEMBERSHIP_CONTROL_OFFSET = 16384
 MEMBERSHIP_STORAGE_SIZE = 16400
@@ -82,6 +82,7 @@ class PlannerState:
         self.topk = torch.empty((ROWS, TOPK), dtype=torch.int32)
         self.stable_prefix_lens = torch.empty(ROWS, dtype=torch.int32)
         self.visible_seq_lens = torch.empty(ROWS, dtype=torch.int32)
+        self.current_token_ids = torch.full((ROWS,), -1, dtype=torch.int32)
         self.slot_to_token = torch.full((ROWS, CAPACITY), -1, dtype=torch.int32)
         self.lru_slots = torch.arange(CAPACITY, dtype=torch.int32).repeat(ROWS, 1)
         self.current_slots = torch.empty((ROWS, TOPK), dtype=torch.int32)
@@ -116,6 +117,8 @@ class PlannerState:
         stable_prefix_lens,
         visible_seq_lens=None,
         enqueue=False,
+        current_token_ids=None,
+        pass_null_current=False,
     ):
         num_rows = len(req_ids)
         self.set_inputs(req_ids, topk, stable_prefix_lens, visible_seq_lens)
@@ -124,6 +127,12 @@ class PlannerState:
             if enqueue
             else helper.lru_resident_compact_with_plan_stable_rows
         )
+        current_token_args = ()
+        if current_token_ids is not None:
+            self.current_token_ids[:num_rows].copy_(torch.tensor(current_token_ids, dtype=torch.int32))
+            current_token_args = (self.ptr(self.current_token_ids),)
+        elif pass_null_current:
+            current_token_args = (0,)
         plan = self.membership[:, MEMBERSHIP_CONTROL_OFFSET - TOPK :]
         planner(
             self.ptr(self.req_ids),
@@ -152,6 +161,7 @@ class PlannerState:
             THREADS,
             THREADS,
             self.ptr(self.visible_seq_lens),
+            *current_token_args,
         )
 
     def set_inputs(self, req_ids, topk, stable_prefix_lens, visible_seq_lens=None):
@@ -242,7 +252,6 @@ def test_current_kv_index_copy_descriptors_survive_graph_replays(
     finally:
         graph.reset()
         torch_npu.npu.synchronize()
-
 
 
 def test_stable_rows_suffix_invalidation_and_plan_encoding(planner_helper):
@@ -379,6 +388,116 @@ def test_enqueued_planner_callback_survives_graph_replays(planner_helper):
         for state in states:
             assert state.miss_count[0].item() == TOPK
             assert bool((state.plan[0, :TOPK] < 0).all())
+    finally:
+        graph.reset()
+        torch_npu.npu.synchronize()
+
+
+def test_actual_current_token_differs_from_visible_tail_and_padding(planner_helper):
+    state = PlannerState()
+    topk = torch.full((2, TOPK), -1, dtype=torch.int32)
+    topk[0, :4] = torch.tensor([193, 194, 199, 200])
+    topk[1, 0] = 0
+    state.call(planner_helper, [101, 202], topk, [199, 0], [200, 1], current_token_ids=[194, -1])
+
+    assert state.plan[0, 0] < 0
+    assert state.plan[0, 1] > 0  # The current write is 194, not visible-1=199.
+    assert state.plan[0, 2] < 0
+    assert state.plan[0, 3] == 0  # Visibility remains 200.
+    assert state.physical_rows[ROWS * 2] == state.current_slots[0, 1]
+    assert state.plan[1, 0] < 0  # Padding must not inject token zero.
+    assert state.physical_rows[ROWS * 2 + 1] == CAPACITY * 2 - 1
+
+
+def test_actual_write_invalidates_inactive_resident_before_reactivation(planner_helper):
+    state = PlannerState()
+    topk = torch.arange(190, 190 + TOPK, dtype=torch.int32).repeat(3, 1)
+    state.call(planner_helper, [101, 101, 202], topk, [200] * 3, [200] * 3, current_token_ids=[-1] * 3)
+    other_request_tokens = state.slot_to_token[2].clone()
+
+    # Only row zero is active, but row one's cached 191 belongs to the same request.
+    empty_topk = torch.full((1, TOPK), -1, dtype=torch.int32)
+    state.call(planner_helper, [101], empty_topk, [199], [200], current_token_ids=[191])
+    for row in (0, 1):
+        assert 190 in state.slot_to_token[row].tolist()
+        assert not bool((state.slot_to_token[row] >= 191).any())
+    torch.testing.assert_close(state.slot_to_token[2], other_request_tokens)
+
+    state.call(planner_helper, [101, 101], topk[:2], [192] * 2, [200] * 2, current_token_ids=[192] * 2)
+    assert state.plan[1, 0] > 0  # Stable token190 remains a hit.
+    assert state.plan[1, 1] < 0  # Re-activated row must reload overwritten token191.
+    assert state.plan[1, 2] > 0  # Current token192 is supplied by injection.
+
+
+@pytest.mark.parametrize(
+    ("current_ids", "stable_prefixes", "cutoff"),
+    [([194, 191], [199, 199], 191), ([194, -1], [199, 0], 194), ([194, 191], [189, 199], 189)],
+)
+def test_request_minimum_write_invalidates_all_resident_rows(planner_helper, current_ids, stable_prefixes, cutoff):
+    state = PlannerState()
+    topk = torch.arange(188, 188 + TOPK, dtype=torch.int32).repeat(ROWS, 1)
+    state.call(
+        planner_helper,
+        [101, 101, 101, 202],
+        topk,
+        [200] * ROWS,
+        [200] * ROWS,
+        current_token_ids=[-1] * ROWS,
+    )
+    other_request_tokens = state.slot_to_token[3].clone()
+    state.call(
+        planner_helper,
+        [101, 101],
+        torch.full((2, TOPK), -1, dtype=torch.int32),
+        stable_prefixes,
+        [200, 200],
+        current_token_ids=current_ids,
+    )
+    # Physical row2 is inactive; padding current=-1 must not lower the request cutoff.
+    resident = state.slot_to_token[2].tolist()
+    assert 188 in resident
+    assert not any(token >= cutoff for token in resident)
+    assert all(token in resident for token in range(188, cutoff))
+    torch.testing.assert_close(state.slot_to_token[3], other_request_tokens)
+
+
+def test_default_current_pointer_matches_explicit_null(planner_helper):
+    omitted, explicit = PlannerState(), PlannerState()
+    for step in range(3):
+        topk = torch.arange(192 + step, 192 + step + TOPK, dtype=torch.int32).repeat(2, 1)
+        for state, pass_null in ((omitted, False), (explicit, True)):
+            state.call(
+                planner_helper, [101, 202], topk, [199 + step] * 2, [200 + step] * 2, pass_null_current=pass_null
+            )
+        assert bool((omitted.plan[:2, TOPK - 1] > 0).all())
+        for name in ("slot_to_token", "lru_slots", "last_req_ids", "membership"):
+            torch.testing.assert_close(getattr(omitted, name), getattr(explicit, name))
+        torch.testing.assert_close(omitted.current_slots[:2], explicit.current_slots[:2])
+        torch.testing.assert_close(omitted.miss_count[:2], explicit.miss_count[:2])
+        torch.testing.assert_close(
+            omitted.physical_rows[ROWS * 2 : ROWS * 2 + 2], explicit.physical_rows[ROWS * 2 : ROWS * 2 + 2]
+        )
+
+
+def test_enqueued_actual_current_pointer_is_read_on_each_graph_replay(planner_helper):
+    if not torch_npu.npu.is_available():
+        pytest.skip("Ascend NPU is unavailable")
+    state = PlannerState()
+    topk = torch.full((1, TOPK), -1, dtype=torch.int32)
+    topk[0, :3] = torch.tensor([194, 195, 199])
+    graph = torch.npu.NPUGraph()
+    try:
+        with torch.npu.graph(graph):
+            state.call(planner_helper, [101], topk, [0], [200], enqueue=True, current_token_ids=[194])
+        torch_npu.npu.synchronize()
+        for current, position in ((194, 0), (195, 1)):
+            # Keep the pointer captured in the callback payload, change its data.
+            state.current_token_ids[0] = current
+            graph.replay()
+            torch_npu.npu.synchronize()
+            assert state.plan[0, position] > 0
+            assert state.plan[0, 2] < 0
+            assert state.physical_rows[ROWS * 2] == state.current_slots[0, position]
     finally:
         graph.reset()
         torch_npu.npu.synchronize()
