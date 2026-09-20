@@ -85,6 +85,27 @@ def _check_device_kv_cache_exist() -> None:
         )
 
 
+def _logical_token_ids_from_slots(
+    slots: torch.Tensor,
+    request_block_table: torch.Tensor,
+    block_size: int,
+    visible_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Invert paged slots; MTP's actual write need not be visible_length-1."""
+    columns = torch.arange(request_block_table.shape[1], device=slots.device)
+    valid_columns = columns.unsqueeze(0) < torch.div(
+        visible_lengths.to(torch.int64).unsqueeze(1) + block_size - 1,
+        block_size,
+        rounding_mode="floor",
+    )
+    physical_blocks = torch.div(slots.to(torch.int64), block_size, rounding_mode="floor")
+    matches = (request_block_table == physical_blocks.unsqueeze(1)) & valid_columns & (slots >= 0).unsqueeze(1)
+    counts = matches.sum(dim=1)
+    logical_blocks = matches.to(torch.int32).argmax(dim=1)
+    logical = logical_blocks * block_size + slots.remainder(block_size)
+    return torch.where(counts == 1, logical, -1).to(torch.int32)
+
+
 class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
     """Fills the offload-specific SFA metadata (decode split + request ids)."""
 
@@ -943,6 +964,14 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             cache_blocks_per_row=cache_blocks_per_row,
             device=ql_nope_decode.device,
         )
+        current_token_ids = None
+        if layer_id == manager.mtp_layer_id:
+            current_token_ids = _logical_token_ids_from_slots(
+                attn_metadata.slot_mapping[:num_tokens],
+                common_inputs.full_kv_block_table,
+                self.block_size,
+                common_inputs.full_kv_actual_seq,
+            )
         external_plan_prepared = manager.prepare_fused_overlap_external_plan(
             layer_name=layer_name,
             num_tokens=num_tokens,
@@ -953,6 +982,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             selection_membership_map=selection_membership_map,
             capturing=get_forward_context().capturing,
             skip_topk=self.skip_topk,
+            current_token_ids_npu=current_token_ids,
         )
         if not external_plan_prepared:
             self._invalidate_fused_overlap_selection_rows(

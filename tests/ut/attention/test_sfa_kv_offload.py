@@ -12,6 +12,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState  # noqa: E40
 from vllm_ascend.attention.sfa_kv_offload import (  # noqa: E402
     AscendSFAKVOffloadImpl,
     AscendSFAKVOffloadMetadataBuilder,
+    _logical_token_ids_from_slots,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (  # noqa: E402
@@ -167,7 +168,8 @@ def test_mtp_rewrite_invalidates_membership_slot_map():
     assert bool((control[:, 0] == -1).all())
 
 
-def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
+@pytest.mark.parametrize("is_mtp", [False, True])
+def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state(is_mtp):
     impl = _make_fused_overlap_impl()
     ql_nope = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
     q_pe = torch.ones((2, 2, 1), dtype=torch.float32)
@@ -176,6 +178,7 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
     full_rope_cpu = torch.zeros((3, 4, 1, 1), dtype=torch.float32)
     metadata = SimpleNamespace(
         num_decodes=2,
+        slot_mapping=torch.tensor([1, -1], dtype=torch.int64),
         token_to_req=torch.tensor([0, 1], dtype=torch.int32),
         req_ids_tensor=torch.tensor([101, 202], dtype=torch.int64),
         block_table=torch.tensor([[0, 1], [1, 2]], dtype=torch.int32),
@@ -222,6 +225,7 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
         return kwargs["query"] + 10
 
     manager = SimpleNamespace(
+        mtp_layer_id=0 if is_mtp else 1,
         topk_buffers_k=[torch.zeros((4, 8, 1, 3), dtype=torch.float32)],
         topk_buffers_v=[torch.zeros((4, 8, 1, 1), dtype=torch.float32)],
         _get_offload_layer_id=lambda _: 0,
@@ -297,6 +301,10 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
         torch.tensor([4, 4], dtype=torch.int32),
     )
     assert plan_inputs["capturing"] is False
+    if is_mtp:
+        torch.testing.assert_close(plan_inputs["current_token_ids_npu"], torch.tensor([1, -1], dtype=torch.int32))
+    else:
+        assert plan_inputs["current_token_ids_npu"] is None
 
 
 def test_fused_overlap_common_inputs_are_reused_only_within_one_forward():
@@ -358,3 +366,24 @@ def test_fused_overlap_common_inputs_are_reused_only_within_one_forward():
         refreshed.seq_len_thresholds.reshape(-1),
         torch.tensor([5, 6], dtype=torch.int32),
     )
+
+
+def test_logical_current_ids_resolve_request_pages_and_reject_padding():
+    slots = torch.tensor([322, -1, 66, 322, 322, 322], dtype=torch.int64)
+    block_table = torch.tensor([[1, 2], [1, 2], [0, 2], [2, 2], [1, 2], [2, 1]], dtype=torch.int32)
+    visible = torch.tensor([200, 200, 100, 200, 128, 200], dtype=torch.int32)
+    actual = _logical_token_ids_from_slots(slots, block_table, 128, visible)
+    # Same physical slot maps differently for another request; duplicate valid
+    # pages, a page beyond visibility, and slot=-1 are not current-token writes.
+    torch.testing.assert_close(actual, torch.tensor([194, -1, 66, -1, -1, 66], dtype=torch.int32))
+    assert slots.tolist() == [322, -1, 66, 322, 322, 322]
+
+
+def test_logical_current_ids_ignore_unused_block_table_columns():
+    slots = torch.tensor([66], dtype=torch.int64)
+    # Allocator padding may repeat block zero beyond the visible logical blocks.
+    table = torch.tensor([[0, 0, 0]], dtype=torch.int32)
+    visible = torch.tensor([100], dtype=torch.int32)
+    assert _logical_token_ids_from_slots(slots, table, 128, visible).tolist() == [66]
+    slots.fill_(67)
+    assert _logical_token_ids_from_slots(slots, table, 128, visible).tolist() == [67]

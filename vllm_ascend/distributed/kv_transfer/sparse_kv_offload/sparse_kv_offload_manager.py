@@ -1343,6 +1343,8 @@ class SparseKVOffloadManager:
             lru_last_req_ids_cpu.data_ptr() for lru_last_req_ids_cpu in self.lru_last_req_ids_cpu_list
         ]
         self.lru_visible_seq_lens_ptr = self.lru_visible_seq_lens_cpu.data_ptr()
+        self.lru_current_token_ids_cpu = torch.empty_like(self.lru_visible_seq_lens_cpu, pin_memory=True)
+        self.lru_current_token_ids_ptr = self.lru_current_token_ids_cpu.data_ptr()
         self.lru_topk_indices_ptr = self.lru_topk_indices_cpu.data_ptr()
         self.lru_token_to_req_ptr = self.lru_token_to_req_cpu.data_ptr()
         self.lru_slot_to_token_ptrs = [
@@ -1791,7 +1793,11 @@ class SparseKVOffloadManager:
         selection_membership_map: torch.Tensor,
         capturing: bool = False,
         skip_topk: bool = False,
+        current_token_ids_npu: torch.Tensor | None = None,
     ) -> bool:
+        if current_token_ids_npu is not None:
+            if current_token_ids_npu.shape != (num_tokens,) or current_token_ids_npu.dtype != torch.int32:
+                raise ValueError("Current logical token IDs must be int32 with one entry per KV row")
         self._validate_fused_overlap_external_plan_inputs(
             num_tokens,
             topk_indices_npu,
@@ -1863,6 +1869,7 @@ class SparseKVOffloadManager:
         owner_map = self.fused_overlap_plan_membership_map
         can_reuse_owner_plan = (
             skip_topk
+            and current_token_ids_npu is None
             and owner_layer_id is not None
             and layer_id > owner_layer_id
             and self.fused_overlap_plan_topk == self.topk
@@ -1913,6 +1920,7 @@ class SparseKVOffloadManager:
                 self.lru_workspace_threads,
                 self.lru_workspace_threads,
                 self.lru_visible_seq_lens_ptr,
+                self.lru_current_token_ids_ptr if current_token_ids_npu is not None else 0,
             )
 
         if capturing:
@@ -1924,6 +1932,8 @@ class SparseKVOffloadManager:
                     self.lru_req_ids_cpu[:num_tokens].copy_(req_ids_npu, non_blocking=True)
                     self.lru_stable_prefix_lens_cpu[:num_tokens].copy_(stable_prefix_lens_npu, non_blocking=True)
                     self.lru_visible_seq_lens_cpu[:num_tokens].copy_(visible_seq_lens_npu, non_blocking=True)
+                    if current_token_ids_npu is not None:
+                        self.lru_current_token_ids_cpu[:num_tokens].copy_(current_token_ids_npu, non_blocking=True)
                     run_planner(enqueue=True)
                     self.fused_plan_current_linear_slots_npu[:num_tokens].copy_(
                         self.lru_physical_row_workspace[
@@ -1948,6 +1958,8 @@ class SparseKVOffloadManager:
                 self.lru_req_ids_cpu[:num_tokens].copy_(req_ids_npu)
                 self.lru_stable_prefix_lens_cpu[:num_tokens].copy_(stable_prefix_lens_npu)
                 self.lru_visible_seq_lens_cpu[:num_tokens].copy_(visible_seq_lens_npu)
+                if current_token_ids_npu is not None:
+                    self.lru_current_token_ids_cpu[:num_tokens].copy_(current_token_ids_npu)
                 run_planner(enqueue=False)
                 self.fused_plan_current_linear_slots_npu[:num_tokens].copy_(
                     self.lru_physical_row_workspace[
