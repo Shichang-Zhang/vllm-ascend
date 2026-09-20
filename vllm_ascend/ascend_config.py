@@ -1038,6 +1038,7 @@ class SparseKVOffloadConfig:
         self.topk_buffer_size = int(user_config.get("topk_buffer_size", 4096))
         self.dram_size_per_dp_GB = int(user_config.get("dram_size_per_dp_GB", 128))
         self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
+        self.lru_max_threads = int(user_config.get("lru_max_threads", 8))
         self.use_fused_overlap = bool(user_config.get("use_fused_overlap", False))
 
         if hasattr(vllm_config.model_config.hf_text_config, "compress_ratios"):
@@ -1069,6 +1070,8 @@ class SparseKVOffloadConfig:
         self.topk = vllm_config.model_config.hf_text_config.index_topk
         if self.topk_buffer_size <= 0:
             raise ValueError("sparse_kv_offload_config.topk_buffer_size must be positive")
+        if self.lru_max_threads <= 0:
+            raise ValueError("sparse_kv_offload_config.lru_max_threads must be positive")
         if self.topk_buffer_size < self.topk:
             raise ValueError(
                 "sparse_kv_offload_config.topk_buffer_size must be >= topk, "
