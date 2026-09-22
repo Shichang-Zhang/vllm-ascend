@@ -201,6 +201,10 @@ def empty_aligned_swapped_tensor(
     aligned_addr = (raw.data_ptr() + alignment - 1) // alignment * alignment
     element_offset = (aligned_addr - raw.data_ptr()) // dtype.itemsize
     aligned = raw[element_offset : element_offset + num_elements].view(shape)
+    if aligned.data_ptr() % alignment != 0:
+        raise RuntimeError(
+            f"Mooncake fused membership tensor is not aligned: ptr=0x{aligned.data_ptr():x}, alignment={alignment}"
+        )
     return aligned
 
 
