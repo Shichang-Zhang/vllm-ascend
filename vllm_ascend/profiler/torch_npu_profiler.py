@@ -16,7 +16,14 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import json
+import os
+import resource
+import socket
+import sys
+import time
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 import torch_npu
@@ -32,6 +39,9 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
 
     def __init__(self, profiler_config: ProfilerConfig, trace_name: str) -> None:
         super().__init__(profiler_config)
+        self._debug_trace_dir = profiler_config.torch_profiler_dir
+        self._debug_trace_name = trace_name
+        self._debug_planner_manager = None
         self.profiler: Any = self._create_profiler(profiler_config, trace_name)
 
     @staticmethod
@@ -76,10 +86,61 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
         )
 
     def _start(self) -> None:
+        # Temporary: use an already loaded manager; do not initialize offload here.
+        module = sys.modules.get(
+            "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager"
+        )
+        manager = getattr(module, "_SPARSE_KV_OFFLOAD_MANAGER", None)
+        if manager is not None and manager.use_fused_overlap and manager.tp_rank == 0:
+            torch_npu.npu.synchronize()
+            self._debug_planner_manager = manager
+            extension = manager.sparse_kv_offload_cpp
+            extension.debug_start_planner_trace()
+            self._debug_clock = self._debug_clock_anchor(extension)
+            self._debug_faults = resource.getrusage(resource.RUSAGE_SELF)
         self.profiler.start()
+
+    @staticmethod
+    def _debug_clock_anchor(extension):
+        # Bracket the clock sample: clocks from different hosts are not directly comparable.
+        before = time.time_ns()
+        steady = extension.debug_planner_clock_ns()
+        after = time.time_ns()
+        return {"steady_ns": steady, "unix_before_ns": before, "unix_after_ns": after}
 
     def _stop(self) -> None:
         self.profiler.stop()
+        manager = self._debug_planner_manager
+        if manager is not None:
+            # Drain callbacks before reading/resetting their preallocated buffers.
+            # This is outside the measured forward path, with no per-layer barriers.
+            torch_npu.npu.synchronize()
+            extension = manager.sparse_kv_offload_cpp
+            records = extension.debug_stop_planner_trace()
+            layers = {ptr: layer for layer, ptr in enumerate(manager.lru_last_req_ids_ptrs)}
+            for record in records:
+                record["layer_id"] = layers.get(record["lru_state_ptr"])
+                durations = sorted((end - begin) / 1000 for begin, end in record["begin_end_steady_ns"])
+                record["p50_us"] = durations[int((len(durations) - 1) * 0.50)]
+                record["p99_us"] = durations[int((len(durations) - 1) * 0.99)]
+                record["max_us"] = durations[-1]
+            output = Path(self._debug_trace_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            faults = resource.getrusage(resource.RUSAGE_SELF)
+            document = {
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "cpu_minor_faults": faults.ru_minflt - self._debug_faults.ru_minflt,
+                "cpu_major_faults": faults.ru_majflt - self._debug_faults.ru_majflt,
+                "rank_trace_name": self._debug_trace_name,
+                "start_clock_anchor": self._debug_clock,
+                "stop_clock_anchor": self._debug_clock_anchor(extension),
+                "scope": "existing captured planner callbacks; includes profile boundary drain",
+                "records": records,
+            }
+            filename = f"{self._debug_trace_name}_{os.getpid()}_{time.time_ns()}_lru_callback.json"
+            (output / filename).write_text(json.dumps(document, indent=2))
+            self._debug_planner_manager = None
 
     def _profiler_step(self) -> bool:
         return True

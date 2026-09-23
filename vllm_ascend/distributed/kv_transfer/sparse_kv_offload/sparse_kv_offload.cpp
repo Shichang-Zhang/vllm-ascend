@@ -5,6 +5,8 @@
 #include <optional>
 #include <iostream>
 #include <chrono>
+#include <array>
+#include <atomic>
 #include <string>
 #include <stdexcept>
 #include <unordered_map>
@@ -651,6 +653,33 @@ void enqueue_current_kv_index_copy_descriptors(
               ret);
 }
 
+// Temporary diagnostics. Reset/snapshot only after the device is quiescent.
+// Bounded per captured callback; never allocate or log on the callback thread.
+struct DebugPlannerTrace {
+  static constexpr size_t kCapacity = 256;
+  std::atomic<bool> enabled{false};
+  size_t calls = 0;
+  std::array<std::array<int64_t, 2>, kCapacity> records{};
+
+  static int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  void reset() noexcept {
+    calls = 0;
+    enabled.store(true);
+  }
+  size_t begin() noexcept {
+    if (!enabled.load()) return kCapacity;
+    const size_t index = calls++;
+    if (index < kCapacity) records[index][0] = now_ns();
+    return index;
+  }
+  void end(size_t index) noexcept {
+    if (index < kCapacity) records[index][1] = now_ns();
+  }
+};
+
 struct LruResidentCompactWithPlanPayload {
   uintptr_t req_ids_ptr;
   uintptr_t last_req_ids_ptr;
@@ -679,6 +708,7 @@ struct LruResidentCompactWithPlanPayload {
   int64_t workspace_threads;
   int64_t requested_threads;
   bool delete_after_run;
+  std::shared_ptr<DebugPlannerTrace> debug_trace = std::make_shared<DebugPlannerTrace>();
 };
 
 struct LruResidentCompactGraphPayloadRegistry {
@@ -737,6 +767,7 @@ LruResidentCompactWithPlanPayload* retain_lru_resident_compact_graph_payload(
 
 void lru_resident_compact_with_plan_callback(void* args) noexcept {
   auto* payload = static_cast<LruResidentCompactWithPlanPayload*>(args);
+  const size_t debug_index = payload->debug_trace->begin();
   lru_resident_compact_impl(
       payload->req_ids_ptr, payload->last_req_ids_ptr, payload->topk_indices_ptr, payload->stable_prefix_lens_ptr,
       payload->slot_to_token_ptr, payload->lru_slots_ptr, payload->current_slots_ptr, payload->miss_count_ptr,
@@ -745,6 +776,7 @@ void lru_resident_compact_with_plan_callback(void* args) noexcept {
       payload->epochs_ptr, payload->num_reqs, payload->topk, payload->capacity, payload->max_token,
       payload->workspace_threads, payload->requested_threads, payload->encoded_plan_ptr, payload->encoded_plan_stride,
       payload->physical_row_workspace_ptr, payload->physical_row_capacity, payload->visible_seq_lens_ptr);
+  payload->debug_trace->end(debug_index);
   if (payload->delete_after_run) {
     delete payload;
   }
@@ -819,6 +851,40 @@ void enqueue_lru_resident_compact_with_plan_stable_rows(
   TORCH_CHECK(ret == ACL_SUCCESS, "aclrtLaunchHostFunc for stable-row external LRU plan failed, error code: ", ret);
 }
 
+// The caller synchronizes outside the measured window before either operation.
+void debug_start_planner_trace() {
+  std::lock_guard<std::mutex> lock(lru_resident_compact_graph_registry_mutex());
+  for (auto& entry : lru_resident_compact_graph_registries()) {
+    for (auto& payload : entry.second->payloads) payload->debug_trace->reset();
+  }
+}
+
+pybind11::list debug_stop_planner_trace() {
+  pybind11::list result;
+  std::lock_guard<std::mutex> lock(lru_resident_compact_graph_registry_mutex());
+  for (auto& entry : lru_resident_compact_graph_registries()) {
+    for (auto& payload : entry.second->payloads) {
+      auto& trace = *payload->debug_trace;
+      trace.enabled.store(false);
+      if (trace.calls == 0) continue;
+      pybind11::dict item;
+      item["graph_id"] = reinterpret_cast<uintptr_t>(entry.first);
+      item["lru_state_ptr"] = payload->last_req_ids_ptr;
+      item["num_reqs"] = payload->num_reqs;
+      item["topk"] = payload->topk;
+      item["calls"] = trace.calls;
+      item["dropped"] = trace.calls > DebugPlannerTrace::kCapacity ? trace.calls - DebugPlannerTrace::kCapacity : 0;
+      pybind11::list records;
+      for (size_t i = 0; i < std::min(trace.calls, DebugPlannerTrace::kCapacity); ++i) {
+        records.append(pybind11::make_tuple(trace.records[i][0], trace.records[i][1]));
+      }
+      item["begin_end_steady_ns"] = records;
+      result.append(item);
+    }
+  }
+  return result;
+}
+
 at::Tensor restore_tensor(uintptr_t ptr_val, const std::vector<int64_t>& shape,
                           torch::ScalarType dtype = torch::kBFloat16) {
   if (ptr_val == 0) {
@@ -830,6 +896,9 @@ at::Tensor restore_tensor(uintptr_t ptr_val, const std::vector<int64_t>& shape,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
+  m.def("debug_start_planner_trace", &debug_start_planner_trace);
+  m.def("debug_stop_planner_trace", &debug_stop_planner_trace);
+  m.def("debug_planner_clock_ns", &DebugPlannerTrace::now_ns);
   m.def("warmup_lru_resident_threads", &warmup_lru_resident_threads,
         "Initialize the OpenMP worker team used by the CPU LRU planner");
   m.def("lru_resident_compact", &lru_resident_compact,
