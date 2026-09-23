@@ -28,11 +28,13 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import (
     HostPoolTopology,
     MooncakeHostPool,
 )
+from vllm_ascend.profiler.sfa_sync_timing import SFASyncTiming
 
 # Main BF16 cache:
 # [k_cache, v_cache, k_cache_cpu, v_cache_cpu, topk_buffer_k, topk_buffer_v].
@@ -531,6 +533,14 @@ class SparseKVOffloadManager:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_group = get_tp_group()
+        self.debug_sync_timing = None
+        if envs.VLLM_ASCEND_DEBUG_SFA_SYNC_TIMING:
+            self.debug_sync_timing = SFASyncTiming(
+                torch_npu.npu.synchronize,
+                torch_npu.npu.is_current_stream_capturing,
+                logger.info,
+                {"dp_rank": parallel_config.data_parallel_rank, "tp_rank": self.tp_rank, "owner": "sfa"},
+            )
         self.block_size = self._infer_group_block_sizes(self.kv_cache_config)
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
@@ -1641,21 +1651,23 @@ class SparseKVOffloadManager:
                 )
             return
 
-        valid = (slots >= 0) & (slots < num_slots)
-        valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        with self.debug_time(f"kv_writeback/rows={token_count}/nonzero"):
+            valid = (slots >= 0) & (slots < num_slots)
+            valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
         if valid_indices.numel() == 0:
             return
-        destinations = slots.index_select(0, valid_indices)
-        flat_host_k.index_copy_(
-            0,
-            destinations,
-            k_rows.index_select(0, valid_indices),
-        )
-        flat_host_v.index_copy_(
-            0,
-            destinations,
-            v_rows.index_select(0, valid_indices),
-        )
+        with self.debug_time(f"kv_writeback/rows={token_count}/index_copy"):
+            destinations = slots.index_select(0, valid_indices)
+            flat_host_k.index_copy_(
+                0,
+                destinations,
+                k_rows.index_select(0, valid_indices),
+            )
+            flat_host_v.index_copy_(
+                0,
+                destinations,
+                v_rows.index_select(0, valid_indices),
+            )
 
     def onload_topk_kv(
         self,
@@ -1780,6 +1792,12 @@ class SparseKVOffloadManager:
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
 
+    def debug_time(self, phase: str, *, capturing: bool = False):
+        timer = getattr(self, "debug_sync_timing", None)
+        if timer is None or capturing:
+            return contextlib.nullcontext()
+        return timer.measure(phase)
+
     def prepare_fused_overlap_external_plan(
         self,
         layer_name: str,
@@ -1864,12 +1882,14 @@ class SparseKVOffloadManager:
                     "external FSA plan requires an NPU staging buffer when "
                     "planner and operator membership storage are separate"
                 )
-            self.tp_group.broadcast(device_staging, src=0)
+            with self.debug_time(f"{layer_name}/rows={num_tokens}/plan_broadcast", capturing=capturing):
+                self.tp_group.broadcast(device_staging, src=0)
             device_plan_storage = device_staging[:num_tokens, :plan_width]
-            plan_storage.copy_(
-                device_plan_storage,
-                non_blocking=non_blocking,
-            )
+            with self.debug_time(f"{layer_name}/rows={num_tokens}/membership_copy", capturing=capturing):
+                plan_storage.copy_(
+                    device_plan_storage,
+                    non_blocking=non_blocking,
+                )
 
         owner_layer_id = self.fused_overlap_plan_owner_layer_id
         owner_map = self.fused_overlap_plan_membership_map
@@ -1957,22 +1977,29 @@ class SparseKVOffloadManager:
         if self.tp_rank == 0:
             self.fused_plan_status_npu.zero_()
             try:
-                self.lru_topk_indices_cpu[:num_tokens].copy_(topk_indices_npu)
-                self.lru_req_ids_cpu[:num_tokens].copy_(req_ids_npu)
-                self.lru_stable_prefix_lens_cpu[:num_tokens].copy_(stable_prefix_lens_npu)
-                self.lru_visible_seq_lens_cpu[:num_tokens].copy_(visible_seq_lens_npu)
-                run_planner(enqueue=False)
-                self.fused_plan_current_linear_slots_npu[:num_tokens].copy_(
-                    self.lru_physical_row_workspace[
-                        self.max_num_topk_rows * 2 : self.max_num_topk_rows * 2 + num_tokens
-                    ]
-                )
-                stage_plan(non_blocking=False)
+                with self.debug_time(f"{layer_name}/rows={num_tokens}/topk_d2h"):
+                    self.lru_topk_indices_cpu[:num_tokens].copy_(topk_indices_npu)
+                with self.debug_time(f"{layer_name}/rows={num_tokens}/metadata_d2h"):
+                    self.lru_req_ids_cpu[:num_tokens].copy_(req_ids_npu)
+                    self.lru_stable_prefix_lens_cpu[:num_tokens].copy_(stable_prefix_lens_npu)
+                    self.lru_visible_seq_lens_cpu[:num_tokens].copy_(visible_seq_lens_npu)
+                with self.debug_time(f"{layer_name}/rows={num_tokens}/cpu_planner"):
+                    run_planner(enqueue=False)
+                with self.debug_time(f"{layer_name}/rows={num_tokens}/plan_h2d"):
+                    self.fused_plan_current_linear_slots_npu[:num_tokens].copy_(
+                        self.lru_physical_row_workspace[
+                            self.max_num_topk_rows * 2 : self.max_num_topk_rows * 2 + num_tokens
+                        ]
+                    )
+                    stage_plan(non_blocking=False)
             except Exception as exc:
                 planner_error = exc
                 self.fused_plan_status_npu.fill_(1)
-        self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
-        if int(self.fused_plan_status_npu.item()) != 0:
+        with self.debug_time(f"{layer_name}/rows={num_tokens}/metadata_broadcast"):
+            self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+        with self.debug_time(f"{layer_name}/rows={num_tokens}/status_d2h"):
+            planner_failed = int(self.fused_plan_status_npu.item()) != 0
+        if planner_failed:
             detail = (
                 f"{type(planner_error).__name__}: {planner_error}"
                 if planner_error is not None

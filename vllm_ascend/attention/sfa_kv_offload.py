@@ -529,9 +529,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             or self._fused_overlap_selection_capacity[3] < cache_blocks_per_row
             or self.selection_kv_block_table.device != device
             or self.selection_kv_block_status.device != device
-            or not get_sparse_kv_offload_manager().is_fused_membership_storage(
-                self.selection_membership_map
-            )
+            or not get_sparse_kv_offload_manager().is_fused_membership_storage(self.selection_membership_map)
             or self.fused_overlap_last_req_ids.device != device
         )
         if needs_realloc:
@@ -889,14 +887,16 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             num_tokens,
             ql_nope_decode.device,
         )
-        common_inputs = self._prepare_fused_overlap_decode_common_inputs(
-            attn_metadata,
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            topk_indices_decode=topk_indices_decode,
-            actual_seq_lengths_query_decode=actual_seq_lengths_query_decode,
-            actual_seq_lengths_key_decode=actual_seq_lengths_key_decode,
-        )
+        capturing = get_forward_context().capturing
+        with manager.debug_time(f"{layer_name}/rows={num_tokens}/metadata_prepare", capturing=capturing):
+            common_inputs = self._prepare_fused_overlap_decode_common_inputs(
+                attn_metadata,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                topk_indices_decode=topk_indices_decode,
+                actual_seq_lengths_query_decode=actual_seq_lengths_query_decode,
+                actual_seq_lengths_key_decode=actual_seq_lengths_key_decode,
+            )
         topk_head_count = topk_indices_decode.shape[1]
         topk = topk_indices_decode.shape[2]
         if topk_head_count != 1:
@@ -988,15 +988,17 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             "layout_kv": "PA_BSND",
             "sparse_mode": 3,
         }
-        manager.inject_current_kv_into_selection(
-            layer_name=layer_name,
-            num_tokens=num_tokens,
-            selection_kv_cache=selection_kv_cache,
-            selection_k_rope=selection_k_rope,
-            capturing=get_forward_context().capturing,
-        )
-        attn_output = fused_op(**fused_inputs)
-        attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
+        with manager.debug_time(f"{layer_name}/rows={num_tokens}/current_kv_injection", capturing=capturing):
+            manager.inject_current_kv_into_selection(
+                layer_name=layer_name,
+                num_tokens=num_tokens,
+                selection_kv_cache=selection_kv_cache,
+                selection_k_rope=selection_k_rope,
+                capturing=capturing,
+            )
+        with manager.debug_time(f"{layer_name}/rows={num_tokens}/fused_attention", capturing=capturing):
+            attn_output = fused_op(**fused_inputs)
+            attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
         manager.wait_for_current_kv_writeback(get_forward_context().capturing)
         return attn_output
 

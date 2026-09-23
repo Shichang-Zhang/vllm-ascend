@@ -28,6 +28,11 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Temporary SFA hot-path diagnostic: 0 (default) disables it; 1 inserts
+    # device synchronization around eager phases and FULL graph replay.
+    # Non-sensitive. Enable on every worker for a separate diagnostic run;
+    # serialized timings change overlap and must not be used as normal TPOT.
+    "VLLM_ASCEND_DEBUG_SFA_SYNC_TIMING": lambda: bool(int(os.getenv("VLLM_ASCEND_DEBUG_SFA_SYNC_TIMING", "0"))),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

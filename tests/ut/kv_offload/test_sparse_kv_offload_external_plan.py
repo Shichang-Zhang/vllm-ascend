@@ -24,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT,
     SparseKVOffloadManager,
 )
+from vllm_ascend.profiler.sfa_sync_timing import SFASyncTiming  # noqa: E402
 
 
 def _make_plan_manager():
@@ -276,8 +277,12 @@ def test_mooncake_membership_uses_per_rank_swapped_storage_and_staging(
     assert synchronization_order == ["stream_sync", "barrier"]
 
 
-def test_mooncake_eager_external_plan_publishes_through_npu_staging():
+@pytest.mark.parametrize("debug_timing", [False, True])
+def test_mooncake_eager_external_plan_publishes_through_npu_staging(debug_timing):
     manager = _make_plan_manager()
+    synchronize, emit = MagicMock(), MagicMock()
+    if debug_timing:
+        manager.debug_sync_timing = SFASyncTiming(synchronize, lambda: False, emit, {})
     _enable_mooncake_membership_staging(manager)
     membership = torch.full(
         (4, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT),
@@ -337,6 +342,21 @@ def test_mooncake_eager_external_plan_publishes_through_npu_staging():
         ((manager.fused_plan_metadata_npu,), {"src": 0}),
         ((manager.fused_overlap_membership_plan_device_staging,), {"src": 0}),
     ]
+    if debug_timing:
+        expected_phases = [
+            "topk_d2h",
+            "metadata_d2h",
+            "cpu_planner",
+            "plan_h2d",
+            "metadata_broadcast",
+            "status_d2h",
+            "plan_broadcast",
+            "membership_copy",
+        ]
+        assert list(manager.debug_sync_timing.calls) == [f"layer.0/rows=2/{phase}" for phase in expected_phases]
+        assert synchronize.call_count == 2 * len(expected_phases)
+    else:
+        synchronize.assert_not_called()
 
 
 def test_non_tp0_mooncake_plan_does_not_require_cpu_planner_storage():

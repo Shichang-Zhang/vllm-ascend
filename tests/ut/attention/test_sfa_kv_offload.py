@@ -1,5 +1,6 @@
 """Regression tests for SFA KV-offload attention metadata."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -222,6 +223,7 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
         return kwargs["query"] + 10
 
     manager = SimpleNamespace(
+        debug_time=lambda *args, **kwargs: nullcontext(),
         topk_buffers_k=[torch.zeros((4, 8, 1, 3), dtype=torch.float32)],
         topk_buffers_v=[torch.zeros((4, 8, 1, 1), dtype=torch.float32)],
         _get_offload_layer_id=lambda _: 0,

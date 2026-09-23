@@ -20,7 +20,9 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.profiler.sfa_sync_timing import SFASyncTiming
 
 from ..utils import weak_ref_tensors
 
@@ -114,6 +116,18 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
+        self.debug_sync_timing = None
+        if ascend_envs.VLLM_ASCEND_DEBUG_SFA_SYNC_TIMING and runtime_mode == CUDAGraphMode.FULL:
+            self.debug_sync_timing = SFASyncTiming(
+                torch_npu.npu.synchronize,
+                torch_npu.npu.is_current_stream_capturing,
+                logger.info,
+                {
+                    "rank": torch.distributed.get_rank(),
+                    "dp_rank": vllm_config.parallel_config.data_parallel_rank,
+                    "owner": "full_graph",
+                },
+            )
         _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
@@ -258,6 +272,15 @@ class ACLGraphWrapper:
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        if self.debug_sync_timing is not None:
+            # Only the replay branch reaches here. The leading device drain is
+            # reported separately; the trailing drain measures completed replay.
+            phase = f"draft={_EXTRA_CTX.is_draft_model}/rows={batch_descriptor.num_tokens}/graph_replay"
+            with self.debug_sync_timing.measure(phase):
+                if not self.enable_enpu and need_sync:
+                    torch.npu.current_stream().synchronize()
+                entry.aclgraph.replay()
+            return entry.output
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()

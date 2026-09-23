@@ -45,6 +45,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.device_allocator.sleep_mem_optimized import AclGraphSleepWakeupManager
+from vllm_ascend.profiler.sfa_sync_timing import SFASyncTiming
 
 
 def test_update_full_graph_params_dispatches_draft_metadata_by_keyword():
@@ -404,6 +405,20 @@ class TestACLGraphWrapper(TestBase):
 
         # Verify graph replay happened
         mock_npu_graph.replay.assert_called_once()
+
+        # Enabling the diagnostic preserves replay/output while waiting for
+        # prior work and completion separately. No capture is performed again.
+        sync_order = []
+        wrapper.debug_sync_timing = SFASyncTiming(
+            lambda: sync_order.append("device_sync"),
+            lambda: False,
+            Mock(),
+            {},
+        )
+        mock_npu_graph.replay.side_effect = lambda: sync_order.append("replay")
+        self.assertEqual(wrapper(test_tensor, "arg2"), "weak_ref_output")
+        self.assertEqual(sync_order, ["device_sync", "replay", "device_sync"])
+        mock_torch.npu.graph.assert_called_once()
 
         # Both calls should return the weak ref output
         self.assertEqual(first_result, "test_output")  # Original output
