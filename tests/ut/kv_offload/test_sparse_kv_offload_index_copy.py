@@ -96,7 +96,9 @@ def test_graph_mooncake_writeback_waits_for_save_stream():
         )
         manager.wait_for_current_kv_writeback(capturing=True)
 
-    manager._offload_new_kv_on_current_stream.assert_called_once_with(
+    manager._offload_new_kv_on_current_stream.assert_called_once()
+    call_args = manager._offload_new_kv_on_current_stream.call_args
+    assert call_args.args == (
         slot_mapping,
         host_k,
         host_v,
@@ -104,10 +106,12 @@ def test_graph_mooncake_writeback_waits_for_save_stream():
         None,
         current_k,
         current_v,
-        False,
-        True,
-        True,
     )
+    assert call_args.kwargs == {
+        "has_prefill": False,
+        "capturing": True,
+        "prepare_index_copy_descriptors": True,
+    }
     assert manager.current_kv_by_layer[0] == (current_k, current_v)
     current_stream.record_event.assert_not_called()
     manager.current_kv_save_stream.wait_event.assert_not_called()
@@ -221,13 +225,13 @@ def test_graph_mooncake_prepares_descriptors_on_first_layer_only():
     first_call, second_call = (
         manager._offload_new_kv_on_current_stream.call_args_list
     )
-    assert first_call.args[-3:] == (
-        False,
-        True,
-        True,
-    )
-    assert second_call.args[-3:] == (
-        False,
-        True,
-        False,
-    )
+    assert first_call.kwargs == {
+        "has_prefill": False,
+        "capturing": True,
+        "prepare_index_copy_descriptors": True,
+    }
+    assert second_call.kwargs == {
+        "has_prefill": False,
+        "capturing": True,
+        "prepare_index_copy_descriptors": False,
+    }

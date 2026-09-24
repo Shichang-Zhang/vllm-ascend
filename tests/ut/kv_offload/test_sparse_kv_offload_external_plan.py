@@ -28,6 +28,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 def _make_plan_manager():
     manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     manager.use_fused_overlap = True
+    manager.fused_async_plan = False
+    manager.tp_size = 1
     manager.tp_rank = 0
     manager.topk = 4
     manager.topk_buffer_size = 8
@@ -503,8 +505,12 @@ def test_capture_external_plan_side_stream_and_mooncake_writeback_wait():
     current_stream.record_event.assert_called_once_with()
     manager.current_kv_save_stream.wait_event.assert_not_called()
     manager.fused_plan_stream.wait_event.assert_called_once_with(input_event)
-    writeback_args = manager._offload_new_kv_on_current_stream.call_args.args
-    assert writeback_args[-3:] == (False, True, True)
+    writeback_kwargs = manager._offload_new_kv_on_current_stream.call_args.kwargs
+    assert writeback_kwargs == {
+        "has_prefill": False,
+        "capturing": True,
+        "prepare_index_copy_descriptors": True,
+    }
     planner = manager.sparse_kv_offload_cpp.enqueue_lru_resident_compact_with_plan_stable_rows
     planner.assert_called_once()
     assert planner.call_args.args[17] == planner_membership[:1].data_ptr()
@@ -621,3 +627,54 @@ def test_mooncake_local_views_and_fused_inputs_share_mapping(peer_change):
     assert manager.gvas_v_bases == [v.data_ptr()]
     assert manager.cpu_block_lens == [(8, 8)]
     manager.tp_group.broadcast.assert_not_called()
+
+
+def test_async_plan_orders_input_lifetime_callback_and_publication():
+    manager = _make_plan_manager()
+    manager.fused_async_plan = True
+    manager.fused_plan_stream = MagicMock()
+    manager.current_kv_save_stream = MagicMock()
+    stream = MagicMock()
+    operations = []
+    manager.fused_plan_stream.wait_event.side_effect = lambda event: operations.append("input_ready")
+    manager.sparse_kv_offload_cpp.enqueue_lru_resident_compact_with_plan_stable_rows.side_effect = (
+        lambda *args: operations.append("planner")
+    )
+    manager.tp_group.broadcast.side_effect = lambda *args, **kwargs: operations.append("publish")
+    topk = torch.arange(4, dtype=torch.int32).view(1, 4)
+    request_ids = torch.tensor([101], dtype=torch.int64)
+    stable = torch.tensor([10], dtype=torch.int32)
+    visible = torch.tensor([11], dtype=torch.int32)
+    membership = torch.full((4, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT), -1, dtype=torch.int16)
+    with (
+        patch.object(manager_module.torch_npu.npu, "current_stream", return_value=stream),
+        patch.object(manager_module.torch_npu.npu, "stream", return_value=nullcontext()),
+        patch.object(torch.Tensor, "record_stream", side_effect=lambda target: operations.append("retain")) as retain,
+        patch.object(torch.Tensor, "item", side_effect=AssertionError("unexpected host value read")),
+    ):
+        assert manager.prepare_fused_overlap_external_plan("layer.0", 1, topk, request_ids, stable, visible, membership)
+    assert operations == ["input_ready", "retain", "retain", "retain", "retain", "planner", "publish"]
+    assert retain.call_count == 4
+    manager.fused_plan_stream.wait_event.assert_called_once_with(stream.record_event.return_value)
+    manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows.assert_not_called()
+    torch.testing.assert_close(manager.lru_topk_indices_cpu[:1], topk)
+    torch.testing.assert_close(manager.lru_req_ids_cpu[:1], request_ids)
+
+
+def test_synchronous_planner_failure_is_published_and_not_reused():
+    manager = _make_plan_manager()
+    manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows.side_effect = ValueError("bad plan")
+    membership = torch.full((4, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT), -1, dtype=torch.int16)
+    with pytest.raises(RuntimeError, match="external planner failed.*bad plan"):
+        manager.prepare_fused_overlap_external_plan(
+            "layer.0",
+            1,
+            torch.zeros(1, 4, dtype=torch.int32),
+            torch.tensor([101]),
+            torch.tensor([10], dtype=torch.int32),
+            torch.tensor([11], dtype=torch.int32),
+            membership,
+        )
+    assert manager.fused_plan_status_npu.item() == 1
+    assert manager.fused_overlap_plan_owner_layer_id is None
+    manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_metadata_npu, src=0)
