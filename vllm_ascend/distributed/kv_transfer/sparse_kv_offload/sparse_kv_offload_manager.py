@@ -1216,7 +1216,19 @@ class SparseKVOffloadManager:
         assert self.num_tokens_buffer_npu.shape == torch.Size([1])
 
         # topk cache reuse related
-        self.lru_workspace_threads = 8
+        # C++ caps active threads by work rows (token rows for fused overlap/MTP).
+        # Do not cap workspace threads by max_num_reqs: token rows can exceed it.
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            available_cpus = os.cpu_count() or 1
+        configured_threads = self.sparse_kv_offload_config.lru_max_threads
+        self.lru_workspace_threads = max(1, min(configured_threads, available_cpus))
+        logger.info(
+            "LRU thread budget: configured=%s, available_cpus=%s, workspace_threads=%s",
+            configured_threads, available_cpus, self.lru_workspace_threads,
+        )
+
         self._warmup_external_lru_planner_threads()
         self.lru_topk_indices_cpu = torch.empty(
             [self.max_num_topk_rows, self.topk],

@@ -1037,6 +1037,7 @@ class SparseKVOffloadConfig:
         "keep_device_kv_cache",
         "use_fused_overlap",
         "host_backend",
+        "lru_max_threads",
     }
 
     @staticmethod
@@ -1083,6 +1084,15 @@ class SparseKVOffloadConfig:
             user_config.get("use_fused_overlap", False),
             "use_fused_overlap",
         )
+        self.lru_max_threads = user_config.get("lru_max_threads", 8)
+        if (
+            type(self.lru_max_threads) is not int
+            or self.lru_max_threads <= 0
+        ):
+            raise ValueError(
+                "sparse_kv_offload_config.lru_max_threads "
+                "must be a positive integer"
+            )
         self.host_backend = str(user_config.get("host_backend", "memfabric"))
         if self.host_backend not in {"memfabric", "mooncake"}:
             raise ValueError(
