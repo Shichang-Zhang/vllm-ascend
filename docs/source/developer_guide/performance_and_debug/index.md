@@ -5,4 +5,5 @@ This section provides guides for benchmarking, performance tuning, profiling, an
 - **[Performance Benchmark](performance_benchmark.md)** — Benchmarking guide
 - **[Optimization and Tuning](optimization_and_tuning.md)** — Performance optimization
 - **[Service Profiling Guide](service_profiling_guide.md)** — Service profiling
+- **[Sparse KV CPU Profiling](sparse_kv_cpu_profiling.md)** — Planner threads, scheduling, and NUMA in Kubernetes (中文)
 - **[msprobe Guide](msprobe_guide.md)** — Debugging with msprobe

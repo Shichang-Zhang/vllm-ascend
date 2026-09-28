@@ -65,6 +65,7 @@ def planner_helper():
             f"-I{torch_npu_path / 'include'}",
         ],
         extra_ldflags=[
+            "-ldl",
             "-fopenmp",
             f"-L{npu_lib_path}",
             "-lascendcl",
@@ -242,7 +243,6 @@ def test_current_kv_index_copy_descriptors_survive_graph_replays(
     finally:
         graph.reset()
         torch_npu.npu.synchronize()
-
 
 
 def test_stable_rows_suffix_invalidation_and_plan_encoding(planner_helper):

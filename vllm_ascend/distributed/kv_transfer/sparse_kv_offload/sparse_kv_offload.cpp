@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include "planner_trace.h"
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -238,7 +239,8 @@ HOT_FUNCTION void lru_resident_compact_impl(
     uintptr_t token_pos_workspace_ptr, uintptr_t slot_workspace_ptr, uintptr_t miss_position_workspace_ptr,
     uintptr_t epochs_ptr, int64_t num_reqs, int64_t topk, int64_t capacity, int64_t max_token,
     int64_t workspace_threads, int64_t requested_threads, uintptr_t encoded_plan_ptr, int64_t encoded_plan_stride,
-    uintptr_t physical_row_workspace_ptr, int64_t physical_row_capacity, uintptr_t visible_seq_lens_ptr) {
+    uintptr_t physical_row_workspace_ptr, int64_t physical_row_capacity, uintptr_t visible_seq_lens_ptr,
+    planner_trace::CallRecord* trace = nullptr) {
   if (num_reqs <= 0 || topk <= 0 || capacity <= 0 || max_token <= 0 || physical_row_capacity < num_reqs) {
     return;
   }
@@ -316,7 +318,13 @@ HOT_FUNCTION void lru_resident_compact_impl(
   const int active_threads = choose_lru_resident_threads(num_reqs_int, static_cast<int>(workspace_threads),
                                                          static_cast<int>(requested_threads));
 
+  if (trace != nullptr) trace->parallel_begin_ns = DebugPlannerTrace::now_ns();
   if (active_threads == 1) {
+    auto* thread_trace = trace == nullptr ? nullptr : &trace->threads[0];
+    if (thread_trace != nullptr) {
+      trace->actual_threads = 1;
+      thread_trace->begin(nullptr);  // Serial path has no OpenMP barrier.
+    }
     for (int row = 0; row < num_reqs_int; ++row) {
       const int physical_row = logical_to_physical == nullptr ? row : logical_to_physical[row];
       process_one_lru_resident_row(row, physical_row, topk_int, capacity_int, max_token_int, req_ids, last_req_ids,
@@ -325,6 +333,14 @@ HOT_FUNCTION void lru_resident_compact_impl(
                                    slot_workspace, miss_position_workspace, epochs, current_token_slots, encoded_plan,
                                    static_cast<int32_t>(encoded_plan_stride), logical_to_physical != nullptr,
                                    visible_seq_lens);
+      if (thread_trace != nullptr) {
+        ++thread_trace->rows;
+        thread_trace->misses += std::max(0, miss_count[row]);
+      }
+    }
+    if (thread_trace != nullptr) {
+      thread_trace->end();
+      trace->parallel_end_ns = DebugPlannerTrace::now_ns();
     }
     return;
   }
@@ -332,6 +348,11 @@ HOT_FUNCTION void lru_resident_compact_impl(
 #pragma omp parallel num_threads(active_threads)
   {
     const int thread_id = omp_get_thread_num();
+    auto* thread_trace = trace == nullptr ? nullptr : &trace->threads[thread_id];
+    if (thread_trace != nullptr) {
+      if (thread_id == 0) trace->actual_threads = omp_get_num_threads();
+      thread_trace->begin(trace->bind_wait);
+    }
     int32_t* RESTRICT token_mark = token_mark_workspace + static_cast<int64_t>(thread_id) * max_token_int;
     int32_t* RESTRICT token_pos = token_pos_workspace + static_cast<int64_t>(thread_id) * max_token_int;
     int32_t* RESTRICT slots = slot_workspace + static_cast<int64_t>(thread_id) * capacity_int * 3;
@@ -344,8 +365,14 @@ HOT_FUNCTION void lru_resident_compact_impl(
                                    miss_count, miss_tokens, miss_slots, token_mark, token_pos, slots, miss_positions,
                                    epoch, current_token_slots, encoded_plan, static_cast<int32_t>(encoded_plan_stride),
                                    logical_to_physical != nullptr, visible_seq_lens);
+      if (thread_trace != nullptr) {
+        ++thread_trace->rows;
+        thread_trace->misses += std::max(0, miss_count[row]);
+      }
     }
+    if (thread_trace != nullptr) thread_trace->end();
   }
+  if (trace != nullptr) trace->parallel_end_ns = DebugPlannerTrace::now_ns();
 }
 
 HOT_FUNCTION void lru_resident_compact(uintptr_t req_ids_ptr, uintptr_t last_req_ids_ptr, uintptr_t topk_indices_ptr,
@@ -513,9 +540,9 @@ std::unique_ptr<CurrentKvIndexCopyPayload> make_current_kv_index_copy_payload(
   TORCH_CHECK(dst_idx_buffer.numel() >= max_num_tokens, "dst_idx_buffer is too small");
   TORCH_CHECK(count_buffer.numel() >= 1, "count_buffer is empty");
 
-  return std::make_unique<CurrentKvIndexCopyPayload>(CurrentKvIndexCopyPayload{
-      slot_mapping, src_idx_buffer, dst_idx_buffer, count_buffer, num_actual_tokens, max_num_tokens, num_host_slots,
-      false});
+  return std::make_unique<CurrentKvIndexCopyPayload>(
+      CurrentKvIndexCopyPayload{slot_mapping, src_idx_buffer, dst_idx_buffer, count_buffer, num_actual_tokens,
+                                max_num_tokens, num_host_slots, false});
 }
 
 void build_current_kv_index_copy_descriptors(CurrentKvIndexCopyPayload* payload) noexcept {
@@ -552,9 +579,10 @@ void build_current_kv_index_copy_descriptors(CurrentKvIndexCopyPayload* payload)
   count[0] = num_copies;
 }
 
-int64_t compute_current_kv_index_copy_descriptors(
-    const at::Tensor& slot_mapping, int64_t num_actual_tokens, int64_t max_num_tokens, int64_t num_host_slots,
-    const at::Tensor& src_idx_buffer, const at::Tensor& dst_idx_buffer, const at::Tensor& count_buffer) {
+int64_t compute_current_kv_index_copy_descriptors(const at::Tensor& slot_mapping, int64_t num_actual_tokens,
+                                                  int64_t max_num_tokens, int64_t num_host_slots,
+                                                  const at::Tensor& src_idx_buffer, const at::Tensor& dst_idx_buffer,
+                                                  const at::Tensor& count_buffer) {
   auto payload = make_current_kv_index_copy_payload(slot_mapping, num_actual_tokens, max_num_tokens, num_host_slots,
                                                     src_idx_buffer, dst_idx_buffer, count_buffer);
   build_current_kv_index_copy_descriptors(payload.get());
@@ -573,8 +601,7 @@ std::mutex& current_kv_index_copy_graph_registry_mutex() {
 
 std::unordered_map<aclmdlRI, std::unique_ptr<CurrentKvIndexCopyGraphPayloadRegistry>>&
 current_kv_index_copy_graph_registries() {
-  static auto* registries =
-      new std::unordered_map<aclmdlRI, std::unique_ptr<CurrentKvIndexCopyGraphPayloadRegistry>>();
+  static auto* registries = new std::unordered_map<aclmdlRI, std::unique_ptr<CurrentKvIndexCopyGraphPayloadRegistry>>();
   return *registries;
 }
 
@@ -609,8 +636,7 @@ CurrentKvIndexCopyPayload* retain_current_kv_index_copy_graph_payload(
       registries.erase(it);
     }
     TORCH_CHECK(register_ret == ACL_SUCCESS,
-                "failed to bind current KV index_copy payload registry to graph lifetime, error code: ",
-                register_ret);
+                "failed to bind current KV index_copy payload registry to graph lifetime, error code: ", register_ret);
   }
   it->second->payloads.push_back(std::move(payload));
   return raw_payload;
@@ -624,9 +650,10 @@ void current_kv_index_copy_descriptor_callback(void* args) noexcept {
   }
 }
 
-void enqueue_current_kv_index_copy_descriptors(
-    const at::Tensor& slot_mapping, int64_t num_actual_tokens, int64_t max_num_tokens, int64_t num_host_slots,
-    const at::Tensor& src_idx_buffer, const at::Tensor& dst_idx_buffer, const at::Tensor& count_buffer) {
+void enqueue_current_kv_index_copy_descriptors(const at::Tensor& slot_mapping, int64_t num_actual_tokens,
+                                               int64_t max_num_tokens, int64_t num_host_slots,
+                                               const at::Tensor& src_idx_buffer, const at::Tensor& dst_idx_buffer,
+                                               const at::Tensor& count_buffer) {
   auto payload = make_current_kv_index_copy_payload(slot_mapping, num_actual_tokens, max_num_tokens, num_host_slots,
                                                     src_idx_buffer, dst_idx_buffer, count_buffer);
   const auto stream = c10_npu::getCurrentNPUStream().stream();
@@ -649,37 +676,12 @@ void enqueue_current_kv_index_copy_descriptors(
   if (ret == ACL_SUCCESS && !graph_lifetime) {
     payload.release();
   }
-  TORCH_CHECK(ret == ACL_SUCCESS, "aclrtLaunchHostFunc for current KV index_copy descriptors failed, error code: ",
-              ret);
+  TORCH_CHECK(ret == ACL_SUCCESS,
+              "aclrtLaunchHostFunc for current KV index_copy descriptors failed, error code: ", ret);
 }
 
 // Temporary diagnostics. Reset/snapshot only after the device is quiescent.
 // Bounded per captured callback; never allocate or log on the callback thread.
-struct DebugPlannerTrace {
-  static constexpr size_t kCapacity = 256;
-  std::atomic<bool> enabled{false};
-  size_t calls = 0;
-  std::array<std::array<int64_t, 2>, kCapacity> records{};
-
-  static int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-  }
-  void reset() noexcept {
-    calls = 0;
-    enabled.store(true);
-  }
-  size_t begin() noexcept {
-    if (!enabled.load()) return kCapacity;
-    const size_t index = calls++;
-    if (index < kCapacity) records[index][0] = now_ns();
-    return index;
-  }
-  void end(size_t index) noexcept {
-    if (index < kCapacity) records[index][1] = now_ns();
-  }
-};
-
 struct LruResidentCompactWithPlanPayload {
   uintptr_t req_ids_ptr;
   uintptr_t last_req_ids_ptr;
@@ -767,7 +769,7 @@ LruResidentCompactWithPlanPayload* retain_lru_resident_compact_graph_payload(
 
 void lru_resident_compact_with_plan_callback(void* args) noexcept {
   auto* payload = static_cast<LruResidentCompactWithPlanPayload*>(args);
-  const size_t debug_index = payload->debug_trace->begin();
+  auto* debug_record = payload->debug_trace->begin();
   lru_resident_compact_impl(
       payload->req_ids_ptr, payload->last_req_ids_ptr, payload->topk_indices_ptr, payload->stable_prefix_lens_ptr,
       payload->slot_to_token_ptr, payload->lru_slots_ptr, payload->current_slots_ptr, payload->miss_count_ptr,
@@ -775,8 +777,8 @@ void lru_resident_compact_with_plan_callback(void* args) noexcept {
       payload->token_pos_workspace_ptr, payload->slot_workspace_ptr, payload->miss_position_workspace_ptr,
       payload->epochs_ptr, payload->num_reqs, payload->topk, payload->capacity, payload->max_token,
       payload->workspace_threads, payload->requested_threads, payload->encoded_plan_ptr, payload->encoded_plan_stride,
-      payload->physical_row_workspace_ptr, payload->physical_row_capacity, payload->visible_seq_lens_ptr);
-  payload->debug_trace->end(debug_index);
+      payload->physical_row_workspace_ptr, payload->physical_row_capacity, payload->visible_seq_lens_ptr, debug_record);
+  payload->debug_trace->end(debug_record);
   if (payload->delete_after_run) {
     delete payload;
   }
@@ -852,10 +854,16 @@ void enqueue_lru_resident_compact_with_plan_stable_rows(
 }
 
 // The caller synchronizes outside the measured window before either operation.
-void debug_start_planner_trace() {
+void debug_start_planner_trace(size_t capacity) {
+  TORCH_CHECK(capacity > 0 && capacity <= DebugPlannerTrace::kMaxCapacity,
+              "planner trace capacity must be in [1, 65536]");
   std::lock_guard<std::mutex> lock(lru_resident_compact_graph_registry_mutex());
   for (auto& entry : lru_resident_compact_graph_registries()) {
-    for (auto& payload : entry.second->payloads) payload->debug_trace->reset();
+    for (auto& payload : entry.second->payloads) {
+      const int threads =
+          choose_lru_resident_threads(payload->num_reqs, payload->workspace_threads, payload->requested_threads);
+      payload->debug_trace->reset(threads, capacity);
+    }
   }
 }
 
@@ -873,12 +881,76 @@ pybind11::list debug_stop_planner_trace() {
       item["num_reqs"] = payload->num_reqs;
       item["topk"] = payload->topk;
       item["calls"] = trace.calls;
-      item["dropped"] = trace.calls > DebugPlannerTrace::kCapacity ? trace.calls - DebugPlannerTrace::kCapacity : 0;
+      item["capacity"] = trace.records.size();
+      item["dropped"] = trace.calls > trace.records.size() ? trace.calls - trace.records.size() : 0;
       pybind11::list records;
-      for (size_t i = 0; i < std::min(trace.calls, DebugPlannerTrace::kCapacity); ++i) {
-        records.append(pybind11::make_tuple(trace.records[i][0], trace.records[i][1]));
+      pybind11::list details;
+      for (size_t i = 0; i < std::min(trace.calls, trace.records.size()); ++i) {
+        const auto& record = trace.records[i];
+        records.append(pybind11::make_tuple(record.begin_ns, record.end_ns));
+        pybind11::dict detail;
+        detail["call_index"] = i;
+        detail["begin_ns"] = record.begin_ns;
+        detail["parallel_begin_ns"] = record.parallel_begin_ns;
+        detail["parallel_end_ns"] = record.parallel_end_ns;
+        detail["end_ns"] = record.end_ns;
+        detail["callback_tid"] = record.callback_tid;
+        detail["actual_threads"] = record.actual_threads;
+        pybind11::list threads;
+        for (size_t thread_id = 0; thread_id < record.threads.size(); ++thread_id) {
+          const auto& thread = record.threads[thread_id];
+          if (thread.entry_ns == 0) continue;
+          pybind11::dict worker;
+          worker["omp_thread"] = thread_id;
+          worker["tid"] = thread.tid;
+          worker["entry_ns"] = thread.entry_ns;
+          worker["work_begin_ns"] = thread.work_begin_ns;
+          worker["work_end_ns"] = thread.work_end_ns;
+          worker["cpu_begin_ns"] = thread.cpu_begin_ns;
+          worker["cpu_end_ns"] = thread.cpu_end_ns;
+          worker["cpu_begin"] = thread.cpu_begin;
+          worker["cpu_end"] = thread.cpu_end;
+          worker["rows"] = thread.rows;
+          worker["misses"] = thread.misses;
+          worker["ompt_support"] = thread.wait ? thread.wait->support : 0;
+          pybind11::list waits;
+          size_t count = 0;
+          if (thread.wait) {
+            count = thread.wait->count.load();
+            for (size_t j = 0; j < std::min(count, planner_trace::WaitTrace::kCapacity); ++j) {
+              const auto& interval = thread.wait->intervals[j];
+              const auto end = interval.end_ns.load(std::memory_order_acquire);
+              waits.append(pybind11::make_tuple(interval.begin_ns.load(), end));
+            }
+          }
+          worker["ompt_wait_intervals_ns"] = waits;
+          worker["ompt_dropped"] =
+              count > planner_trace::WaitTrace::kCapacity ? count - planner_trace::WaitTrace::kCapacity : 0;
+          threads.append(worker);
+        }
+        detail["threads"] = threads;
+        details.append(detail);
       }
       item["begin_end_steady_ns"] = records;
+      item["details"] = details;
+      pybind11::list buffers;
+      const auto add_buffer = [&buffers](const char* name, uintptr_t address, int64_t bytes) {
+        pybind11::dict buffer;
+        buffer["name"] = name;
+        buffer["address"] = address;
+        buffer["bytes"] = bytes;
+        buffers.append(buffer);
+      };
+      add_buffer("token_mark", payload->token_mark_workspace_ptr,
+                 payload->workspace_threads * payload->max_token * sizeof(int32_t));
+      add_buffer("token_pos", payload->token_pos_workspace_ptr,
+                 payload->workspace_threads * payload->max_token * sizeof(int32_t));
+      add_buffer("slot_to_token", payload->slot_to_token_ptr,
+                 payload->physical_row_capacity * payload->capacity * sizeof(int32_t));
+      add_buffer("lru_slots", payload->lru_slots_ptr,
+                 payload->physical_row_capacity * payload->capacity * sizeof(int32_t));
+      add_buffer("topk_indices", payload->topk_indices_ptr, payload->num_reqs * payload->topk * sizeof(int32_t));
+      item["buffers"] = buffers;
       result.append(item);
     }
   }
@@ -896,7 +968,7 @@ at::Tensor restore_tensor(uintptr_t ptr_val, const std::vector<int64_t>& shape,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
-  m.def("debug_start_planner_trace", &debug_start_planner_trace);
+  m.def("debug_start_planner_trace", &debug_start_planner_trace, py::arg("capacity") = DebugPlannerTrace::kCapacity);
   m.def("debug_stop_planner_trace", &debug_stop_planner_trace);
   m.def("debug_planner_clock_ns", &DebugPlannerTrace::now_ns);
   m.def("warmup_lru_resident_threads", &warmup_lru_resident_threads,
@@ -927,5 +999,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Build compact source/destination index_copy descriptors on CPU");
   m.def("enqueue_current_kv_index_copy_descriptors", &enqueue_current_kv_index_copy_descriptors,
         "Enqueue graph-safe current KV index_copy descriptor generation");
-
 }

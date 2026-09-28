@@ -32,6 +32,7 @@ from vllm.profiler.wrapper import WorkerProfiler
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.profiler.sparse_kv_cpu import buffer_mappings, snapshot
 
 
 class TorchNPUProfilerWrapper(WorkerProfiler):
@@ -42,7 +43,9 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
         self._debug_trace_dir = profiler_config.torch_profiler_dir
         self._debug_trace_name = trace_name
         self._debug_planner_manager = None
-        self.profiler: Any = self._create_profiler(profiler_config, trace_name)
+        self.profiler: Any = (
+            None if envs_ascend.VLLM_ASCEND_PLANNER_TRACE_ONLY else self._create_profiler(profiler_config, trace_name)
+        )
 
     @staticmethod
     def _create_profiler(profiler_config: ProfilerConfig, trace_name: str) -> Any:
@@ -87,18 +90,18 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
 
     def _start(self) -> None:
         # Temporary: use an already loaded manager; do not initialize offload here.
-        module = sys.modules.get(
-            "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager"
-        )
+        module = sys.modules.get("vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager")
         manager = getattr(module, "_SPARSE_KV_OFFLOAD_MANAGER", None)
         if manager is not None and manager.use_fused_overlap and manager.tp_rank == 0:
             torch_npu.npu.synchronize()
             self._debug_planner_manager = manager
             extension = manager.sparse_kv_offload_cpp
-            extension.debug_start_planner_trace()
+            extension.debug_start_planner_trace(envs_ascend.VLLM_ASCEND_PLANNER_TRACE_CAPACITY)
             self._debug_clock = self._debug_clock_anchor(extension)
             self._debug_faults = resource.getrusage(resource.RUSAGE_SELF)
-        self.profiler.start()
+            self._debug_system_start = snapshot(os.getpid())
+        if self.profiler is not None:
+            self.profiler.start()
 
     @staticmethod
     def _debug_clock_anchor(extension):
@@ -109,7 +112,8 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
         return {"steady_ns": steady, "unix_before_ns": before, "unix_after_ns": after}
 
     def _stop(self) -> None:
-        self.profiler.stop()
+        if self.profiler is not None:
+            self.profiler.stop()
         manager = self._debug_planner_manager
         if manager is not None:
             # Drain callbacks before reading/resetting their preallocated buffers.
@@ -127,15 +131,28 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             output = Path(self._debug_trace_dir)
             output.mkdir(parents=True, exist_ok=True)
             faults = resource.getrusage(resource.RUSAGE_SELF)
+            system_stop = snapshot(os.getpid(), memory=True)
+            for record in records:
+                record["buffer_mappings"] = buffer_mappings(record.get("buffers", []), system_stop)
+            parallel = manager.vllm_config.parallel_config
             document = {
+                "schema_version": 2,
+                "clock": "CLOCK_MONOTONIC",
                 "hostname": socket.gethostname(),
                 "pid": os.getpid(),
+                "dp_rank": parallel.data_parallel_rank,
+                "dp_size": parallel.data_parallel_size,
+                "tp_rank": manager.tp_rank,
+                "tp_size": manager.tp_size,
                 "cpu_minor_faults": faults.ru_minflt - self._debug_faults.ru_minflt,
                 "cpu_major_faults": faults.ru_majflt - self._debug_faults.ru_majflt,
                 "rank_trace_name": self._debug_trace_name,
                 "start_clock_anchor": self._debug_clock,
                 "stop_clock_anchor": self._debug_clock_anchor(extension),
                 "scope": "existing captured planner callbacks; includes profile boundary drain",
+                "call_identity": "graph_id/layer_id/call_index is local; not a cross-DP decode step",
+                "system_start": self._debug_system_start,
+                "system_stop": system_stop,
                 "records": records,
             }
             filename = f"{self._debug_trace_name}_{os.getpid()}_{time.time_ns()}_lru_callback.json"

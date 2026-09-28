@@ -292,21 +292,26 @@ class TestTorchNPUProfilerWrapper(TestBase):
         wrapper.step()
         mock_profiler.stop.assert_called_once()
 
-
     def test_debug_callback_trace_exports_layer_and_durations(self):
         from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 
         extension = MagicMock()
         extension.debug_planner_clock_ns.return_value = 1000
-        extension.debug_stop_planner_trace.return_value = [{
-            "lru_state_ptr": 123,
-            "begin_end_steady_ns": [[1000, 4000], [5000, 14000]],
-            "calls": 2,
-            "dropped": 0,
-        }]
+        extension.debug_stop_planner_trace.return_value = [
+            {
+                "lru_state_ptr": 123,
+                "begin_end_steady_ns": [[1000, 4000], [5000, 14000]],
+                "calls": 2,
+                "dropped": 0,
+            }
+        ]
         manager = SimpleNamespace(
-            use_fused_overlap=True, tp_rank=0,
-            sparse_kv_offload_cpp=extension, lru_last_req_ids_ptrs=[123],
+            use_fused_overlap=True,
+            tp_rank=0,
+            tp_size=2,
+            vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_rank=7, data_parallel_size=16)),
+            sparse_kv_offload_cpp=extension,
+            lru_last_req_ids_ptrs=[123],
         )
         module_name = "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager"
         with (
@@ -315,16 +320,18 @@ class TestTorchNPUProfilerWrapper(TestBase):
             patch.object(TorchNPUProfilerWrapper, "_create_profiler", return_value=MagicMock()),
             patch("torch_npu.npu.synchronize") as synchronize,
         ):
-            wrapper = TorchNPUProfilerWrapper(
-                ProfilerConfig(profiler="torch", torch_profiler_dir=directory), "dp0_tp0"
-            )
+            wrapper = TorchNPUProfilerWrapper(ProfilerConfig(profiler="torch", torch_profiler_dir=directory), "dp0_tp0")
             wrapper._start()
             extension.debug_start_planner_trace.assert_called_once()
             wrapper._stop()
             self.assertEqual(synchronize.call_count, 2)
             files = list(Path(directory).glob("*_lru_callback.json"))
             self.assertEqual(len(files), 1)
-            record = json.loads(files[0].read_text())["records"][0]
+            document = json.loads(files[0].read_text())
+            self.assertEqual(document["dp_rank"], 7)
+            self.assertEqual(document["tp_size"], 2)
+            self.assertEqual(document["clock"], "CLOCK_MONOTONIC")
+            record = document["records"][0]
             self.assertEqual(record["layer_id"], 0)
             self.assertEqual(record["p50_us"], 3)
             self.assertEqual(record["max_us"], 9)
@@ -336,12 +343,12 @@ class TestTorchNPUProfilerWrapper(TestBase):
         extension = MagicMock()
         manager = SimpleNamespace(use_fused_overlap=True, tp_rank=1, sparse_kv_offload_cpp=extension)
         module_name = "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager"
-        with patch.dict(sys.modules, {module_name: SimpleNamespace(_SPARSE_KV_OFFLOAD_MANAGER=manager)}), (
-            patch.object(TorchNPUProfilerWrapper, "_create_profiler", return_value=MagicMock())
-        ), patch("torch_npu.npu.synchronize") as synchronize:
-            wrapper = TorchNPUProfilerWrapper(
-                ProfilerConfig(profiler="torch", torch_profiler_dir="/unused"), "dp0_tp1"
-            )
+        with (
+            patch.dict(sys.modules, {module_name: SimpleNamespace(_SPARSE_KV_OFFLOAD_MANAGER=manager)}),
+            patch.object(TorchNPUProfilerWrapper, "_create_profiler", return_value=MagicMock()),
+            patch("torch_npu.npu.synchronize") as synchronize,
+        ):
+            wrapper = TorchNPUProfilerWrapper(ProfilerConfig(profiler="torch", torch_profiler_dir="/unused"), "dp0_tp1")
             wrapper._start()
             wrapper._stop()
             extension.debug_start_planner_trace.assert_not_called()

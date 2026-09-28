@@ -33,6 +33,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Non-sensitive. Enable on every worker for a separate diagnostic run;
     # serialized timings change overlap and must not be used as normal TPOT.
     "VLLM_ASCEND_DEBUG_SFA_SYNC_TIMING": lambda: bool(int(os.getenv("VLLM_ASCEND_DEBUG_SFA_SYNC_TIMING", "0"))),
+    # CPU planner diagnostics: skip torch/NPU collection during profiler windows.
+    # Default 0; valid values 0 (combined profiling), 1 (CPU planner only).
+    # Non-sensitive. Applies to the sparse-offload decoding hot path; no extra
+    # per-layer synchronization. Disabled by default on all hardware.
+    "VLLM_ASCEND_PLANNER_TRACE_ONLY": lambda: bool(int(os.getenv("VLLM_ASCEND_PLANNER_TRACE_ONLY", "0"))),
+    # Preallocated CPU trace calls per captured planner payload. Default 256;
+    # valid range [1, 65536], checked before recording. Non-sensitive.
+    # Reduce for many captured graphs/layers to avoid diagnostic memory pressure.
+    "VLLM_ASCEND_PLANNER_TRACE_CAPACITY": lambda: int(os.getenv("VLLM_ASCEND_PLANNER_TRACE_CAPACITY", "256")),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

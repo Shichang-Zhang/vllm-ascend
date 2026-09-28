@@ -724,6 +724,7 @@ class SparseKVOffloadManager:
                 f"-I{torch_npu_include}",
             ],
             extra_ldflags=[
+                "-ldl",
                 "-fopenmp",
                 f"-L{npu_lib_path}",
                 "-lascendcl",
