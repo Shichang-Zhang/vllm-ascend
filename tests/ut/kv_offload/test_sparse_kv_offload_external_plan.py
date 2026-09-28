@@ -13,6 +13,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import (  # noqa: E40
     sparse_kv_offload_manager as manager_module,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import (  # noqa: E402
+    HostMemoryRegion,
     MooncakeHostPool,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (  # noqa: E402
@@ -52,7 +53,6 @@ def _make_plan_manager():
     manager.current_kv_by_layer = {}
     manager.fused_overlap_membership_map = None
     manager.fused_overlap_membership_map_rows = 0
-    manager.fused_overlap_membership_region = None
     manager.fused_overlap_planner_membership_map = None
     manager.fused_overlap_membership_plan_device_staging = None
     manager._host_kv_allocator = None
@@ -171,7 +171,41 @@ def _enable_mooncake_membership_staging(manager):
     return allocator
 
 
-def test_mooncake_membership_uses_compact_cpu_and_npu_staging(monkeypatch):
+def test_empty_aligned_swapped_tensor_returns_aligned_view():
+    raw_tensors = []
+
+    def empty_swapped(shape, *, dtype, device):
+        assert device == torch.device("npu:0")
+        raw = torch.empty(shape, dtype=dtype)
+        raw_tensors.append(raw)
+        return raw
+
+    with (
+        patch.object(
+            manager_module.torch_npu,
+            "empty_with_swapped_memory",
+            side_effect=empty_swapped,
+            create=True,
+        ),
+        patch.object(
+            manager_module.torch_npu.npu,
+            "current_device",
+            return_value=0,
+        ),
+    ):
+        aligned = manager_module.empty_aligned_swapped_tensor(
+            [3, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
+            torch.int16,
+        )
+
+    assert raw_tensors
+    assert aligned.shape == (3, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT)
+    assert aligned.data_ptr() % manager_module._CPU_CACHE_ALIGNMENT == 0
+
+
+def test_mooncake_membership_uses_per_rank_swapped_storage_and_staging(
+    monkeypatch,
+):
     # CPU UT validates staging geometry/ordering, not accelerator pinning.
     allocate_tensor = torch.empty
 
@@ -187,16 +221,12 @@ def test_mooncake_membership_uses_compact_cpu_and_npu_staging(monkeypatch):
     manager.tp_group = MagicMock()
     manager.fused_overlap_membership_map = None
     manager.fused_overlap_membership_map_rows = 0
-    manager.fused_overlap_membership_region = None
     manager.fused_overlap_planner_membership_map = None
     manager.fused_overlap_membership_plan_device_staging = None
     _enable_mooncake_membership_staging(manager)
-    region = SimpleNamespace(
-        tensor=torch.empty(
-            3 * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT * 2,
-            dtype=torch.int8,
-        ),
-        release=MagicMock(),
+    swapped_membership = torch.empty(
+        (3, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT),
+        dtype=torch.int16,
     )
     synchronization_order = []
     manager.tp_group.barrier.side_effect = lambda: synchronization_order.append("barrier")
@@ -206,8 +236,8 @@ def test_mooncake_membership_uses_compact_cpu_and_npu_staging(monkeypatch):
     with (
         patch.object(
             manager_module,
-            "allocate_mooncake_host_region",
-            return_value=region,
+            "empty_aligned_swapped_tensor",
+            return_value=swapped_membership,
         ) as allocate,
         patch.object(
             manager_module.torch_npu.npu,
@@ -237,7 +267,10 @@ def test_mooncake_membership_uses_compact_cpu_and_npu_staging(monkeypatch):
     assert membership.data_ptr() != planner.data_ptr()
     assert device_staging.data_ptr() != planner.data_ptr()
     assert device_staging.data_ptr() != membership.data_ptr()
-    allocate.assert_called_once()
+    allocate.assert_called_once_with(
+        [3, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
+        torch.int16,
+    )
     current_stream.synchronize.assert_called_once_with()
     manager.tp_group.barrier.assert_called_once_with()
     assert synchronization_order == ["stream_sync", "barrier"]
@@ -300,6 +333,10 @@ def test_mooncake_eager_external_plan_publishes_through_npu_staging():
     planner = sparse_kv_ops.sparse_kv_lru_resident_compact_with_plan_stable_rows
     assert planner.call_args.args[17] == planner_membership[:2].data_ptr()
     assert planner.call_args.args[18] == plan_width
+    assert manager.tp_group.broadcast.call_args_list == [
+        ((manager.fused_plan_metadata_npu,), {"src": 0}),
+        ((manager.fused_overlap_membership_plan_device_staging,), {"src": 0}),
+    ]
 
 
 def test_non_tp0_mooncake_plan_does_not_require_cpu_planner_storage():
@@ -313,6 +350,12 @@ def test_non_tp0_mooncake_plan_does_not_require_cpu_planner_storage():
     )
     manager.fused_overlap_membership_map = membership
     manager.fused_overlap_planner_membership_map = None
+    plan_width = manager.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
+    manager.fused_overlap_membership_plan_device_staging = torch.full(
+        (4, plan_width),
+        9,
+        dtype=torch.int16,
+    )
     sparse_kv_ops = SimpleNamespace(
         sparse_kv_lru_resident_compact_with_plan_stable_rows=(
             manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows
@@ -336,7 +379,15 @@ def test_non_tp0_mooncake_plan_does_not_require_cpu_planner_storage():
 
     (sparse_kv_ops.sparse_kv_lru_resident_compact_with_plan_stable_rows.assert_not_called())
     (sparse_kv_ops.sparse_kv_enqueue_lru_resident_compact_with_plan_stable_rows.assert_not_called())
-    manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_metadata_npu, src=0)
+    assert manager.tp_group.broadcast.call_args_list == [
+        ((manager.fused_plan_metadata_npu,), {"src": 0}),
+        ((manager.fused_overlap_membership_plan_device_staging,), {"src": 0}),
+    ]
+    plan_start = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT - manager.topk
+    torch.testing.assert_close(
+        membership[:1, plan_start : plan_start + plan_width],
+        manager.fused_overlap_membership_plan_device_staging[:1],
+    )
 
 
 def test_external_lru_plan_is_reused_by_three_skip_layers_and_replanned_at_owner():
@@ -509,7 +560,10 @@ def test_capture_external_plan_side_stream_and_mooncake_writeback_wait():
     planner.assert_called_once()
     assert planner.call_args.args[17] == planner_membership[:1].data_ptr()
     assert planner.call_args.args[18] == plan_width
-    manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_metadata_npu, src=0)
+    assert manager.tp_group.broadcast.call_args_list == [
+        ((manager.fused_plan_metadata_npu,), {"src": 0}),
+        ((manager.fused_overlap_membership_plan_device_staging,), {"src": 0}),
+    ]
     current_stream.wait_stream.assert_any_call(manager.fused_plan_stream)
     current_stream.wait_stream.assert_any_call(manager.current_kv_save_stream)
     assert manager.current_kv_by_layer[0][0].numel() == 1
@@ -590,7 +644,7 @@ def test_mooncake_local_views_and_fused_inputs_share_mapping(peer_change):
     manager.offload_layer_names = ["layer.0"]
     manager.kv_cache_config = SimpleNamespace(num_blocks=4)
     pool = MooncakeHostPool(
-        manager_module.HostMemoryRegion(torch.empty(256, dtype=torch.int8)),
+        HostMemoryRegion(torch.empty(256, dtype=torch.int8)),
         manager_module.HostPoolTopology(tp_rank=1, tp_size=2),
     )
     manager._host_kv_allocator = pool

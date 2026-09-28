@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from vllm.logger import logger
+
+# CANN VMM address reservations require a size that is a multiple of 1 GiB,
+# independently of the smaller physical allocation granularity.
+_ASCEND_VMM_RESERVATION_ALIGNMENT = 1 << 30
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -58,7 +61,7 @@ class HostMemoryRegion:
 
 
 def _select_shared_segment_mode() -> tuple[bool, bool]:
-    """Select a Mooncake mode that exposes an NPU-addressable Host VA."""
+    """Select Ascend VMM shared memory with an NPU-addressable SVM VA."""
     try:
         from mooncake.shared_segment import shared_segment_supported
     except ImportError as exc:
@@ -66,9 +69,9 @@ def _select_shared_segment_mode() -> tuple[bool, bool]:
             "Mooncake shared_segment support is required for sparse KV offload with the Mooncake Host backend"
         ) from exc
 
-    if shared_segment_supported(mmap=True, host_register=True):
-        return True, True
-    raise RuntimeError("Mooncake shared_segment cannot expose an NPU-addressable address")
+    if shared_segment_supported(mmap=False, host_register=False):
+        return False, False
+    raise RuntimeError("Mooncake shared_segment requires Ascend VMM support for an NPU-addressable address")
 
 
 def allocate_mooncake_host_region(
@@ -90,7 +93,10 @@ def allocate_mooncake_host_region(
         raise ValueError(f"size_bytes must be positive, got {size_bytes}")
     if alignment <= 0:
         raise ValueError(f"alignment must be positive, got {alignment}")
-    allocation_size_bytes = int(size_bytes) + int(alignment) - 1
+    allocation_size_bytes = _align_up(
+        int(size_bytes) + int(alignment) - 1,
+        _ASCEND_VMM_RESERVATION_ALIGNMENT,
+    )
     if topology.tp_size > 1 and topology.tp_group is None:
         raise RuntimeError(
             f"create_shared_segment requires tp_group when tp_size > 1: tp={topology.tp_rank}/{topology.tp_size}"
@@ -124,13 +130,10 @@ def allocate_mooncake_host_region(
         rank_id=topology.tp_rank,
         owner_rank=topology.owner_rank,
         device_id=topology.device_id,
-        tp_group=topology.tp_group,
+        comm_group=topology.tp_group,
         mmap=mmap,
         host_register=host_register,
     )
-    if host_register and os.getenv("VLLM_ASCEND_SKIP_MIGRATEPAGES") is None:
-        os.environ["VLLM_ASCEND_SKIP_MIGRATEPAGES"] = "1"
-
     raw = segment.tensors("pool")[0].reshape(-1)
     base_offset = _align_up(raw.data_ptr(), alignment) - raw.data_ptr()
     aligned = raw.narrow(0, base_offset, int(size_bytes))
