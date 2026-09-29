@@ -555,6 +555,7 @@ class SparseKVOffloadManager:
         self.fused_overlap_membership_map_rows = 0
         self.fused_overlap_planner_membership_map: torch.Tensor | None = None
         self.fused_overlap_membership_plan_device_staging: torch.Tensor | None = None
+        self.fused_plan_broadcast_buffer: torch.Tensor | None = None
         self.fused_overlap_plan_owner_layer_id: int | None = None
         self.fused_overlap_plan_topk: int | None = None
         self.fused_overlap_plan_num_tokens = 0
@@ -683,6 +684,10 @@ class SparseKVOffloadManager:
         self.fused_overlap_membership_map = None
         self.fused_overlap_planner_membership_map = None
         self.fused_overlap_membership_plan_device_staging = None
+        self.fused_plan_broadcast_buffer = None
+        self.fused_plan_metadata_npu = None
+        self.fused_plan_status_npu = None
+        self.fused_plan_current_linear_slots_npu = None
         allocator = self._host_kv_allocator
         if allocator is not None:
             allocator.close()
@@ -852,11 +857,7 @@ class SparseKVOffloadManager:
             )
             plan_width = self.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
             plan_shape = [row_capacity, plan_width]
-            self.fused_overlap_membership_plan_device_staging = torch.empty(
-                plan_shape,
-                dtype=torch.int16,
-                device=membership_map.device,
-            )
+            self._allocate_fused_plan_staging(row_capacity, membership_map.device)
             planner_map = None
             if self.tp_rank == 0:
                 planner_map = torch.empty(
@@ -893,6 +894,32 @@ class SparseKVOffloadManager:
         self.fused_overlap_membership_map = membership_map
         self.fused_overlap_membership_map_rows = row_capacity
         return membership_map
+
+    def _allocate_fused_plan_staging(self, row_capacity: int, device: torch.device) -> None:
+        """Preallocate one broadcast payload before graph capture.
+
+        Keep metadata as int32 and the encoded plan as an int16 view of the
+        same storage. Broadcasting int32 preserves both payloads bit-for-bit
+        without per-step packing, casts, or additional device allocations.
+        """
+        metadata = self.fused_plan_metadata_npu
+        metadata_elements = metadata.numel()
+        plan_width = self.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
+        plan_elements = row_capacity * plan_width
+        plan_bytes = plan_elements * torch.int16.itemsize
+        buffer = torch.zeros(
+            metadata_elements + cdiv(plan_bytes, torch.int32.itemsize),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.fused_plan_broadcast_buffer = buffer
+        self.fused_plan_metadata_npu = buffer[:metadata_elements]
+        self.fused_plan_metadata_npu.copy_(metadata)
+        self.fused_plan_status_npu = self.fused_plan_metadata_npu[:1]
+        self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
+        self.fused_overlap_membership_plan_device_staging = (
+            buffer[metadata_elements:].view(torch.int16)[:plan_elements].view(row_capacity, plan_width)
+        )
 
     def _init_fused_overlap_membership_control(
         self,
@@ -1239,7 +1266,9 @@ class SparseKVOffloadManager:
         self.lru_workspace_threads = max(1, min(configured_threads, available_cpus))
         logger.info(
             "LRU thread budget: configured=%s, available_cpus=%s, workspace_threads=%s",
-            configured_threads, available_cpus, self.lru_workspace_threads,
+            configured_threads,
+            available_cpus,
+            self.lru_workspace_threads,
         )
 
         self._warmup_external_lru_planner_threads()
@@ -1994,12 +2023,17 @@ class SparseKVOffloadManager:
                     "external FSA plan requires an NPU staging buffer when "
                     "planner and operator membership storage are separate"
                 )
-            self.tp_group.broadcast(device_staging, src=0)
             device_plan_storage = device_staging[:num_tokens, :plan_width]
             plan_storage.copy_(
                 device_plan_storage,
                 non_blocking=non_blocking,
             )
+
+        broadcast_buffer = self.fused_plan_metadata_npu
+        if self._requires_fused_membership_staging():
+            broadcast_buffer = self.fused_plan_broadcast_buffer
+            if broadcast_buffer is None:
+                raise RuntimeError("Mooncake external FSA plan requires a preallocated broadcast buffer")
         async_plan = capturing or self.fused_async_plan
 
         owner_layer_id = self.fused_overlap_plan_owner_layer_id
@@ -2087,7 +2121,7 @@ class SparseKVOffloadManager:
                     stage_plan(non_blocking=True)
                     if capturing and self.tp_size > 1:
                         self.fused_plan_stream.wait_stream(self.current_kv_save_stream)
-                self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+                self.tp_group.broadcast(broadcast_buffer, src=0)
                 publish_staged_plan(non_blocking=True)
             torch_npu.npu.current_stream().wait_stream(self.fused_plan_stream)
             self.fused_overlap_plan_owner_layer_id = layer_id
@@ -2111,7 +2145,7 @@ class SparseKVOffloadManager:
             except Exception as exc:
                 planner_error = exc
                 self.fused_plan_status_npu.fill_(1)
-        self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+        self.tp_group.broadcast(broadcast_buffer, src=0)
         if int(self.fused_plan_status_npu.item()) != 0:
             detail = (
                 f"{type(planner_error).__name__}: {planner_error}"
