@@ -469,6 +469,10 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
         manager.fused_overlap_membership_map = membership
         manager.fused_overlap_planner_membership_map = planner
         manager.fused_overlap_membership_plan_device_staging = device_staging
+        manager.fused_plan_broadcast_buffer = MagicMock()
+        manager.fused_plan_metadata_npu = MagicMock()
+        manager.fused_plan_status_npu = MagicMock()
+        manager.fused_plan_current_linear_slots_npu = MagicMock()
         manager._host_kv_allocator = None
 
         manager.close()
@@ -476,6 +480,10 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
         self.assertIsNone(manager.fused_overlap_membership_map)
         self.assertIsNone(manager.fused_overlap_planner_membership_map)
         self.assertIsNone(manager.fused_overlap_membership_plan_device_staging)
+        self.assertIsNone(manager.fused_plan_broadcast_buffer)
+        self.assertIsNone(manager.fused_plan_metadata_npu)
+        self.assertIsNone(manager.fused_plan_status_npu)
+        self.assertIsNone(manager.fused_plan_current_linear_slots_npu)
 
     def test_manager_rejects_pool_larger_than_dram_limit(self):
         vllm_config, kv_cache_config, offload_config = _make_manager_init_inputs()

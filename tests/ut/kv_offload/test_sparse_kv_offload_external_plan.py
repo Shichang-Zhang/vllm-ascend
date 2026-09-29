@@ -57,6 +57,7 @@ def _make_plan_manager():
     manager.fused_overlap_membership_map_rows = 0
     manager.fused_overlap_planner_membership_map = None
     manager.fused_overlap_membership_plan_device_staging = None
+    manager.fused_plan_broadcast_buffer = None
     manager._host_kv_allocator = None
     manager.fused_overlap_plan_owner_layer_id = None
     manager.fused_overlap_plan_topk = None
@@ -173,6 +174,112 @@ def _enable_mooncake_membership_staging(manager):
     return allocator
 
 
+@pytest.mark.parametrize("topk", [3, 4])
+def test_combined_plan_buffer_preserves_metadata_and_int16_bits(topk):
+    manager = _make_plan_manager()
+    manager.topk = topk
+    metadata = torch.tensor([0, 65537, 131079, -1, 2147483647], dtype=torch.int32)
+    manager.fused_plan_metadata_npu.copy_(metadata)
+    manager._allocate_fused_plan_staging(3, torch.device("cpu"))
+    plan = manager.fused_overlap_membership_plan_device_staging
+    plan.copy_(torch.arange(plan.numel(), dtype=torch.int16).view_as(plan) - 16000)
+    payload = manager.fused_plan_broadcast_buffer
+    assert payload.dtype == torch.int32
+    assert payload.is_contiguous()
+    assert plan.is_contiguous()
+    assert plan.data_ptr() == payload.data_ptr() + metadata.nbytes
+    assert payload.nbytes >= metadata.nbytes + plan.nbytes
+    assert payload.nbytes - metadata.nbytes - plan.nbytes < torch.int32.itemsize
+    torch.testing.assert_close(manager.fused_plan_metadata_npu, metadata)
+
+    peer = _make_plan_manager()
+    peer.topk = topk
+    peer._allocate_fused_plan_staging(3, torch.device("cpu"))
+    peer.fused_plan_broadcast_buffer.copy_(payload)
+    torch.testing.assert_close(peer.fused_plan_metadata_npu, metadata)
+    torch.testing.assert_close(peer.fused_overlap_membership_plan_device_staging, plan)
+    peer.fused_plan_status_npu.fill_(1)
+    assert peer.fused_plan_broadcast_buffer[0] == 1
+    torch.testing.assert_close(peer.fused_plan_current_linear_slots_npu, metadata[1:])
+
+
+@pytest.mark.parametrize("mode", ["eager", "async", "capture", "failure"])
+def test_combined_plan_broadcast_publishes_to_each_rank(mode):
+    # Simulate the same collective on two ranks, including failed TP0 planning.
+    payloads = []
+    for rank in (0, 1):
+        manager = _make_plan_manager()
+        manager.tp_rank = rank
+        manager.tp_size = 2
+        manager.fused_async_plan = mode == "async"
+        manager.fused_plan_stream = MagicMock()
+        manager.current_kv_save_stream = MagicMock()
+        _enable_mooncake_membership_staging(manager)
+        manager._allocate_fused_plan_staging(4, torch.device("cpu"))
+        plan = manager.fused_overlap_membership_plan_device_staging
+        planner_storage = torch.full_like(plan, -12345)
+        manager.fused_overlap_planner_membership_map = planner_storage if rank == 0 else None
+        manager.lru_physical_row_workspace[8:10] = torch.tensor([65537, 131079])
+        membership = torch.full((4, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT), -1, dtype=torch.int16)
+        manager.fused_overlap_membership_map = membership
+        if mode == "failure":
+            manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows.side_effect = ValueError(
+                "bad plan"
+            )
+
+        def broadcast(buffer, src, *, rank=rank, manager=manager):
+            assert src == 0
+            assert buffer is manager.fused_plan_broadcast_buffer
+            if rank == 0:
+                if mode == "capture":
+                    manager.fused_plan_stream.wait_stream.assert_called_once_with(manager.current_kv_save_stream)
+                payloads.append(buffer.clone())
+            else:
+                buffer.copy_(payloads[0])
+
+        manager.tp_group.broadcast.side_effect = broadcast
+        stream = MagicMock()
+        expected_error = (
+            pytest.raises(RuntimeError, match="external planner failed") if mode == "failure" else nullcontext()
+        )
+        with (
+            patch.object(manager_module.torch_npu.npu, "current_stream", return_value=stream),
+            patch.object(manager_module.torch_npu.npu, "stream", side_effect=lambda _: nullcontext()),
+            patch.object(torch.Tensor, "record_stream"),
+            patch.object(torch.Tensor, "item", side_effect=AssertionError("unexpected host value read"))
+            if mode in ("async", "capture")
+            else nullcontext(),
+            expected_error,
+        ):
+            manager.prepare_fused_overlap_external_plan(
+                "layer.0",
+                2,
+                torch.zeros((2, 4), dtype=torch.int32),
+                torch.tensor([101, 202]),
+                torch.tensor([10, 20], dtype=torch.int32),
+                torch.tensor([11, 21], dtype=torch.int32),
+                membership,
+                capturing=mode == "capture",
+            )
+        manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_broadcast_buffer, src=0)
+        if mode == "failure":
+            assert manager.fused_plan_status_npu.item() == 1
+            assert manager.fused_overlap_plan_owner_layer_id is None
+            assert torch.all(membership == -1)
+        else:
+            start = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT - manager.topk
+            torch.testing.assert_close(membership[:2, start : start + plan.shape[1]], planner_storage[:2])
+            torch.testing.assert_close(
+                manager.fused_plan_current_linear_slots_npu[:2], torch.tensor([65537, 131079], dtype=torch.int32)
+            )
+            assert torch.all(membership[2:] == -1)
+        if mode in ("async", "capture"):
+            stream.wait_stream.assert_called_once_with(manager.fused_plan_stream)
+        if rank == 1:
+            manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows.assert_not_called()
+            manager.sparse_kv_offload_cpp.enqueue_lru_resident_compact_with_plan_stable_rows.assert_not_called()
+
+
 def test_empty_aligned_swapped_tensor_returns_aligned_view():
     raw_tensors = []
 
@@ -225,7 +332,9 @@ def test_mooncake_membership_uses_per_rank_swapped_storage_and_staging(
     manager.fused_overlap_membership_map_rows = 0
     manager.fused_overlap_planner_membership_map = None
     manager.fused_overlap_membership_plan_device_staging = None
+    manager.fused_plan_broadcast_buffer = None
     _enable_mooncake_membership_staging(manager)
+    manager.fused_plan_metadata_npu = torch.zeros(4, dtype=torch.int32)
     swapped_membership = torch.empty(
         (3, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT),
         dtype=torch.int16,
@@ -294,10 +403,7 @@ def test_mooncake_eager_external_plan_publishes_through_npu_staging():
     )
     manager.fused_overlap_membership_map = membership
     manager.fused_overlap_planner_membership_map = planner_membership
-    manager.fused_overlap_membership_plan_device_staging = torch.empty(
-        (4, plan_width),
-        dtype=torch.int16,
-    )
+    manager._allocate_fused_plan_staging(4, torch.device("cpu"))
     sparse_kv_ops = SimpleNamespace(
         sparse_kv_lru_resident_compact_with_plan_stable_rows=(
             manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows
@@ -335,10 +441,7 @@ def test_mooncake_eager_external_plan_publishes_through_npu_staging():
     planner = sparse_kv_ops.sparse_kv_lru_resident_compact_with_plan_stable_rows
     assert planner.call_args.args[17] == planner_membership[:2].data_ptr()
     assert planner.call_args.args[18] == plan_width
-    assert manager.tp_group.broadcast.call_args_list == [
-        ((manager.fused_plan_metadata_npu,), {"src": 0}),
-        ((manager.fused_overlap_membership_plan_device_staging,), {"src": 0}),
-    ]
+    manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_broadcast_buffer, src=0)
 
 
 def test_non_tp0_mooncake_plan_does_not_require_cpu_planner_storage():
@@ -353,11 +456,8 @@ def test_non_tp0_mooncake_plan_does_not_require_cpu_planner_storage():
     manager.fused_overlap_membership_map = membership
     manager.fused_overlap_planner_membership_map = None
     plan_width = manager.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
-    manager.fused_overlap_membership_plan_device_staging = torch.full(
-        (4, plan_width),
-        9,
-        dtype=torch.int16,
-    )
+    manager._allocate_fused_plan_staging(4, torch.device("cpu"))
+    manager.fused_overlap_membership_plan_device_staging.fill_(9)
     sparse_kv_ops = SimpleNamespace(
         sparse_kv_lru_resident_compact_with_plan_stable_rows=(
             manager.sparse_kv_offload_cpp.lru_resident_compact_with_plan_stable_rows
@@ -381,10 +481,7 @@ def test_non_tp0_mooncake_plan_does_not_require_cpu_planner_storage():
 
     (sparse_kv_ops.sparse_kv_lru_resident_compact_with_plan_stable_rows.assert_not_called())
     (sparse_kv_ops.sparse_kv_enqueue_lru_resident_compact_with_plan_stable_rows.assert_not_called())
-    assert manager.tp_group.broadcast.call_args_list == [
-        ((manager.fused_plan_metadata_npu,), {"src": 0}),
-        ((manager.fused_overlap_membership_plan_device_staging,), {"src": 0}),
-    ]
+    manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_broadcast_buffer, src=0)
     plan_start = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT - manager.topk
     torch.testing.assert_close(
         membership[:1, plan_start : plan_start + plan_width],
@@ -511,10 +608,7 @@ def test_capture_external_plan_side_stream_and_mooncake_writeback_wait():
     _enable_mooncake_membership_staging(manager)
     manager.fused_overlap_membership_map = membership
     manager.fused_overlap_planner_membership_map = planner_membership
-    manager.fused_overlap_membership_plan_device_staging = torch.empty(
-        (4, plan_width),
-        dtype=torch.int16,
-    )
+    manager._allocate_fused_plan_staging(4, torch.device("cpu"))
     topk = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
     req_ids = torch.tensor([101], dtype=torch.int64)
     stable_prefix_lens = torch.tensor([10], dtype=torch.int32)
@@ -566,10 +660,7 @@ def test_capture_external_plan_side_stream_and_mooncake_writeback_wait():
     planner.assert_called_once()
     assert planner.call_args.args[17] == planner_membership[:1].data_ptr()
     assert planner.call_args.args[18] == plan_width
-    assert manager.tp_group.broadcast.call_args_list == [
-        ((manager.fused_plan_metadata_npu,), {"src": 0}),
-        ((manager.fused_overlap_membership_plan_device_staging,), {"src": 0}),
-    ]
+    manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_broadcast_buffer, src=0)
     current_stream.wait_stream.assert_any_call(manager.fused_plan_stream)
     current_stream.wait_stream.assert_any_call(manager.current_kv_save_stream)
     assert manager.current_kv_by_layer[0][0].numel() == 1
