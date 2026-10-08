@@ -123,41 +123,38 @@ def test_graph_mooncake_index_copy_runs_on_save_stream():
     manager.token_size_bytes_k = 2 * torch.bfloat16.itemsize
     manager.token_size_bytes_v = torch.bfloat16.itemsize
     manager.max_d2h_index_copy_tokens = 4
-    manager.d2h_slot_mapping_cpu = torch.zeros(4, dtype=torch.int64)
-    manager.d2h_src_idx_cpu = torch.zeros(4, dtype=torch.int64)
-    manager.d2h_dst_idx_cpu = torch.zeros(4, dtype=torch.int64)
-    manager.d2h_index_count_cpu = torch.zeros(1, dtype=torch.int32)
     manager.d2h_src_idx_npu = torch.zeros(4, dtype=torch.int64)
     manager.d2h_dst_idx_npu = torch.zeros(4, dtype=torch.int64)
     manager.d2h_index_count_npu = torch.zeros(1, dtype=torch.int32)
+    manager.d2h_index_chunk_src_npu = torch.zeros(4, dtype=torch.int64)
+    manager.d2h_index_chunk_dst_npu = torch.zeros(4, dtype=torch.int64)
+    manager.d2h_index_chunk_count_npu = torch.zeros(4, dtype=torch.int32)
     manager.current_kv_save_stream = MagicMock()
     current_stream = MagicMock()
-    descriptors_ready = object()
-    current_stream.record_event.return_value = descriptors_ready
+    current_kv_ready = object()
+    current_stream.record_event.return_value = current_kv_ready
 
-    def enqueue_descriptors(
-        slot_mapping,
-        num_actual_tokens,
-        max_num_tokens,
-        num_host_slots,
-        src_idx,
-        dst_idx,
+    def build_descriptors(
+        slots,
+        sources,
+        destinations,
         count,
+        chunk_sources,
+        chunk_destinations,
+        chunk_counts,
+        host_capacity,
     ):
-        assert slot_mapping[0].item() == 2
-        assert num_actual_tokens == 1
-        assert max_num_tokens == 4
-        assert num_host_slots == 4
-        src_idx.zero_()
-        dst_idx.fill_(2)
+        assert slots[0].item() == 2
+        assert host_capacity == 4
+        assert chunk_sources is manager.d2h_index_chunk_src_npu
+        assert chunk_destinations is manager.d2h_index_chunk_dst_npu
+        assert chunk_counts is manager.d2h_index_chunk_count_npu
+        sources.zero_()
+        destinations.fill_(2)
         count.fill_(1)
 
-    sparse_kv_ops = SimpleNamespace(
-        enqueue_current_kv_index_copy_descriptors=MagicMock(
-            side_effect=enqueue_descriptors,
-        ),
-    )
-    manager.sparse_kv_offload_cpp = sparse_kv_ops
+    descriptor_builder = MagicMock(side_effect=build_descriptors)
+    manager.fused_index_copy_descriptor_builder = descriptor_builder
     host_k = torch.zeros((4, 2), dtype=torch.bfloat16)
     host_v = torch.zeros((4, 1), dtype=torch.bfloat16)
     current_k = torch.tensor([[1, 2]], dtype=torch.bfloat16)
@@ -185,9 +182,9 @@ def test_graph_mooncake_index_copy_runs_on_save_stream():
     assert torch.equal(host_v[2], current_v[0])
     current_stream.record_event.assert_called_once_with()
     manager.current_kv_save_stream.wait_event.assert_called_once_with(
-        descriptors_ready
+        current_kv_ready
     )
-    sparse_kv_ops.enqueue_current_kv_index_copy_descriptors.assert_called_once()
+    descriptor_builder.assert_called_once()
 
 
 def test_graph_mooncake_prepares_descriptors_on_first_layer_only():
