@@ -1043,42 +1043,29 @@ class SparseKVOffloadManager:
             self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
             if self._uses_mooncake_host_pool() and self.tp_rank == 0:
-                self.d2h_slot_mapping_cpu = torch.zeros(
+                self.d2h_src_idx_npu = torch.empty(
                     self.max_d2h_index_copy_tokens,
                     dtype=torch.int64,
-                    device="cpu",
-                    pin_memory=True,
+                    device=device,
                 )
-                self.d2h_src_idx_cpu = torch.zeros(
+                self.d2h_dst_idx_npu = torch.empty(
                     self.max_d2h_index_copy_tokens,
                     dtype=torch.int64,
-                    device="cpu",
-                    pin_memory=True,
+                    device=device,
                 )
-                self.d2h_dst_idx_cpu = torch.zeros(
-                    self.max_d2h_index_copy_tokens,
-                    dtype=torch.int64,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                self.d2h_index_count_cpu = torch.zeros(
+                self.d2h_index_count_npu = torch.empty(
                     1,
                     dtype=torch.int32,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                self.d2h_src_idx_npu = torch.zeros(
-                    self.max_d2h_index_copy_tokens,
-                    dtype=torch.int64,
                     device=device,
                 )
-                self.d2h_dst_idx_npu = torch.zeros(
-                    self.max_d2h_index_copy_tokens,
-                    dtype=torch.int64,
-                    device=device,
+                self.d2h_index_chunk_src_npu = torch.empty_like(
+                    self.d2h_src_idx_npu
                 )
-                self.d2h_index_count_npu = torch.zeros(
-                    1,
+                self.d2h_index_chunk_dst_npu = torch.empty_like(
+                    self.d2h_dst_idx_npu
+                )
+                self.d2h_index_chunk_count_npu = torch.empty(
+                    self.max_d2h_index_copy_tokens,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1086,6 +1073,7 @@ class SparseKVOffloadManager:
         self.d2h_token_indices_npu = torch.arange(self.max_num_tokens, dtype=torch.int64, device=device)
 
         self._initialize_fused_writeback_descriptors()
+        self._initialize_mooncake_index_copy_descriptors()
         self._initialize_paired_current_scatter()
         pages_per_row = self.topk_buffer_size // self.block_size
         self.current_slots_npu = torch.empty(
@@ -1417,6 +1405,25 @@ class SparseKVOffloadManager:
         self.fused_writeback_descriptor_builder = build_writeback_descriptors
         self.fused_reuse_writeback_layout = False
 
+    def _initialize_mooncake_index_copy_descriptors(self) -> None:
+        self.fused_index_copy_descriptor_builder = None
+        if (
+            not self.use_fused_overlap
+            or self.tp_rank != 0
+            or self.max_d2h_index_copy_tokens == 0
+            or not self._uses_mooncake_host_pool()
+        ):
+            return
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.index_copy_descriptors import (
+            build_index_copy_descriptors,
+            warmup_index_copy_descriptors,
+        )
+
+        warmup_index_copy_descriptors(self)
+        self.fused_index_copy_descriptor_builder = (
+            build_index_copy_descriptors
+        )
+
     def offload_new_kv(
         self,
         layer_name: str,
@@ -1660,39 +1667,6 @@ class SparseKVOffloadManager:
         if result not in (None, 0):
             raise RuntimeError(f"memfabric D2H sparse_copy failed with result={result}")
 
-    def _prepare_current_kv_index_copy_descriptors(
-        self,
-        *,
-        slots: torch.Tensor,
-        token_count: int,
-        num_slots: int,
-    ) -> None:
-        self.d2h_slot_mapping_cpu[:token_count].copy_(
-            slots,
-            non_blocking=True,
-        )
-        self.sparse_kv_offload_cpp.enqueue_current_kv_index_copy_descriptors(
-            self.d2h_slot_mapping_cpu,
-            token_count,
-            self.max_d2h_index_copy_tokens,
-            num_slots,
-            self.d2h_src_idx_cpu,
-            self.d2h_dst_idx_cpu,
-            self.d2h_index_count_cpu,
-        )
-        self.d2h_src_idx_npu.copy_(
-            self.d2h_src_idx_cpu,
-            non_blocking=True,
-        )
-        self.d2h_dst_idx_npu.copy_(
-            self.d2h_dst_idx_cpu,
-            non_blocking=True,
-        )
-        self.d2h_index_count_npu.copy_(
-            self.d2h_index_count_cpu,
-            non_blocking=True,
-        )
-
     def _offload_new_kv_via_index_copy(
         self,
         *,
@@ -1737,15 +1711,30 @@ class SparseKVOffloadManager:
             raise ValueError("Mooncake Host K/V pools have incompatible token capacities")
 
         if capturing:
-            if prepare_descriptors:
-                self._prepare_current_kv_index_copy_descriptors(
-                    slots=slots,
-                    token_count=token_count,
-                    num_slots=num_slots,
-                )
             current_kv_ready = torch_npu.npu.current_stream().record_event()
             with torch_npu.npu.stream(self.current_kv_save_stream):
                 self.current_kv_save_stream.wait_event(current_kv_ready)
+                if prepare_descriptors:
+                    descriptor_builder = getattr(
+                        self,
+                        "fused_index_copy_descriptor_builder",
+                        None,
+                    )
+                    if descriptor_builder is None:
+                        raise RuntimeError(
+                            "Mooncake graph writeback requires the NPU "
+                            "index_copy descriptor builder"
+                        )
+                    descriptor_builder(
+                        slots,
+                        self.d2h_src_idx_npu,
+                        self.d2h_dst_idx_npu,
+                        self.d2h_index_count_npu,
+                        self.d2h_index_chunk_src_npu,
+                        self.d2h_index_chunk_dst_npu,
+                        self.d2h_index_chunk_count_npu,
+                        num_slots,
+                    )
                 flat_host_k.index_copy_(
                     0,
                     self.d2h_dst_idx_npu,
