@@ -139,6 +139,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "store_kv_block_metadata"
         "sparse_attention_score"
         "fused_sparse_attention_overlap"
+        "fused_lightning_indexer_manage"
+        "fused_scatter_copy_sparse_flash_attention"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -196,6 +198,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "store_kv_block_metadata"
         "sparse_attention_score"
         "fused_sparse_attention_overlap"
+        "fused_lightning_indexer_manage"
+        "fused_scatter_copy_sparse_flash_attention"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
