@@ -239,6 +239,14 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
             200 * 2048 + alignment_reserve,
         )
 
+        self.assertEqual(
+            get_sparse_kv_offload_cpu_pool_size_bytes(
+                kv_cache_config,
+                include_mooncake_writeback_sinks=True,
+            ),
+            200 * 2048 + alignment_reserve + 2 * (1024 // 128),
+        )
+
     def test_cpu_pool_size_supports_uniform_specs(self):
         specs, _, alignment_reserve = _make_memory_plan_inputs()
         uniform_specs = UniformTypeKVCacheSpecs(
@@ -679,10 +687,7 @@ class TestHostBackendSelection(unittest.TestCase):
             manager.allocate_host_kv_tensors([128, 64], 32)
 
     def test_allocate_host_kv_tensors_delegates_to_allocator(self):
-        mooncake = MagicMock()
-        mooncake.allocate_tensors.return_value = [MagicMock()]
         cases = [
-            ("mooncake", mooncake),
             ("memfabric_rank0", manager_module.MemFabricHostKVAllocator(0)),
             ("memfabric_rank1", manager_module.MemFabricHostKVAllocator(1)),
         ]
@@ -696,14 +701,49 @@ class TestHostBackendSelection(unittest.TestCase):
                     return_value=[MagicMock(), MagicMock()],
                 ) as helper:
                     tensors = manager.allocate_host_kv_tensors([128, 64], 32)
-                if name == "mooncake":
-                    self.assertIs(tensors, mooncake.allocate_tensors.return_value)
-                    helper.assert_not_called()
-                elif name == "memfabric_rank0":
+                if name == "memfabric_rank0":
                     self.assertIs(tensors, helper.return_value)
                 else:
                     self.assertEqual(tensors, [None, None])
                     helper.assert_not_called()
+
+    def test_mooncake_allocation_adds_one_private_sink_row(self):
+        pool = MooncakeHostPool(
+            HostMemoryRegion(torch.empty(128, dtype=torch.int8), handle=None),
+            HostPoolTopology(tp_rank=0, tp_size=1),
+        )
+        manager = object.__new__(SparseKVOffloadManager)
+        manager._host_kv_allocator = pool
+        manager.kv_cache_config = SimpleNamespace(num_blocks=2)
+        manager.block_size = 4
+        manager._mooncake_writeback_raw_views = {}
+
+        logical_k_raw, logical_v_raw = manager.allocate_host_kv_tensors(
+            [32, 16],
+            alignment=1,
+        )
+
+        self.assertEqual(logical_k_raw.numel(), 32)
+        self.assertEqual(logical_v_raw.numel(), 16)
+        physical_k = manager._mooncake_writeback_raw_views[
+            logical_k_raw.data_ptr()
+        ]
+        physical_v = manager._mooncake_writeback_raw_views[
+            logical_v_raw.data_ptr()
+        ]
+        self.assertEqual(physical_k.numel(), 36)
+        self.assertEqual(physical_v.numel(), 18)
+
+        logical_k = logical_k_raw.view(torch.bfloat16).view(8, 2)
+        logical_v = logical_v_raw.view(torch.bfloat16).view(8, 1)
+        self.assertEqual(
+            manager._get_mooncake_writeback_view(logical_k, 2).shape,
+            (9, 2),
+        )
+        self.assertEqual(
+            manager._get_mooncake_writeback_view(logical_v, 1).shape,
+            (9, 1),
+        )
 
     def test_close_releases_mooncake_region_via_manager(self):
         release_callback = MagicMock()
@@ -834,6 +874,7 @@ class TestRegisterKvCachesBackendBranch(unittest.TestCase):
                 return_value=(0, 128, (("host.0", "k", 0),))
             )
             manager._host_kv_allocator = allocator
+            manager._get_mooncake_writeback_view = MagicMock()
         manager._register_offload_layers = MagicMock()
         manager.offload_layer_names = ["host.0"]
         manager.layer_name_to_offload_id = {"host.0": 0}
@@ -846,6 +887,7 @@ class TestRegisterKvCachesBackendBranch(unittest.TestCase):
         manager.max_num_tokens = 4
         manager.max_num_topk_rows = 4
         manager.max_model_len = 1024
+        manager.sparse_kv_offload_config = SimpleNamespace(lru_max_threads=8)
         manager.use_fused_overlap = False
         manager.tp_rank = 1
         manager.tp_group = MagicMock()
@@ -876,6 +918,7 @@ class TestRegisterKvCachesBackendBranch(unittest.TestCase):
         self.assertEqual(len(manager.k_caches_cpu), 1)
         self.assertEqual(manager.gvas_k_bases, [k_cpu.data_ptr()])
         self.assertEqual(manager.gvas_v_bases, [v_cpu.data_ptr()])
+        self.assertEqual(manager._get_mooncake_writeback_view.call_count, 2)
 
     def test_register_kv_caches_broadcasts_with_memfabric_backend(self):
         manager, kv_caches = self._make_register_caches_manager("memfabric", None, None)

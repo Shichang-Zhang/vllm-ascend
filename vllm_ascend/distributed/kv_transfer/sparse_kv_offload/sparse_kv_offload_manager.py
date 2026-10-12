@@ -314,6 +314,8 @@ def plan_sparse_kv_offload_memory(
 
 def get_sparse_kv_offload_cpu_pool_size_bytes(
     kv_cache_config: KVCacheConfig,
+    *,
+    include_mooncake_writeback_sinks: bool = False,
 ) -> int:
     """Return a safe upper bound for aligned host KV allocations."""
     layer_specs: dict[str, KVCacheSpec] = {}
@@ -327,7 +329,12 @@ def get_sparse_kv_offload_cpu_pool_size_bytes(
         raise ValueError("Sparse KV offload requires host-resident KV cache specs")
     raw_host_bytes = kv_cache_config.num_blocks * sum(spec.page_size_bytes for spec in host_specs)
     alignment_reserve_bytes = len(host_specs) * _CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
-    return raw_host_bytes + alignment_reserve_bytes
+    writeback_sink_bytes = (
+        sum(spec.page_size_bytes // spec.block_size for spec in host_specs)
+        if include_mooncake_writeback_sinks
+        else 0
+    )
+    return raw_host_bytes + alignment_reserve_bytes + writeback_sink_bytes
 
 
 def allocate_kv_cache_tensors_for_sparse_kv_offload(
@@ -554,7 +561,10 @@ class SparseKVOffloadManager:
         self._build_cpp()
 
         dram_limit_bytes = int(sparse_kv_offload_config.dram_size_per_dp_GB * (1 << 30))
-        planned_pool_size_bytes = get_sparse_kv_offload_cpu_pool_size_bytes(kv_cache_config)
+        planned_pool_size_bytes = get_sparse_kv_offload_cpu_pool_size_bytes(
+            kv_cache_config,
+            include_mooncake_writeback_sinks=self.host_backend == "mooncake",
+        )
         if planned_pool_size_bytes > dram_limit_bytes:
             raise ValueError(
                 "Sparse KV offload planned CPU pool exceeds DRAM limit after "
@@ -569,6 +579,8 @@ class SparseKVOffloadManager:
         )
         self._host_kv_allocator: HostKVAllocator | None = None
         self._host_allocation_prepared = False
+        self._mooncake_writeback_raw_views: dict[int, torch.Tensor] = {}
+        self._mooncake_writeback_views: dict[int, torch.Tensor] = {}
         logger.info(
             "SparseKVOffloadManager starts CPU KV pool initialization: "
             "planned=%.2f GiB, configured_limit=%s GiB, num_blocks=%s.",
@@ -636,7 +648,42 @@ class SparseKVOffloadManager:
         allocator = self._host_kv_allocator
         if allocator is None:
             raise RuntimeError("prepare_host_kv_allocation must run before Host KV allocation")
-        return allocator.allocate_tensors(sizes, alignment)
+        if not isinstance(allocator, MooncakeHostPool):
+            return allocator.allocate_tensors(sizes, alignment)
+
+        logical_token_capacity = self.kv_cache_config.num_blocks * self.block_size
+        if logical_token_capacity <= 0:
+            raise ValueError(
+                "Mooncake Host-KV logical token capacity must be positive"
+            )
+        sink_sizes: list[int] = []
+        for size in sizes:
+            if size <= 0 or size % logical_token_capacity != 0:
+                raise ValueError(
+                    "Mooncake Host-KV allocation cannot derive one-token "
+                    f"sink size: size={size}, capacity={logical_token_capacity}"
+                )
+            sink_sizes.append(size // logical_token_capacity)
+
+        physical_sizes = [
+            size + sink_size
+            for size, sink_size in zip(sizes, sink_sizes, strict=True)
+        ]
+        physical_tensors = allocator.allocate_tensors(physical_sizes, alignment)
+        logical_tensors: list[torch.Tensor] = []
+        registry = getattr(self, "_mooncake_writeback_raw_views", None)
+        if registry is None:
+            registry = {}
+            self._mooncake_writeback_raw_views = registry
+        for logical_size, physical_tensor in zip(
+            sizes,
+            physical_tensors,
+            strict=True,
+        ):
+            logical_tensor = physical_tensor.narrow(0, 0, logical_size)
+            registry[int(logical_tensor.data_ptr())] = physical_tensor
+            logical_tensors.append(logical_tensor)
+        return logical_tensors
 
     def _uses_mooncake_host_pool(self) -> bool:
         return isinstance(
@@ -650,6 +697,50 @@ class SparseKVOffloadManager:
         if not isinstance(allocator, MooncakeHostPool):
             raise RuntimeError("Sparse KV offload is not using the Mooncake Host backend")
         return allocator
+
+    def _get_mooncake_writeback_view(
+        self,
+        logical_tensor: torch.Tensor,
+        token_dim: int,
+    ) -> torch.Tensor:
+        """Return the logical Host-KV rows plus one private sink row."""
+        logical_ptr = int(logical_tensor.data_ptr())
+        cached_views = getattr(self, "_mooncake_writeback_views", {})
+        cached = cached_views.get(logical_ptr)
+        if cached is not None:
+            return cached
+        registry = getattr(self, "_mooncake_writeback_raw_views", {})
+        physical_raw = registry.get(logical_ptr)
+        if physical_raw is None:
+            raise RuntimeError(
+                "Mooncake Host-KV writeback storage is not registered"
+            )
+        if token_dim <= 0 or logical_tensor.numel() % token_dim != 0:
+            raise ValueError(
+                "Mooncake Host-KV tensor has an invalid token-row layout"
+            )
+        logical_rows = logical_tensor.numel() // token_dim
+        expected_bytes = (
+            logical_tensor.numel() + token_dim
+        ) * logical_tensor.element_size()
+        if physical_raw.numel() != expected_bytes:
+            raise RuntimeError(
+                "Mooncake Host-KV writeback storage has an unexpected size: "
+                f"expected={expected_bytes}, actual={physical_raw.numel()}"
+            )
+        writeback = physical_raw.view(logical_tensor.dtype).view(
+            logical_rows + 1,
+            token_dim,
+        )
+        if int(writeback.data_ptr()) != logical_ptr:
+            raise RuntimeError(
+                "Mooncake Host-KV logical and writeback views do not share "
+                "the same base address"
+            )
+        if not hasattr(self, "_mooncake_writeback_views"):
+            self._mooncake_writeback_views = {}
+        self._mooncake_writeback_views[logical_ptr] = writeback
+        return writeback
 
     def _requires_fused_membership_staging(self) -> bool:
         """Whether the active Host allocator needs a CPU planner bridge."""
@@ -668,6 +759,12 @@ class SparseKVOffloadManager:
         if allocator is not None:
             allocator.close()
             self._host_kv_allocator = None
+        registry = getattr(self, "_mooncake_writeback_raw_views", None)
+        if registry is not None:
+            registry.clear()
+        views = getattr(self, "_mooncake_writeback_views", None)
+        if views is not None:
+            views.clear()
 
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
@@ -1013,6 +1110,16 @@ class SparseKVOffloadManager:
             )
         self.token_size_bytes_k = kv_head_num * head_dim_k * dtype.itemsize
         self.token_size_bytes_v = kv_head_num * head_dim_v * dtype.itemsize
+        if self._uses_mooncake_host_pool():
+            token_dim_k = self.token_size_bytes_k // dtype.itemsize
+            token_dim_v = self.token_size_bytes_v // dtype.itemsize
+            for k_cache_cpu, v_cache_cpu in zip(
+                self.k_caches_cpu,
+                self.v_caches_cpu,
+                strict=True,
+            ):
+                self._get_mooncake_writeback_view(k_cache_cpu, token_dim_k)
+                self._get_mooncake_writeback_view(v_cache_cpu, token_dim_v)
         if self.topk_buffer_size % self.block_size != 0:
             raise ValueError(
                 "Sparse KV offload topk_buffer_size must be divisible by "
@@ -1043,30 +1150,9 @@ class SparseKVOffloadManager:
             self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
             if self._uses_mooncake_host_pool() and self.tp_rank == 0:
-                self.d2h_src_idx_npu = torch.empty(
-                    self.max_d2h_index_copy_tokens,
-                    dtype=torch.int64,
-                    device=device,
-                )
                 self.d2h_dst_idx_npu = torch.empty(
                     self.max_d2h_index_copy_tokens,
                     dtype=torch.int64,
-                    device=device,
-                )
-                self.d2h_index_count_npu = torch.empty(
-                    1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                self.d2h_index_chunk_src_npu = torch.empty_like(
-                    self.d2h_src_idx_npu
-                )
-                self.d2h_index_chunk_dst_npu = torch.empty_like(
-                    self.d2h_dst_idx_npu
-                )
-                self.d2h_index_chunk_count_npu = torch.empty(
-                    self.max_d2h_index_copy_tokens,
-                    dtype=torch.int32,
                     device=device,
                 )
         self.d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
@@ -1415,13 +1501,13 @@ class SparseKVOffloadManager:
         ):
             return
         from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.index_copy_descriptors import (
-            build_index_copy_descriptors,
-            warmup_index_copy_descriptors,
+            build_index_copy_destinations,
+            warmup_index_copy_destinations,
         )
 
-        warmup_index_copy_descriptors(self)
+        warmup_index_copy_destinations(self)
         self.fused_index_copy_descriptor_builder = (
-            build_index_copy_descriptors
+            build_index_copy_destinations
         )
 
     def offload_new_kv(
@@ -1709,6 +1795,22 @@ class SparseKVOffloadManager:
         num_slots = flat_host_k.shape[0]
         if num_slots != flat_host_v.shape[0] or num_slots <= 0:
             raise ValueError("Mooncake Host K/V pools have incompatible token capacities")
+        writeback_host_k = self._get_mooncake_writeback_view(
+            k_cache_cpu,
+            token_dim_k,
+        )
+        writeback_host_v = self._get_mooncake_writeback_view(
+            v_cache_cpu,
+            token_dim_v,
+        )
+        if (
+            writeback_host_k.shape[0] != num_slots + 1
+            or writeback_host_v.shape[0] != num_slots + 1
+        ):
+            raise RuntimeError(
+                "Mooncake Host K/V writeback views must contain exactly "
+                "one private sink row"
+            )
 
         if capturing:
             current_kv_ready = torch_npu.npu.current_stream().record_event()
@@ -1727,40 +1829,33 @@ class SparseKVOffloadManager:
                         )
                     descriptor_builder(
                         slots,
-                        self.d2h_src_idx_npu,
                         self.d2h_dst_idx_npu,
-                        self.d2h_index_count_npu,
-                        self.d2h_index_chunk_src_npu,
-                        self.d2h_index_chunk_dst_npu,
-                        self.d2h_index_chunk_count_npu,
                         num_slots,
                     )
-                flat_host_k.index_copy_(
+                destinations = self.d2h_dst_idx_npu[:token_count]
+                writeback_host_k.index_copy_(
                     0,
-                    self.d2h_dst_idx_npu,
-                    k_rows.index_select(0, self.d2h_src_idx_npu),
+                    destinations,
+                    k_rows,
                 )
-                flat_host_v.index_copy_(
+                writeback_host_v.index_copy_(
                     0,
-                    self.d2h_dst_idx_npu,
-                    v_rows.index_select(0, self.d2h_src_idx_npu),
+                    destinations,
+                    v_rows,
                 )
             return
 
         valid = (slots >= 0) & (slots < num_slots)
-        valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
-        if valid_indices.numel() == 0:
-            return
-        destinations = slots.index_select(0, valid_indices)
-        flat_host_k.index_copy_(
+        destinations = slots.masked_fill(~valid, num_slots)
+        writeback_host_k.index_copy_(
             0,
             destinations,
-            k_rows.index_select(0, valid_indices),
+            k_rows,
         )
-        flat_host_v.index_copy_(
+        writeback_host_v.index_copy_(
             0,
             destinations,
-            v_rows.index_select(0, valid_indices),
+            v_rows,
         )
 
     def onload_topk_kv(
