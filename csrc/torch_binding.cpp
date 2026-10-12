@@ -3642,6 +3642,35 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              &vllm_ascend::npu_fused_scatter_copy_sparse_flash_attention);
 
     ops.def(
+        "npu_fused_lightning_indexer_manage("
+        "Tensor index_weights, Tensor query_dequant_scale, Tensor query, "
+        "Tensor index_key_dequant_scale, Tensor index_key_cache, "
+        "Tensor index_block_table, Tensor actual_seq_lengths_query, "
+        "Tensor actual_seq_lengths_key, Tensor offload_seq_lengths_key, "
+        "Tensor num_cache_tokens, Tensor request_state, Tensor req_pool_entries, "
+        "Tensor(a!) cache_slots_pool, Tensor(b!) topk_src_ids, "
+        "Tensor(c!) topk_dst_slots, Tensor(d!) topk_miss_counts, "
+        "Tensor(e!) miss_src_ids, Tensor(f!) miss_dst_slots, "
+        "Tensor(g!) miss_counts) -> ()"
+    );
+    ops.impl("npu_fused_lightning_indexer_manage", torch::kPrivateUse1,
+             &vllm_ascend::npu_fused_lightning_indexer_manage);
+
+    ops.def(
+        "npu_fused_scatter_copy_sparse_flash_attention("
+        "Tensor query_rope, Tensor query, Tensor actual_seq_lengths_query, "
+        "Tensor actual_seq_lengths_kv, Tensor num_cache_tokens, "
+        "Tensor topk_dst_slots, Tensor topk_src_ids, Tensor topk_miss_counts, "
+        "Tensor miss_src_ids, Tensor miss_dst_slots, Tensor miss_counts, "
+        "Tensor hbm_block_table, Tensor dram_block_table, "
+        "Tensor(a!) hbm_k_rope, Tensor(b!) hbm_kv_cache, "
+        "Tensor dram_k_rope, Tensor dram_kv_cache, float scale_value, "
+        "Tensor(c!) attention_out) -> ()"
+    );
+    ops.impl("npu_fused_scatter_copy_sparse_flash_attention", torch::kPrivateUse1,
+             &vllm_ascend::npu_fused_scatter_copy_sparse_flash_attention);
+
+    ops.def(
         "npu_fused_sparse_attention_overlap(Tensor query, Tensor(a!) selection_k_rope, "
         "Tensor(b!) selection_kv_cache, Tensor(c!) selection_kv_block_table, "
         "Tensor(d!) selection_kv_block_status, Tensor(e!) selection_membership_map, "
