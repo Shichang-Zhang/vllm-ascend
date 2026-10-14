@@ -267,11 +267,49 @@ Enable `dsa_pd_offload=true` on Prefill as well; see
 | `dram_size_per_dp_GB`  | Host memory reserved per DP rank. It must hold the full KV cache. TP ranks share this pool.                                               |
 | `keep_device_kv_cache` | Debug-only option that retains the full device KV cache. Keep it `false` in production.                                                   |
 | `lru_max_threads`      | Per-Decode-Worker CPU LRU planner thread budget. Positive integer; default `8`.                                                           |
+| `use_fused_overlap` | Selects the original fused overlap path. Default `false`; mutually exclusive with `fused_copy_sfa`. |
+| `fused_op_type` | `none` (default) or `fused_copy_sfa`, which selects NPU LIM residency management and fused copy/attention. |
 
 `lru_max_threads` caps the CPU LRU planner per Decode Worker. The effective
 team is also limited by the current work rows and the process CPU affinity.
 A larger value allocates more per-thread CPU workspaces; give the Worker an
 adequate NUMA-local CPU affinity range before increasing it.
+
+### NPU-managed residency with Copy-SFA
+
+To select the new kernels, configure Decode with:
+
+```json
+{
+  "sparse_kv_offload_config": {
+    "enabled": true,
+    "fused_op_type": "fused_copy_sfa",
+    "use_fused_overlap": false,
+    "host_backend": "memfabric",
+    "keep_device_kv_cache": false,
+    "topk_buffer_size": 8192,
+    "dram_size_per_dp_GB": 128
+  }
+}
+```
+
+Use the existing `SfaRemoteD2HConnector` configuration for the MemFabric
+backend. Changing the Host backend does not select a connector automatically.
+
+This path requires TopK 2048, block size 128, BF16 main KV and an unquantized
+indexer cache. It supports 1–7 query tokens per request, including MTP, with
+`max_model_len` at most 2097152. The hot budget must be a multiple of 256,
+at least `2048 * (1 + num_speculative_tokens)` and at most 16128. DSpark,
+context parallelism, pipeline parallelism and Model Runner V2 are unsupported.
+For MTP3, 8192 is the minimum hot budget. Query heads below eight are padded
+for the kernel and trimmed from its output.
+
+LIM selects TopK and updates its membership map on NPU. Copy-SFA loads cache
+misses and computes attention, with two extra blocks reserved for a circular
+tail. Request generations isolate reused rows, and padded requests use private
+rows. `lru_max_threads` does not control this residency path.
+Initial requests and prefix rollback restore dense KV or tails eagerly;
+ordinary decode does not rebuild CPU LRU plans or repeat these recovery copies.
 
 ## 4. Use Them Together
 

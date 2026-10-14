@@ -47,6 +47,9 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
+    prepare_copy_sfa_dummy_slots,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     prepare_sparse_kv_offload_mtp_dummy_metadata,
 )
@@ -61,9 +64,10 @@ from vllm_ascend.spec_decode.utils import (
     _disable_flash_comm_v1_context,
     _maybe_eager_context,
     build_parallel_draft_seq_lens_cpu,
+    compact_mtp_topk_indices,
     patch_tensor_parallel_group,
 )
-from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable
+from vllm_ascend.utils import check_gdn_layer, enable_dsa_cp, enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.device_metadata import DeviceMetadataTask, DeviceMetadataTaskProvider
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
@@ -170,6 +174,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         self.use_sparse = hasattr(vllm_config.model_config.hf_text_config, "index_topk")
 
+        self._lim_topk_compactors: list[nn.Module] = []
         self._share_mtp_indices = False
         spec_config = self.vllm_config.speculative_config
         draft_model_config = getattr(spec_config, "draft_model_config", None)
@@ -746,6 +751,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
     def _maybe_share_topk_indices(self, target_language_model: nn.Module) -> None:
+        self._lim_topk_compactors = []
+        draft_model = getattr(self.model, "model", None)
         if hasattr(target_language_model.model, "topk_indices_buffer"):
             if hasattr(self.model.model, "topk_indices_buffer"):
                 del self.model.model.topk_indices_buffer
@@ -755,11 +762,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 " Sharing target model topk_indices_buffer with the draft model."
             )
             target_buffer = target_language_model.model.topk_indices_buffer
-            draft_model = getattr(self.model, "model", None)
             if target_buffer is not None and draft_model is not None:
-                for _, module in draft_model.named_modules():
+                for module in draft_model.modules():
                     if hasattr(module, "topk_indices_buffer"):
                         module.topk_indices_buffer = target_buffer
+        if draft_model is not None:
+            self._lim_topk_compactors.extend(
+                module for module in draft_model.modules() if getattr(module, "uses_lim_topk_metadata", False)
+            )
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
@@ -820,6 +830,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # num_reqs is already the padded version
                 self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
                 self.query_start_loc.copy_to_gpu()
+                if self.runner._offload_pool_slots is not None:
+                    prepare_copy_sfa_dummy_slots(
+                        self.runner._offload_pool_slots.np,
+                        self.runner._offload_pool_generations.np,
+                        num_reqs,
+                    )
+                    self.runner._copy_sfa_need_eager_tail_restore = False
                 req_ids_tensor, token_to_req = prepare_sparse_kv_offload_mtp_dummy_metadata(
                     num_tokens,
                     num_reqs,
@@ -855,6 +872,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     group_len=self.runner.group_len.gpu[:num_reqs],
                     group_key_idx=self.runner.group_key_idx.gpu[:num_reqs],
                     group_key_cache_idx=self.runner.group_key_cache_idx.gpu[:num_reqs],
+                    req_topk_buffer_slots=(
+                        self.runner._offload_pool_slots.cpu[:num_reqs]
+                        if self.runner._offload_pool_slots is not None
+                        else None
+                    ),
+                    req_topk_buffer_generations=(
+                        self.runner._offload_pool_generations.cpu[:num_reqs]
+                        if self.runner._offload_pool_generations is not None
+                        else None
+                    ),
+                    offload_dummy=True,
                     req_ids_tensor=req_ids_tensor,
                     token_to_req=token_to_req,
                 )
@@ -868,6 +896,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # update the tensor's address for each step.
                 for draft_index in range(self.num_speculative_tokens):
                     common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+                    common_attn_metadata.copy_sfa_draft_index = draft_index
+                    common_attn_metadata.copy_sfa_restore_tails = False
                     extra_attn_metadata_args: dict = {}
                     if self.use_compress:
                         extra_attn_metadata_args.update(
@@ -1560,6 +1590,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
                 draft_token_ids, draft_probs_step0 = self._sample_draft_from_logits(logits, sampling_metadata)
 
+        if self._share_mtp_indices and draft_model is not None:
+            compact_mtp_topk_indices(
+                draft_model,
+                token_indices_to_sample,
+                num_input_tokens,
+                tp_group=get_tp_group() if enable_dsa_cp() else None,
+                lim_topk_compactors=self._lim_topk_compactors,
+            )
+
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             if draft_probs_step0 is not None:
@@ -1932,9 +1971,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         assert draft_index > 0
         assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
+        use_fused_copy_sfa = (
+            getattr(self.runner, "sparse_kv_offload_enabled", False)
+            and self.runner.sparse_kv_offload_config.use_fused_copy_sfa
+        )
+        if use_fused_copy_sfa:
+            common_attn_metadata.copy_sfa_restore_tails = False
 
         if draft_index == 1:
-            if aclgraph_runtime_mode == CUDAGraphMode.FULL:
+            if aclgraph_runtime_mode == CUDAGraphMode.FULL and not use_fused_copy_sfa:
                 common_attn_metadata.num_reqs = input_batch_size
                 common_attn_metadata.block_table_tensor = self._adjust_tensor(
                     common_attn_metadata.block_table_tensor, input_batch_size
@@ -1956,9 +2001,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     self.token_arange_np[: input_batch_size + 1]
                 ).clone()
             else:
-                common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
+                # Copy-SFA owns one pool row per request; graph token padding
+                # must not enlarge the request arena to the verify token count.
+                draft_reqs = common_attn_metadata.num_reqs if use_fused_copy_sfa else batch_size
+                common_attn_metadata.query_start_loc = self.arange[: draft_reqs + 1]
                 common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-                    self.token_arange_np[: batch_size + 1]
+                    self.token_arange_np[: draft_reqs + 1]
                 ).clone()
 
             common_attn_metadata.num_actual_tokens = batch_size
@@ -2321,6 +2369,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             group_len=common_attn_metadata.group_len,
             group_key_idx=common_attn_metadata.group_key_idx,
             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
+            req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
+            req_topk_buffer_generations=common_attn_metadata.req_topk_buffer_generations,
+            offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=token_to_req,
         )
@@ -2418,6 +2469,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             group_len=common_attn_metadata.group_len,
             group_key_idx=common_attn_metadata.group_key_idx,
             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
+            req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
+            req_topk_buffer_generations=common_attn_metadata.req_topk_buffer_generations,
+            offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,
         )
@@ -2543,6 +2597,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     ):
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
+        if (
+            getattr(self.runner, "sparse_kv_offload_enabled", False)
+            and self.runner.sparse_kv_offload_config.use_fused_copy_sfa
+        ):
+            common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+            common_attn_metadata.copy_sfa_draft_index = 0
+            common_attn_metadata.copy_sfa_restore_tails = False
         per_layer_attn_metadata: dict[str, Any] = {}
         device_metadata_tasks: list[DeviceMetadataTask] = []
         device_metadata_executor = (

@@ -13,12 +13,72 @@ from vllm_ascend.attention.sfa_kv_offload import (  # noqa: E402
     AscendSFAKVOffloadImpl,
     AscendSFAKVOffloadMetadataBuilder,
 )
-from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder  # noqa: E402
+from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadataBuilder  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (  # noqa: E402
     FSA_EXTERNAL_PLAN_READY_MARKER,
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
     FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT,
 )
+from vllm_ascend.ops.mla import mla_forward  # noqa: E402
+
+
+@pytest.mark.parametrize("need_gather_q_kv", [False, True])
+@pytest.mark.parametrize("fused_enabled", [None, False, True], ids=["profiling", "fallback", "copy_sfa"])
+def test_mla_dispatch_to_offload_preserves_gather_flag_and_output(need_gather_q_kv, fused_enabled):
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.use_fused_copy_sfa = True
+    impl.lim_reuse_request_count = 7
+    layer_name = "model.layers.0.attn"
+    metadata = None if fused_enabled is None else SimpleNamespace(fused_copy_sfa_enabled=fused_enabled)
+    hidden_states = torch.ones((2, 3))
+    output = torch.empty_like(hidden_states)
+    kv_cache = ()
+    context = SimpleNamespace(
+        no_compile_layers={
+            "mla_wrapper": SimpleNamespace(
+                mla_attn=SimpleNamespace(layer_name=layer_name, impl=impl, kv_cache=kv_cache)
+            )
+        },
+        attn_metadata=None if metadata is None else {layer_name: metadata},
+        capturing=True,
+    )
+
+    def attention_forward(self, name, hidden, cache, attn_metadata, gather=False, output=None):
+        assert self is impl
+        assert name == layer_name
+        assert hidden is hidden_states
+        assert cache is kv_cache
+        assert attn_metadata is metadata
+        assert gather is need_gather_q_kv
+        assert output is not None
+        assert impl._copy_sfa_metadata is metadata
+        assert impl._current_layer_name == layer_name
+        output.copy_(hidden)
+        return output
+
+    with (
+        patch("vllm_ascend.ops.mla.get_forward_context", return_value=context),
+        patch.object(AscendSFAImpl, "forward", autospec=True, side_effect=attention_forward) as parent,
+    ):
+        mla_forward(hidden_states, need_gather_q_kv, output, "mla_wrapper")
+    parent.assert_called_once_with(impl, layer_name, hidden_states, kv_cache, metadata, need_gather_q_kv, output)
+    torch.testing.assert_close(output, hidden_states)
+    assert impl._copy_sfa_metadata is None
+    assert impl._current_layer_name is None
+    assert impl.lim_reuse_request_count == (0 if fused_enabled is False else 7)
+
+
+@pytest.mark.parametrize("need_gather_q_kv", [False, True])
+def test_offload_profiling_forward_uses_the_provided_output(need_gather_q_kv):
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.use_fused_copy_sfa = True
+    hidden_states = torch.ones((2, 3))
+    output = torch.full_like(hidden_states, -1)
+    returned = impl.forward("layer.0", hidden_states, (), None, need_gather_q_kv, output)
+    assert returned is output
+    assert torch.count_nonzero(output) == 0
+    assert impl._copy_sfa_metadata is None
+    assert impl._current_layer_name is None
 
 
 def _make_boundary_decode_metadata():
@@ -101,7 +161,13 @@ def test_disabling_device_checks_preserves_shape_validation_without_item():
 )
 def test_pd_decode_consumer_is_derived_from_kv_role(kv_transfer_config, expected):
     vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
-    with patch.object(AscendSFAMetadataBuilder, "__init__", return_value=None):
+    with (
+        patch.object(AscendSFAMetadataBuilder, "__init__", return_value=None),
+        patch(
+            "vllm_ascend.attention.sfa_kv_offload.get_ascend_config",
+            return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(use_fused_copy_sfa=False)),
+        ),
+    ):
         builder = AscendSFAKVOffloadMetadataBuilder(
             kv_cache_spec=None,
             layer_names=[],
