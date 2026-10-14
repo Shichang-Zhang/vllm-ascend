@@ -170,7 +170,7 @@ Add the following options to the Decode launch command:
 | `lru_max_threads` | Per-Decode-Worker CPU LRU planner thread budget. Positive integer; default `8`. |
 | `use_fused_overlap` | Selects the original fused overlap path. Default `false`; mutually exclusive with `fused_copy_sfa`. |
 | `fused_op_type` | `none` (default) or `fused_copy_sfa`, which selects NPU LIM residency management and fused copy/attention. |
-| `host_backend` | `memfabric` (default) or `mooncake`. Mooncake requires fused overlap and disaggregated Decode. |
+| `host_backend` | `memfabric` (default) or `mooncake`. Mooncake requires fused overlap or Copy-SFA and disaggregated Decode. |
 
 `lru_max_threads` caps the CPU LRU planner per Decode Worker. The effective
 team is also limited by the current work rows and the process CPU affinity.
@@ -183,11 +183,12 @@ To select the new kernels, configure Decode with:
 
 ```json
 {
+  "enable_sparse_li_c8": true,
   "sparse_kv_offload_config": {
     "enabled": true,
     "fused_op_type": "fused_copy_sfa",
     "use_fused_overlap": false,
-    "host_backend": "memfabric",
+    "host_backend": "mooncake",
     "keep_device_kv_cache": false,
     "topk_buffer_size": 8192,
     "dram_size_per_dp_GB": 128
@@ -195,14 +196,15 @@ To select the new kernels, configure Decode with:
 }
 ```
 
-Use the existing `SfaRemoteD2HConnector` configuration for the MemFabric
-backend. Changing the Host backend does not select a connector automatically.
+Use the existing blockwise DSA Mooncake connector configuration for the
+Mooncake backend. `SfaRemoteD2HConnector` remains the MemFabric connector;
+changing the Host backend does not select a connector automatically.
 
-This path requires TopK 2048, block size 128 and BF16 main KV. The indexer
-may use BF16 or LI C8 (`enable_sparse_li_c8=true`): C8 requires INT8 query/key,
-FP16 dequant scales and BF16 weights; FP8 is not supported. Native builds must
-include `npu_fused_quant_lightning_indexer_manage` for LI C8.
-It supports 1–7 query tokens per request, including MTP, with
+This path requires TopK 2048, block size 128 and BF16 main KV. Set
+`enable_sparse_li_c8=true` to use INT8 indexer query/cache with FP16 scales
+through the quantized LIM operator from PR #17444. Leave it false for BF16
+LIM. FP8 indexer caches and sparse SFA C8 main KV are unsupported. It supports
+1–7 query tokens per request, including MTP, with
 `max_model_len` at most 2097152. The hot budget must be a multiple of 256,
 at least `2048 * (1 + num_speculative_tokens)` and at most 16128. DSpark,
 context parallelism, pipeline parallelism and Model Runner V2 are unsupported.
@@ -212,15 +214,19 @@ for the kernel and trimmed from its output.
 LIM selects TopK and updates its membership map on NPU. Copy-SFA loads cache
 misses and computes attention, with two extra blocks reserved for a circular
 tail. Request generations isolate reused rows, and padded requests use private
-rows. `lru_max_threads` does not control this residency path.
+rows. `lru_max_threads` does not control this residency path. Mooncake accesses
+each TP rank's local AscendVMM Host KV views. Its independent KV writeback
+callback remains, with a TP visibility fence before shared Host KV reads.
 Initial requests restore dense KV or tails eagerly. On speculative rollback,
-each physical attention layer uses LIM state `-4` to restore its dense layout
-on NPU before reading it; tail recovery remains eager. LIM receives the computed
-prefix length, while Copy-SFA keeps its dense-mode cache budget at zero.
-The recovery excludes the current query KV and returns to state `-3` on the
-next ordinary dense step. BF16 and quantized LIM both support this state;
-rebuild the Ascend custom operators when upgrading to this implementation.
+each physical attention layer uses LIM and Copy-SFA to restore its dense layout
+on NPU before reading it; tail recovery remains eager. Mooncake writeback
+descriptors are prepared once per forward layout and shared across its layers.
+Colocate decode maintains the retained paged KV cache for mixed-batch recovery.
+Mixed batches use a separate resident fallback arena, whose memory is included
+in cache profiling, then restore Copy-SFA residency when decode resumes.
 Ordinary fused decode does not rebuild CPU LRU plans or repeat recovery copies.
+Rebuild the Ascend custom operators when upgrading to this implementation;
+Both BF16 and quantized LIM include the dense-layout recovery state.
 
 ## 4. Use Them Together
 
