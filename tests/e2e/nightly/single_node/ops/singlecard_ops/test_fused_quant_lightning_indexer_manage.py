@@ -5,7 +5,7 @@ ManageCase structure and scenario matrix, adapted to the quantized ABI
 (int8 query/key + fp16 dequant scales, bf16 weights).  Differences:
 
 - The scoring reference is the official *quantized* indexer
-  (npu_quant_lightning_indexer) compared as TopK *sets* — the two int8
+  (npu_lightning_indexer_quant) compared as TopK *sets* — the two int8
   pipelines may break dense score ties differently, while every management
   output (miss lists, slot mapping, pool bijection, tail padding) stays exact
   because it is driven by the operator's own TopK.
@@ -22,10 +22,8 @@ from dataclasses import dataclass, replace
 
 import pytest
 import torch
-import torch_npu
+import torch_npu  # noqa: F401  # NPU op registration side effect
 
-from vllm_ascend.device.device_config import get_ascend_device_type
-from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
@@ -38,7 +36,6 @@ MAX_CACHE_TOKENS = 32640
 INVALID_SLOT = -(1 << 31)
 PADDING_ID = -1
 INT8_MAX = 127
-INT64_MAX = torch.iinfo(torch.int64).max
 
 SMALL_HEAD_COUNT = 32
 LARGE_HEAD_COUNT = 64
@@ -353,7 +350,7 @@ def _native_topk(case: QuantManageCase) -> torch.Tensor:
     """Per-route official quantized LI reference rows (TND / PA_BSND)."""
     rows = []
     for route, visible_len in enumerate(_visible_lengths(case)):
-        output = torch_npu.npu_quant_lightning_indexer(
+        output = torch.ops._C_ascend.npu_lightning_indexer_quant(
             case.query[route : route + 1],
             case.index_key_cache,
             case.index_weights[route : route + 1].to(torch.float16),
@@ -368,8 +365,6 @@ def _native_topk(case: QuantManageCase) -> torch.Tensor:
             layout_key="PA_BSND",
             sparse_count=TOPK,
             sparse_mode=0,
-            pre_tokens=INT64_MAX,
-            next_tokens=INT64_MAX,
         )
         idx = output[0] if isinstance(output, (tuple, list)) else output
         rows.append(idx.reshape(-1)[:TOPK])
@@ -549,10 +544,6 @@ def _run_and_assert(case: QuantManageCase, set_tolerance: int = 0) -> tuple[torc
     return cache, outputs
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize("heads", [SMALL_HEAD_COUNT, LARGE_HEAD_COUNT])
 @torch.inference_mode()
 def test_fused_quant_lim_non_offload_matches_native(heads):
@@ -566,10 +557,6 @@ def test_fused_quant_lim_non_offload_matches_native(heads):
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize(
     "q,offload_len,actual_key",
     [
@@ -592,10 +579,6 @@ def test_fused_quant_lim_non_offload_short_visible_padding(q, offload_len, actua
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize("q_values,offload_len,cache_tokens", FIRST_DECODE_SCENARIOS)
 @torch.inference_mode()
 def test_fused_quant_lim_first_decode_initializes_cache(q_values, offload_len, cache_tokens):
@@ -608,10 +591,6 @@ def test_fused_quant_lim_first_decode_initializes_cache(q_values, offload_len, c
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize("q_values,offload_len,cache_tokens", STEADY_REPLACEMENT_SCENARIOS)
 @torch.inference_mode()
 def test_fused_quant_lim_steady_replacement_then_all_hit(q_values, offload_len, cache_tokens):
@@ -631,10 +610,6 @@ def test_fused_quant_lim_steady_replacement_then_all_hit(q_values, offload_len, 
     torch.testing.assert_close(repeated_cache, updated_cache, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize(
     "states",
     [
@@ -658,10 +633,6 @@ def test_fused_quant_lim_state_patterns(states):
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @torch.inference_mode()
 def test_fused_quant_lim_mixed_state_mtp():
     case = _build_case(
@@ -674,10 +645,6 @@ def test_fused_quant_lim_mixed_state_mtp():
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @torch.inference_mode()
 def test_fused_quant_lim_lifecycle():
     q_values = [1, 4]
@@ -734,10 +701,6 @@ def test_fused_quant_lim_lifecycle():
     torch.testing.assert_close(stable_cache, identity_cache, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize("q,state,offload_len,cache_tokens", ROUTE_STATE_SCENARIOS)
 @torch.inference_mode()
 def test_fused_quant_lim_route_state_matrix(q, state, offload_len, cache_tokens):
@@ -750,10 +713,6 @@ def test_fused_quant_lim_route_state_matrix(q, state, offload_len, cache_tokens)
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize("q,state,offload_len,cache_tokens,heads", HEAD_ROUTE_SCENARIOS)
 @torch.inference_mode()
 def test_fused_quant_lim_head_matrix(q, state, offload_len, cache_tokens, heads):
@@ -767,10 +726,6 @@ def test_fused_quant_lim_head_matrix(q, state, offload_len, cache_tokens, heads)
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize("q_values,states,offload_len,cache_tokens", MIXED_BATCH_SCENARIOS)
 @torch.inference_mode()
 def test_fused_quant_lim_mixed_batch_matrix(q_values, states, offload_len, cache_tokens):
@@ -783,10 +738,6 @@ def test_fused_quant_lim_mixed_batch_matrix(q_values, states, offload_len, cache
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize(
     "q,occurrence_count",
     [
@@ -805,10 +756,6 @@ def test_fused_quant_lim_occurrence_sort_boundaries(q, occurrence_count):
     assert int(outputs[MISS_COUNT_OUTPUT][0]) == occurrence_count
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @pytest.mark.parametrize(
     "q_values,states,offload_len,cache_tokens,min_source,heads",
     LONG_SEQUENCE_SCENARIOS,
@@ -851,10 +798,6 @@ def test_fused_quant_lim_long_sequence_source_ids(q_values, states, offload_len,
     _run_and_assert(case)
 
 
-@pytest.mark.skipif(
-    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
-    reason="The local quantized fused LIM kernel is configured for Ascend A2/A3",
-)
 @torch.inference_mode()
 def test_fused_quant_lim_rejects_invalid_contract():
     case = _build_case(
