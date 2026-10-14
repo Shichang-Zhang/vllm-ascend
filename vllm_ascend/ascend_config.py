@@ -1113,8 +1113,11 @@ class SparseKVOffloadConfig:
         if self.dram_size_per_dp_GB <= 0:
             raise ValueError("sparse_kv_offload_config.dram_size_per_dp_GB must be positive")
         if self.enabled and self.host_backend == "mooncake":
-            if not self.use_fused_overlap:
-                raise ValueError("sparse_kv_offload_config.host_backend='mooncake' requires use_fused_overlap=true")
+            if not (self.use_fused_overlap or self.use_fused_copy_sfa):
+                raise ValueError(
+                    "sparse_kv_offload_config.host_backend='mooncake' "
+                    "requires use_fused_overlap=true or fused_op_type='fused_copy_sfa'"
+                )
             if self.keep_device_kv_cache:
                 raise ValueError(
                     "sparse_kv_offload_config.host_backend='mooncake' is "
