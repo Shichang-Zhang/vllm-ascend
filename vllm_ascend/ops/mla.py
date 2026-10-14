@@ -64,6 +64,43 @@ class IndexerWrapper(nn.Module):
 
 
 class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
+    @property
+    def skip_topk(self) -> bool:
+        return self.__dict__.get("_skip_topk", False)
+
+    @skip_topk.setter
+    def skip_topk(self, value: bool) -> None:
+        self.__dict__["_skip_topk"] = bool(value)
+        impl = getattr(getattr(self, "mla_attn", None), "impl", None)
+        if impl is not None and hasattr(impl, "skip_topk"):
+            impl.skip_topk = self.__dict__["_skip_topk"]
+            self.mla_attn.skip_topk = self.__dict__["_skip_topk"]
+
+    @property
+    def topk_indices_buffer(self) -> torch.Tensor | None:
+        impl = getattr(getattr(self, "mla_attn", None), "impl", None)
+        if impl is None:
+            return None
+        return getattr(impl, "topk_indices_buffer", None)
+
+    @topk_indices_buffer.setter
+    def topk_indices_buffer(self, value: torch.Tensor | None) -> None:
+        impl = getattr(getattr(self, "mla_attn", None), "impl", None)
+        if impl is not None and hasattr(impl, "topk_indices_buffer"):
+            impl.topk_indices_buffer = value
+            self.mla_attn.topk_indices_buffer = value
+
+    @property
+    def uses_lim_topk_metadata(self) -> bool:
+        impl = getattr(getattr(self, "mla_attn", None), "impl", None)
+        return bool(getattr(impl, "use_fused_copy_sfa", False))
+
+    def compact_lim_topk_metadata(self, slot_ids: torch.Tensor) -> None:
+        impl = getattr(getattr(self, "mla_attn", None), "impl", None)
+        compact = getattr(impl, "compact_lim_topk_metadata", None)
+        if compact is not None:
+            compact(slot_ids)
+
     def __init__(
         self,
         hidden_size: int,
@@ -128,6 +165,9 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             layer_name=f"{prefix}.attn",
         )
 
+        self.mla_attn.skip_topk = skip_topk
+        self.mla_attn.topk_indices_buffer = getattr(self.mla_attn.impl, "topk_indices_buffer", None)
+
         original_process_weights = self.mla_attn.process_weights_after_loading
 
         def wrapped_process_weights(act_dtype: torch.dtype):
@@ -160,6 +200,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         kv_cache: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if getattr(self.mla_attn.impl, "use_fused_copy_sfa", False):
+            self.mla_attn.impl.skip_topk = self.mla_attn.skip_topk
         hidden_dim = self.hidden_size
 
         if _EXTRA_CTX.flash_comm_v1_enabled and self.tp_size > 1 and self.is_vl_first_layer:

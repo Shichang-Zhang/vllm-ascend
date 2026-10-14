@@ -327,9 +327,20 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             group_len=self.group_len,
             group_key_idx=self.group_key_idx,
             group_key_cache_idx=self.group_key_cache_idx,
+            req_topk_buffer_slots=_slice_reqs(self.req_topk_buffer_slots),
+            req_topk_buffer_generations=_slice_reqs(self.req_topk_buffer_generations),
+            offload_dummy=self.offload_dummy,
+            copy_sfa_restore_tails=self.copy_sfa_restore_tails,
+            copy_sfa_draft_index=self.copy_sfa_draft_index,
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
         )
+
+    req_topk_buffer_slots: torch.Tensor | None = None
+    req_topk_buffer_generations: torch.Tensor | None = None
+    offload_dummy: bool = False
+    copy_sfa_restore_tails: bool = False
+    copy_sfa_draft_index: int | None = None
 
 
 def filter_chunked_req_indices(
