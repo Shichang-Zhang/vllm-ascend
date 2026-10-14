@@ -1822,6 +1822,10 @@ class SparseKVOffloadConfig:
     store_port_base: int = 8500
     topk: int = dataclasses.field(default=0, init=False)
     use_fused_overlap: bool = False
+    # kernel_v2 compat: fused operator selector, kept so user configs from the
+    # kernel_v2 branch keep parsing; the fused path itself follows main's
+    # use_fused_copy_sfa semantics (enabled and not use_fused_overlap).
+    fused_op_type: Literal["none", "fused_copy_sfa"] = "none"
     lru_max_threads: int = 8
     host_backend: Literal["memfabric", "mooncake"] = "memfabric"
 
@@ -1845,6 +1849,10 @@ class SparseKVOffloadConfig:
             raise ValueError("sparse_kv_offload_config.dram_size_per_dp_GB must be positive")
         if not 1 <= self.store_port_base <= 65535:
             raise ValueError("sparse_kv_offload_config.store_port_base must be a valid TCP port")
+        if self.fused_op_type not in ("none", "fused_copy_sfa"):
+            raise ValueError("sparse_kv_offload_config.fused_op_type must be none or fused_copy_sfa")
+        if self.fused_op_type == "fused_copy_sfa" and self.use_fused_overlap:
+            raise ValueError("fused_copy_sfa and use_fused_overlap are mutually exclusive")
 
         if self.enabled and self.host_backend == "mooncake":
             if not self.use_fused_overlap:
@@ -1913,6 +1921,18 @@ class SparseKVOffloadConfig:
         ):
             # Only V2 initializes the resident draft KV from remote prompt context.
             raise ValueError("Sparse KV offload with DSpark requires V2 remote prompt-context initialization")
+        if self.use_fused_copy_sfa:
+            if speculative is not None and speculative.method == "dspark":
+                raise ValueError("fused_copy_sfa does not support DSpark speculative decoding")
+            width = 1 + (speculative.num_speculative_tokens if speculative else 0)
+            if self.topk != 2048 or not 1 <= width <= 7:
+                raise ValueError("fused_copy_sfa serving requires TopK=2048 and 1-7 query rows per request")
+            if not width * self.topk <= self.topk_buffer_size <= 16128 or self.topk_buffer_size % 256:
+                raise ValueError("fused_copy_sfa hot budget must be 256-aligned in [Q_max*2048, 16128]")
+            if vllm_config.cache_config.block_size != 128:
+                raise ValueError("fused_copy_sfa requires block_size=128")
+            if vllm_config.model_config.max_model_len > 1 << 21:
+                raise ValueError("fused_copy_sfa requires max_model_len <= 2097152")
         if self.topk_buffer_size < self.topk:
             raise ValueError(
                 "sparse_kv_offload_config.topk_buffer_size must be >= topk, "

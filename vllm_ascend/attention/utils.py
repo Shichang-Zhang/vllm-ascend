@@ -395,6 +395,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # CPU views of runner-owned CpuGpuBuffers; never exact sequence lengths.
     req_topk_buffer_slots: torch.Tensor | None = None
     req_topk_buffer_active: torch.Tensor | None = None
+    req_topk_buffer_generations: torch.Tensor | None = None
     copy_sfa_draft_index: int | None = None
     copy_sfa_restore_tails: bool = False
     offload_dummy: bool = False
@@ -479,7 +480,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
         )
-
 
 def filter_chunked_req_indices(
     seq_len: torch.Tensor,

@@ -1,7 +1,7 @@
 """Regression tests for SFA KV-offload attention metadata."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -12,41 +12,78 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState  # noqa: E40
 from vllm_ascend.attention.sfa_kv_offload import (  # noqa: E402
     AscendSFAKVOffloadImpl,
     AscendSFAKVOffloadMetadataBuilder,
-    AscendSFAOffloadMetadata,
 )
-from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder  # noqa: E402
+from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadataBuilder  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (  # noqa: E402
     FSA_EXTERNAL_PLAN_READY_MARKER,
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
     FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT,
 )
+from vllm_ascend.ops.mla import mla_forward  # noqa: E402
 
 
-@pytest.mark.parametrize("defer_wait", [False, True])
-def test_exec_kv_offload_always_completes_compute_and_cache_write(defer_wait):
+@pytest.mark.parametrize("need_gather_q_kv", [False, True])
+@pytest.mark.parametrize("fused_enabled", [None, False, True], ids=["profiling", "fallback", "copy_sfa"])
+def test_mla_dispatch_to_offload_preserves_gather_flag_and_output(need_gather_q_kv, fused_enabled):
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
-    k_nope, k_pe = torch.ones(2, 4), torch.ones(2, 2)
-    impl._is_decode_only = MagicMock(return_value=True)
-    impl._compute_kv_only = MagicMock(return_value=(k_nope, k_pe))
-    impl._offload_layer_name = MagicMock(return_value="layer")
-    impl._cpu_cache_pair = MagicMock(return_value=(torch.empty(1), torch.empty(1)))
-    impl._in_graph_runtime = MagicMock(return_value=False)
-    slots = torch.arange(2)
-    metadata = SimpleNamespace(fused_copy_sfa_enabled=False)
-    with patch("vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager") as get_manager:
-        manager = get_manager.return_value
-        result = impl.exec_kv(k_nope, k_pe, k_pe, (), slots, metadata, defer_wait=defer_wait)
-        assert isinstance(result, tuple)
-        assert result[0] is k_pe and result[1] is k_nope
-        impl._compute_kv_only.assert_called_once_with(k_nope, k_pe, k_pe)
-        manager.offload_new_kv.assert_called_once()
-        assert manager.offload_new_kv.call_args.kwargs["slot_mapping"] is slots
-        assert manager.offload_new_kv.call_args.kwargs["k"] is k_nope
-        assert manager.offload_new_kv.call_args.kwargs["v"] is k_pe
+    impl.use_fused_copy_sfa = True
+    impl.lim_reuse_request_count = 7
+    layer_name = "model.layers.0.attn"
+    metadata = None if fused_enabled is None else SimpleNamespace(fused_copy_sfa_enabled=fused_enabled)
+    hidden_states = torch.ones((2, 3))
+    output = torch.empty_like(hidden_states)
+    kv_cache = ()
+    context = SimpleNamespace(
+        no_compile_layers={
+            "mla_wrapper": SimpleNamespace(
+                mla_attn=SimpleNamespace(layer_name=layer_name, impl=impl, kv_cache=kv_cache)
+            )
+        },
+        attn_metadata=None if metadata is None else {layer_name: metadata},
+        capturing=True,
+    )
+
+    def attention_forward(self, name, hidden, cache, attn_metadata, gather=False, output=None):
+        assert self is impl
+        assert name == layer_name
+        assert hidden is hidden_states
+        assert cache is kv_cache
+        assert attn_metadata is metadata
+        assert gather is need_gather_q_kv
+        assert output is not None
+        assert impl._copy_sfa_metadata is metadata
+        assert impl._current_layer_name == layer_name
+        output.copy_(hidden)
+        return output
+
+    with (
+        patch("vllm_ascend.ops.mla.get_forward_context", return_value=context),
+        patch.object(AscendSFAImpl, "forward", autospec=True, side_effect=attention_forward) as parent,
+    ):
+        mla_forward(hidden_states, need_gather_q_kv, output, "mla_wrapper")
+    parent.assert_called_once_with(impl, layer_name, hidden_states, kv_cache, metadata, need_gather_q_kv, output)
+    torch.testing.assert_close(output, hidden_states)
+    assert impl._copy_sfa_metadata is None
+    assert impl._current_layer_name is None
+    assert impl.lim_reuse_request_count == (0 if fused_enabled is False else 7)
+
+
+@pytest.mark.parametrize("need_gather_q_kv", [False, True])
+def test_offload_profiling_forward_uses_the_provided_output(need_gather_q_kv):
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.use_fused_copy_sfa = True
+    hidden_states = torch.ones((2, 3))
+    output = torch.full_like(hidden_states, -1)
+    returned = impl.forward("layer.0", hidden_states, (), None, need_gather_q_kv, output)
+    assert returned is output
+    assert torch.count_nonzero(output) == 0
+    assert impl._copy_sfa_metadata is None
+    assert impl._current_layer_name is None
 
 
 def _make_boundary_decode_metadata():
     return SimpleNamespace(
+        context_parallel_metadata=None,
         max_query_len=1,
         num_reqs=1,
         num_actual_tokens=1,
@@ -55,6 +92,62 @@ def _make_boundary_decode_metadata():
         req_ids_tensor=torch.tensor([7]),
         token_to_req=torch.tensor([0]),
     )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_fused_metadata_checks_do_not_change_mtp_flattening(enabled):
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    metadata = SimpleNamespace(token_to_req=torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+    cumulative = torch.tensor([2, 4], dtype=torch.int32)
+    lengths = torch.tensor([12, 22], dtype=torch.int32)
+    blocks = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+    with (
+        patch(
+            "vllm_ascend.attention.sfa_kv_offload.get_forward_context", return_value=SimpleNamespace(capturing=False)
+        ),
+        patch("vllm_ascend.attention.sfa_kv_offload.envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA", enabled),
+    ):
+        impl._validate_fused_overlap_mtp_decode_metadata(
+            metadata, num_tokens=4, num_reqs=2, full_q_actual_seq=cumulative, full_kv_actual_seq=lengths
+        )
+        observed = impl._flatten_fused_overlap_mtp_to_token_batch(
+            metadata,
+            num_tokens=4,
+            num_reqs=2,
+            full_q_actual_seq=cumulative,
+            full_kv_actual_seq=lengths,
+            full_kv_block_table=blocks,
+        )
+    torch.testing.assert_close(observed[0], torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    torch.testing.assert_close(observed[1], torch.tensor([11, 12, 21, 22], dtype=torch.int32))
+    torch.testing.assert_close(observed[2], blocks[torch.tensor([0, 0, 1, 1])])
+
+
+def test_disabling_device_checks_preserves_shape_validation_without_item():
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    metadata = SimpleNamespace(token_to_req=torch.tensor([0, 0], dtype=torch.int32))
+    with (
+        patch(
+            "vllm_ascend.attention.sfa_kv_offload.get_forward_context", return_value=SimpleNamespace(capturing=False)
+        ),
+        patch("vllm_ascend.attention.sfa_kv_offload.envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA", False),
+        patch.object(torch.Tensor, "item", side_effect=AssertionError("unexpected device-value read")),
+    ):
+        impl._validate_fused_overlap_mtp_decode_metadata(
+            metadata,
+            num_tokens=2,
+            num_reqs=1,
+            full_q_actual_seq=torch.tensor([2]),
+            full_kv_actual_seq=torch.tensor([10]),
+        )
+        with pytest.raises(RuntimeError, match="token_to_req length mismatch"):
+            impl._validate_fused_overlap_mtp_decode_metadata(
+                metadata,
+                num_tokens=3,
+                num_reqs=1,
+                full_q_actual_seq=torch.tensor([3]),
+                full_kv_actual_seq=torch.tensor([10]),
+            )
 
 
 @pytest.mark.parametrize(
@@ -69,7 +162,7 @@ def _make_boundary_decode_metadata():
 def test_pd_decode_consumer_is_derived_from_kv_role(kv_transfer_config, expected):
     vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
     with (
-        patch.object(AscendSFAMetadataBuilder, "__init__", return_value=None) as init,
+        patch.object(AscendSFAMetadataBuilder, "__init__", return_value=None),
         patch(
             "vllm_ascend.attention.sfa_kv_offload.get_ascend_config",
             return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(use_fused_copy_sfa=False)),
@@ -83,9 +176,6 @@ def test_pd_decode_consumer_is_derived_from_kv_role(kv_transfer_config, expected
         )
 
     assert builder.is_pd_decode_consumer is expected
-    assert init.call_args.args[4] is AscendSFAOffloadMetadata
-    assert "copy_sfa_seq_lens" in AscendSFAOffloadMetadata.__dataclass_fields__
-    assert "copy_sfa_seq_lens" not in AscendSFAMetadata.__dataclass_fields__
 
 
 @pytest.mark.parametrize(
@@ -101,7 +191,6 @@ def test_boundary_token_classification_depends_on_pd_decode_role(
     expected_prefills,
 ):
     builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
-    builder.use_fused_copy_sfa = False
     builder.decode_threshold = 1
     builder.is_pd_decode_consumer = is_pd_decode_consumer
     metadata = SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly)
@@ -122,7 +211,6 @@ def test_boundary_token_classification_depends_on_pd_decode_role(
 
 def test_pd_decode_consumer_still_rejects_long_prefill_classification():
     builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
-    builder.use_fused_copy_sfa = False
     builder.decode_threshold = 1
     builder.is_pd_decode_consumer = True
     metadata = SimpleNamespace()
@@ -140,66 +228,6 @@ def test_pd_decode_consumer_still_rejects_long_prefill_classification():
     assert metadata.num_decodes == 0
     assert metadata.num_prefills == 1
     assert metadata.num_decode_tokens == 0
-
-
-def _make_draft_decode_metadata(max_query_len: int):
-    common = _make_boundary_decode_metadata()
-    common.max_query_len = max_query_len
-    common.num_actual_tokens = max_query_len
-    common.query_start_loc_cpu = torch.tensor([0, max_query_len])
-    common.is_prefilling = torch.tensor([False])
-    # attn_utils derives a per-layer variant for the MTP draft layers and marks
-    # it with copy_sfa_draft_index so the offload keeps the reuse path.
-    common.copy_sfa_draft_index = 0
-    return common
-
-
-@pytest.mark.parametrize(
-    ("max_query_len", "expected_state"),
-    [
-        (1, AscendAttentionState.DecodeOnly),
-        (4, AscendAttentionState.SpecDecoding),
-    ],
-)
-def test_draft_decode_batch_is_never_classified_as_prefill(max_query_len, expected_state):
-    builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
-    builder.use_fused_copy_sfa = False
-    builder.decode_threshold = 4
-    builder.is_pd_decode_consumer = True
-    builder.copy_sfa_metadata_steps = 4
-    # build_attn_state labels a 1+num_spec token draft batch ChunkedPrefill.
-    metadata = SimpleNamespace(attn_state=AscendAttentionState.ChunkedPrefill)
-
-    with patch(
-        "vllm_ascend.attention.utils.is_pd_decode_recompute_scheduler_enabled",
-        return_value=False,
-    ):
-        builder._populate_offload_metadata(metadata, _make_draft_decode_metadata(max_query_len))
-
-    assert metadata.num_prefills == 0
-    assert metadata.num_decodes == 1
-    assert metadata.attn_state is expected_state
-    assert AscendSFAKVOffloadImpl._is_decode_only(metadata)
-
-
-def test_prefill_batch_keeps_its_attention_state():
-    builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
-    builder.use_fused_copy_sfa = False
-    builder.decode_threshold = 4
-    builder.is_pd_decode_consumer = True
-    builder.copy_sfa_metadata_steps = 4
-    metadata = SimpleNamespace(attn_state=AscendAttentionState.ChunkedPrefill)
-    common = _make_draft_decode_metadata(8)
-    del common.copy_sfa_draft_index
-
-    with patch(
-        "vllm_ascend.attention.utils.is_pd_decode_recompute_scheduler_enabled",
-        return_value=False,
-    ):
-        builder._populate_offload_metadata(metadata, common)
-
-    assert metadata.num_prefills == 1
-    assert metadata.attn_state is AscendAttentionState.ChunkedPrefill
 
 
 def _make_fused_overlap_impl() -> AscendSFAKVOffloadImpl:
@@ -241,12 +269,9 @@ def test_mtp_rewrite_invalidates_membership_slot_map():
         req_ids_tensor=torch.tensor([7], dtype=torch.int64),
     )
 
-    with (
-        patch(
-            "vllm_ascend.attention.sfa_kv_offload.get_forward_context",
-            return_value=SimpleNamespace(capturing=False),
-        ),
-        patch("vllm_ascend.attention.sfa_kv_offload._EXTRA_CTX", SimpleNamespace(capturing=False)),
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.get_forward_context",
+        return_value=SimpleNamespace(capturing=False),
     ):
         impl._invalidate_fused_overlap_selection_rows(
             selection_status,
@@ -265,10 +290,6 @@ def test_mtp_rewrite_invalidates_membership_slot_map():
 
 
 def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
-    """
-    Test that the fused overlap external plan receives the raw topk indices and the full selection state,
-    and that the fused op receives the correct inputs.
-    """
     impl = _make_fused_overlap_impl()
     ql_nope = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
     q_pe = torch.ones((2, 2, 1), dtype=torch.float32)
@@ -344,7 +365,6 @@ def test_fused_overlap_external_plan_passes_raw_topk_and_full_selection_state():
             "vllm_ascend.attention.sfa_kv_offload.get_forward_context",
             return_value=SimpleNamespace(capturing=False),
         ),
-        patch("vllm_ascend.attention.sfa_kv_offload._EXTRA_CTX", SimpleNamespace(capturing=False)),
     ):
         output = impl._execute_fused_overlap_offload_decode(
             ql_nope,
@@ -419,12 +439,9 @@ def test_fused_overlap_common_inputs_are_reused_only_within_one_forward():
     second_forward = SimpleNamespace(capturing=False)
     current_forward = [first_forward]
 
-    with (
-        patch(
-            "vllm_ascend.attention.sfa_kv_offload.get_forward_context",
-            side_effect=lambda: current_forward[0],
-        ),
-        patch("vllm_ascend.attention.sfa_kv_offload._EXTRA_CTX", SimpleNamespace(capturing=False)),
+    with patch(
+        "vllm_ascend.attention.sfa_kv_offload.get_forward_context",
+        side_effect=lambda: current_forward[0],
     ):
         first = impl._prepare_fused_overlap_decode_common_inputs(
             metadata,
@@ -463,110 +480,3 @@ def test_fused_overlap_common_inputs_are_reused_only_within_one_forward():
         refreshed.seq_len_thresholds.reshape(-1),
         torch.tensor([5, 6], dtype=torch.int32),
     )
-
-
-def test_c8_quant_lim():
-    n_head, head_dim, num_decodes, tokens, blocks = 32, 128, 2, 2, 8
-    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
-    impl.lim_slot_map = torch.full((num_decodes * 2, blocks * head_dim), -(1 << 31), dtype=torch.int32)
-    impl.lim_topk_src = torch.zeros((tokens, 1, 2048), dtype=torch.int32)
-    impl.lim_topk_dst = torch.zeros_like(impl.lim_topk_src)
-    impl.lim_topk_misses = torch.zeros(tokens, dtype=torch.int32)
-    impl.lim_miss_src = torch.empty((num_decodes, 32768), dtype=torch.int32)
-    impl.lim_miss_dst = torch.empty_like(impl.lim_miss_src)
-    impl.lim_misses = torch.zeros(num_decodes, dtype=torch.int32)
-    impl.lim_reuse_request_count = 0
-    impl._copy_sfa_metadata = SimpleNamespace(
-        copy_sfa_pool_entries=torch.arange(num_decodes, dtype=torch.int32),
-        num_decode_tokens=tokens,
-        copy_sfa_prefix_lens=torch.full((num_decodes,), 4096, dtype=torch.int32),
-        copy_sfa_cache_tokens=torch.full((num_decodes,), 2048, dtype=torch.int32),
-        copy_sfa_query_ends=torch.tensor([1, 2], dtype=torch.int32),
-        copy_sfa_seq_lens=torch.full((num_decodes,), 8192, dtype=torch.int32),
-        lim_request_state=torch.tensor([-2, -3], dtype=torch.int32),
-        copy_sfa_reuse_logical_lens=None,
-    )
-    query = torch.randint(-8, 8, (tokens * n_head, head_dim), dtype=torch.int8)
-    query_scale = torch.ones(tokens * n_head, dtype=torch.float16)
-    weights = torch.randn(tokens, n_head, dtype=torch.bfloat16)
-    indexer = SimpleNamespace(
-        enable_sparse_li_c8=True,
-        n_head=n_head,
-        head_dim=head_dim,
-        k_cache=SimpleNamespace(
-            kv_cache=(
-                torch.zeros((blocks, head_dim, 1, head_dim), dtype=torch.int8),
-                torch.zeros((blocks, head_dim, 1, 1), dtype=torch.float16),
-            )
-        ),
-    )
-    indexer_metadata = SimpleNamespace(block_table=torch.zeros((num_decodes, blocks), dtype=torch.int32))
-    m_c8 = MagicMock()
-    m_bf16 = MagicMock()
-    with patch(
-        "vllm_ascend.attention.sfa_kv_offload.torch.ops._C_ascend",
-        SimpleNamespace(npu_fused_quant_lightning_indexer_manage=m_c8, npu_fused_lightning_indexer_manage=m_bf16),
-    ):
-        result = impl._lim_select(query, weights, indexer, indexer_metadata, query_scale)
-
-    assert m_c8.called
-    assert not m_bf16.called
-    op_weights, q_scale, op_query, key_scale, index_key = m_c8.call_args.args[:5]
-    assert op_weights.dtype == torch.bfloat16
-    assert tuple(q_scale.shape) == (tokens, n_head) and q_scale.dtype == torch.float16
-    assert tuple(op_query.shape) == (tokens, n_head, head_dim) and op_query.dtype == torch.int8
-    assert tuple(key_scale.shape) == (blocks, head_dim, 1)
-    assert index_key.dtype == torch.int8
-    assert result.data_ptr() == impl.lim_topk_src.data_ptr()
-    torch.testing.assert_close(result, impl.lim_topk_src[:tokens])
-
-
-@pytest.mark.parametrize("mode", ["copy_sfa", "overlap", "mixed_debug", "prefill_debug"])
-def test_offload_attention_dispatch_after_removing_unfused_mode(mode):
-    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
-    impl.layer_name = "model.layers.0.self_attn.attn"
-    impl.use_fused_overlap = mode == "overlap"
-    impl._copy_sfa_attention = MagicMock(return_value=torch.ones(2, 1, 4))
-    impl._execute_fused_overlap_offload_decode = MagicMock(return_value=torch.ones(2, 1, 4))
-    query = torch.zeros(2, 1, 4)
-    cache = (torch.zeros(1, 128, 1, 4), torch.zeros(1, 128, 1, 4))
-    table = torch.tensor([[0]], dtype=torch.int32)
-    metadata = SimpleNamespace(
-        fused_copy_sfa_enabled=mode == "copy_sfa",
-        num_decodes=0 if mode == "prefill_debug" else 1,
-        num_decode_tokens=0 if mode == "prefill_debug" else (1 if mode == "mixed_debug" else 2),
-        num_prefills=1 if mode.endswith("debug") else 0,
-        req_ids_tensor=torch.tensor([0]),
-        token_to_req=torch.tensor([0, 0]),
-    )
-    paged_output = torch.full_like(query, 2)
-    with (
-        patch("vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager"),
-        patch("vllm_ascend.attention.sfa_kv_offload._check_device_kv_cache_exist") as check_cache,
-        patch.object(
-            AscendSFAImpl,
-            "_execute_sparse_flash_attention_process",
-            return_value=paged_output,
-        ) as paged_attention,
-    ):
-        output = impl._execute_sparse_flash_attention_process(
-            query,
-            query,
-            cache,
-            torch.zeros(2, 1, dtype=torch.int32),
-            metadata,
-            torch.tensor([2]),
-            torch.tensor([2]),
-            block_table=table,
-        )
-    if mode.endswith("debug"):
-        check_cache.assert_called_once()
-        paged_attention.assert_called_once()
-        assert paged_attention.call_args.args[2] is cache
-        assert paged_attention.call_args.kwargs["block_table"] is table
-        assert output is paged_output
-    else:
-        check_cache.assert_not_called()
-        paged_attention.assert_not_called()
-    assert impl._copy_sfa_attention.call_count == (mode == "copy_sfa")
-    assert impl._execute_fused_overlap_offload_decode.call_count == (mode == "overlap")

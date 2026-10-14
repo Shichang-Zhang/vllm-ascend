@@ -297,6 +297,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         kv_cache: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if getattr(self.mla_attn.impl, "use_fused_copy_sfa", False):
+            self.mla_attn.impl.skip_topk = self.mla_attn.skip_topk
         hidden_dim = self.hidden_size
         num_output_tokens = (hidden_states.shape[0] + self.output_token_shard_size - 1) // self.output_token_shard_size
         output = torch.empty((num_output_tokens, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)

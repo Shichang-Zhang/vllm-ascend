@@ -1696,9 +1696,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return hidden_states, ql_nope, q_pe, q_c
 
-    def _prepare_indexer_metadata(self, indexer_metadata, attn_metadata) -> None:
-        """Allow an attention backend to supply indexer selection metadata."""
-        return
+    def _select_indexer_topk(
+        self, q_li, q_li_scale, q_li_shape, weights, kv_cache, attn_metadata, actual_query_lengths, actual_key_lengths
+    ):
+        """Select TopK using the backend's prepared indexer queries."""
+        return DeviceOperator.indexer_select_post_process(
+            self,
+            q_li,
+            q_li_scale,
+            q_li_shape,
+            weights,
+            kv_cache,
+            attn_metadata,
+            actual_query_lengths,
+            actual_key_lengths,
+            self.enable_sparse_li_c8,
+            self.use_torch_npu_lightning_indexer,
+        )
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:
