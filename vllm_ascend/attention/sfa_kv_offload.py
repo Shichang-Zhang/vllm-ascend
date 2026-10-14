@@ -502,8 +502,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self.lim_indexer_owner = self
         self._copy_sfa_metadata: AscendSFAOffloadMetadata | None = None
         if self.use_fused_copy_sfa:
-            if self.enable_sparse_li_c8:
-                raise NotImplementedError("Fused Copy-SFA offload does not support sparse LI C8 serving yet")
+            if self.enable_sparse_li_c8 and self.c8_k_cache_dtype != torch.int8:
+                raise NotImplementedError("Fused Copy-SFA LI C8 requires INT8 query/key and FP16 scales")
             self.copy_sfa_hot_tokens = offload_cfg.topk_buffer_size
             requests = self.vllm_config.scheduler_config.max_num_seqs + 2
             tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -666,12 +666,20 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self, q_li, q_li_scale, q_li_shape, weights, kv_cache, attn_metadata, actual_query_lengths, actual_key_lengths
     ):
         if getattr(attn_metadata, "fused_copy_sfa_enabled", False):
-            return self._lim_select(q_li, weights, kv_cache[self.kv_cache_indexer_k_idx], attn_metadata.block_table)
+            key_scale = kv_cache[self.kv_cache_indexer_scale_idx] if self.enable_sparse_li_c8 else None
+            return self._lim_select(
+                q_li,
+                weights,
+                kv_cache[self.kv_cache_indexer_k_idx],
+                attn_metadata.block_table,
+                query_scale=q_li_scale,
+                key_scale=key_scale,
+            )
         return super()._select_indexer_topk(
             q_li, q_li_scale, q_li_shape, weights, kv_cache, attn_metadata, actual_query_lengths, actual_key_lengths
         )
 
-    def _lim_select(self, query, weights, index_cache, block_table):
+    def _lim_select(self, query, weights, index_cache, block_table, *, query_scale=None, key_scale=None):
         metadata = self._copy_sfa_metadata
         assert metadata is not None and metadata.copy_sfa_pool_entries is not None
         count = metadata.copy_sfa_pool_entries.numel()
@@ -681,17 +689,34 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         cache = metadata.copy_sfa_cache_tokens
         index_cache = index_cache.view(-1, 128, 1, 128)
         table = block_table[:count].contiguous()
-        if self.lim_key_scale is None:
-            self.lim_key_scale = torch.empty(index_cache.shape[:3], dtype=torch.float32, device=query.device)
-            self.lim_query_scale = torch.empty(
-                (self.lim_topk_src.shape[0], query.shape[1]), dtype=torch.float32, device=query.device
-            )
-        assert self.lim_query_scale is not None
-        torch.ops._C_ascend.npu_fused_lightning_indexer_manage(
+        if getattr(self, "enable_sparse_li_c8", False):
+            if query_scale is None or key_scale is None:
+                raise ValueError("LI C8 LIM requires query and index-key dequant scales")
+            if query.dtype != torch.int8 or index_cache.dtype != torch.int8:
+                raise ValueError("LI C8 LIM requires INT8 query and index-key cache")
+            if query_scale.dtype != torch.float16 or key_scale.dtype != torch.float16:
+                raise ValueError("LI C8 LIM requires FP16 query and index-key scales")
+            if weights.dtype != torch.bfloat16:
+                raise ValueError("LI C8 LIM requires BF16 index weights")
+            query = query.reshape(-1, self.n_head, 128)
+            query_scale = query_scale.reshape(-1, self.n_head)[:tokens].contiguous()
+            key_scale = key_scale.reshape(index_cache.shape[:3]).contiguous()
+            lim_op = torch.ops._C_ascend.npu_fused_quant_lightning_indexer_manage
+        else:
+            if self.lim_key_scale is None:
+                self.lim_key_scale = torch.empty(index_cache.shape[:3], dtype=torch.float32, device=query.device)
+                self.lim_query_scale = torch.empty(
+                    (self.lim_topk_src.shape[0], query.shape[1]), dtype=torch.float32, device=query.device
+                )
+            assert self.lim_query_scale is not None
+            query_scale = self.lim_query_scale[:tokens]
+            key_scale = self.lim_key_scale
+            lim_op = torch.ops._C_ascend.npu_fused_lightning_indexer_manage
+        lim_op(
             weights[:tokens].contiguous(),
-            self.lim_query_scale[:tokens],
+            query_scale,
             query[:tokens].contiguous(),
-            self.lim_key_scale,
+            key_scale,
             index_cache,
             table,
             metadata.copy_sfa_query_ends,
