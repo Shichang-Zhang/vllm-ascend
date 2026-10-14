@@ -24,10 +24,10 @@ def make_config(*, topk=2048, drafts=0, block_size=128, max_model_len=32768, met
 
 
 def options(**kwargs):
-    return dict(enabled=True, fused_op_type="fused_copy_sfa", host_backend="memfabric", topk_buffer_size=8192, **kwargs)
+    return dict(enabled=True, fused_op_type="fused_copy_sfa", host_backend="mooncake", topk_buffer_size=8192, **kwargs)
 
 
-def test_fused_copy_sfa_selects_memfabric_without_v1_overlap():
+def test_fused_copy_sfa_selects_mooncake_without_v1_overlap():
     config = SparseKVOffloadConfig.from_additional_config(make_config(drafts=3), options())
     assert config.use_fused_copy_sfa
     assert not config.use_fused_overlap
