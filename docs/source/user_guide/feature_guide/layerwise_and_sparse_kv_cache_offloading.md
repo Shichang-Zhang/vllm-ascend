@@ -198,8 +198,11 @@ To select the new kernels, configure Decode with:
 Use the existing `SfaRemoteD2HConnector` configuration for the MemFabric
 backend. Changing the Host backend does not select a connector automatically.
 
-This path requires TopK 2048, block size 128, BF16 main KV and an unquantized
-indexer cache. It supports 1–7 query tokens per request, including MTP, with
+This path requires TopK 2048, block size 128 and BF16 main KV. The indexer
+may use BF16 or LI C8 (`enable_sparse_li_c8=true`): C8 requires INT8 query/key,
+FP16 dequant scales and BF16 weights; FP8 is not supported. Native builds must
+include `npu_fused_quant_lightning_indexer_manage` for LI C8.
+It supports 1–7 query tokens per request, including MTP, with
 `max_model_len` at most 2097152. The hot budget must be a multiple of 256,
 at least `2048 * (1 + num_speculative_tokens)` and at most 16128. DSpark,
 context parallelism, pipeline parallelism and Model Runner V2 are unsupported.
