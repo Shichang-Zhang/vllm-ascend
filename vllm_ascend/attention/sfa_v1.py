@@ -1510,8 +1510,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
-        return DeviceOperator.indexer_select_post_process(
-            self,
+        return self._select_indexer_topk(
             q_li,
             q_li_scale,
             q_li_shape_ori,
@@ -1520,6 +1519,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
+        )
+
+    def _select_indexer_topk(
+        self, q_li, q_li_scale, q_li_shape, weights, kv_cache, attn_metadata, actual_query_lengths, actual_key_lengths
+    ):
+        """Select TopK using the backend's prepared indexer queries."""
+        return DeviceOperator.indexer_select_post_process(
+            self,
+            q_li,
+            q_li_scale,
+            q_li_shape,
+            weights,
+            kv_cache,
+            attn_metadata,
+            actual_query_lengths,
+            actual_key_lengths,
             self.enable_sparse_li_c8,
             self.use_torch_npu_lightning_indexer,
         )
