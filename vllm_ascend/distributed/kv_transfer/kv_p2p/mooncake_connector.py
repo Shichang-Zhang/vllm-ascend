@@ -2262,8 +2262,8 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                     raise ValueError("DSA Host offload requires kv_load_failure_policy='fail'")
                 if not offload.enabled:
                     raise ValueError("Blockwise DSA Decode requires sparse KV offload enabled")
-                if not offload.use_fused_overlap:
-                    raise ValueError("Blockwise DSA Decode requires fused overlap")
+                if not (offload.use_fused_overlap or getattr(offload, "use_fused_copy_sfa", False) is True):
+                    raise ValueError("Blockwise DSA Decode requires fused overlap or fused_copy_sfa")
                 if offload.host_backend != "mooncake":
                     raise ValueError("Blockwise DSA Decode requires host_backend='mooncake'")
             logger.debug(
