@@ -36,6 +36,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool im
     HostPoolTopology,
     MooncakeHostPool,
 )
+from vllm_ascend.ops.triton.batch_memcpy import batch_memcpy_kernel
 
 # Main BF16 cache:
 # [k_cache, v_cache, k_cache_cpu, v_cache_cpu, topk_buffer_k, topk_buffer_v].
@@ -48,6 +49,7 @@ OFFLOAD_K_CACHE_CPU_INDEX = 2
 OFFLOAD_V_CACHE_CPU_INDEX = 3
 OFFLOAD_TOPK_BUFFER_K_INDEX = 4
 OFFLOAD_TOPK_BUFFER_V_INDEX = 5
+COPY_SFA_MEMCPY_BLOCK_BYTES = 8192
 
 
 class HostKVAllocator(typing.Protocol):
@@ -1302,6 +1304,14 @@ class SparseKVOffloadManager:
         if self.use_fused_copy_sfa:
             self._bind_copy_sfa_bases()
             self.copy_sfa_visibility_token = torch.zeros(1, dtype=torch.int32, device=device)
+            if self._uses_mooncake_host_pool():
+                # Compile before serving; a zero-length copy touches no KV.
+                batch_memcpy_kernel[(1,)](
+                    self.copy_sfa_local_host_bases,
+                    self.copy_sfa_local_device_bases,
+                    torch.zeros(1, dtype=torch.int64, device=device),
+                    BLOCK_SIZE=COPY_SFA_MEMCPY_BLOCK_BYTES,
+                )
             if not self.sparse_kv_offload_config.keep_device_kv_cache:
                 # LIM owns residency on NPU; no CPU LRU planner or workspace is used.
                 return
@@ -1634,6 +1644,20 @@ class SparseKVOffloadManager:
                 ).view(2, 1)
             )
 
+        if self._uses_mooncake_host_pool():
+            # These are each rank's own NPU-addressable VMM pointers, never
+            # pointers broadcast from TP0 or MemFabric global addresses.
+            self.copy_sfa_local_host_bases = torch.stack(self.copy_sfa_host_bases)
+            self.copy_sfa_local_device_bases = torch.stack(self.copy_sfa_device_bases)
+            self.copy_sfa_local_token_bytes = torch.tensor(
+                [
+                    self.topk_buffers_k[0].shape[-1] * self.topk_buffers_k[0].element_size(),
+                    self.topk_buffers_v[0].shape[-1] * self.topk_buffers_v[0].element_size(),
+                ],
+                dtype=torch.int64,
+                device=device,
+            ).view(1, 2, 1)
+
     def dense_fill_copy_sfa_rows(
         self,
         dense_fills: dict[int, tuple[int, int]],
@@ -1648,6 +1672,19 @@ class SparseKVOffloadManager:
         and block size, outside graph capture at metadata-build time. Host and
         device bases are bound during cache registration.
         """
+        if self._uses_mooncake_host_pool():
+            sources, destinations, lengths = [], [], []
+            stride_tokens = self.topk_buffers_k[0].shape[1]
+            for slot, (row, computed) in dense_fills.items():
+                for block in range(cdiv(computed, block_size)):
+                    sources.append(int(block_table[row, block]) * block_size)
+                    destinations.append(slot * stride_tokens + block * block_size)
+                    lengths.append(min(block_size, computed - block * block_size))
+            if sources:
+                device = self.topk_buffers_k[0].device
+                descriptors = torch.tensor([sources, destinations, lengths], dtype=torch.int64, device=device)
+                self._copy_sfa_local_ranges(*descriptors.unbind(0))
+            return
         topk_k = self.topk_buffers_k[0]
         stride_tokens = topk_k.shape[1]
         token_bytes = torch.tensor(
@@ -1662,13 +1699,6 @@ class SparseKVOffloadManager:
             if computed <= 0:
                 continue
             nblocks = (computed + block_size - 1) // block_size
-            if self._uses_mooncake_host_pool():
-                for block in range(nblocks):
-                    source = int(block_table[row, block]) * block_size
-                    destination = slot * stride_tokens + block * block_size
-                    length = min(block_size, computed - block * block_size)
-                    self._copy_sfa_local_rows(source, destination, length)
-                continue
             src_tokens = torch.tensor(
                 [int(block_table[row, b]) * block_size for b in range(nblocks)], dtype=torch.int64
             ).to(topk_k.device)
@@ -1696,20 +1726,11 @@ class SparseKVOffloadManager:
         if src_off is None or dst_off is None or lengths is None or count is None:
             return
         if self._uses_mooncake_host_pool():
-            # Exact tail geometry stays on NPU during normal decode. Request
-            # admission and prefix rollback run eagerly, outside graph capture;
-            # stage their bounded recovery descriptors once for typed VMM copies.
-            descriptors = (
-                torch.stack(
-                    (metadata.copy_sfa_tail_src, metadata.copy_sfa_tail_dst, metadata.copy_sfa_tail_lengths), dim=-1
-                )
-                .reshape(-1, 3)
-                .cpu()
-                .tolist()
+            self._copy_sfa_local_ranges(
+                metadata.copy_sfa_tail_src,
+                metadata.copy_sfa_tail_dst,
+                metadata.copy_sfa_tail_lengths,
             )
-            for source, destination, length in descriptors:
-                if length:
-                    self._copy_sfa_local_rows(source, destination, length)
             return
         if not getattr(self, "copy_sfa_host_bases", None):
             raise RuntimeError("fused_copy_sfa KV base addresses must be bound before tail restore")
@@ -1727,14 +1748,20 @@ class SparseKVOffloadManager:
         if result not in (None, 0):
             raise RuntimeError(f"memfabric fused_copy_sfa tail H2D failed with result={result}")
 
-    def _copy_sfa_local_rows(self, source: int, destination: int, length: int) -> None:
-        """Restore an eager recovery range through each rank's own VMM mapping."""
-        for host_k, host_v, device_k, device_v in zip(
-            self.k_caches_cpu, self.v_caches_cpu, self.topk_buffers_k, self.topk_buffers_v
-        ):
-            for host, device in ((host_k, device_k), (host_v, device_v)):
-                source_rows = host.view(-1, host.shape[-1])[source : source + length]
-                device.view(-1, device.shape[-1])[destination : destination + length].copy_(source_rows)
+    def _copy_sfa_local_ranges(self, sources: torch.Tensor, destinations: torch.Tensor, lengths: torch.Tensor) -> None:
+        """Restore all layers in one launch using this rank's local VMM addresses.
+
+        Descriptors stay on device. Zero-length entries, including padded
+        requests, issue no memory accesses. Each active destination range must
+        be disjoint, as guaranteed by the request-owned row layout.
+        """
+        if sources.numel() == 0:
+            return
+        token_bytes = self.copy_sfa_local_token_bytes
+        src = self.copy_sfa_local_host_bases + sources.reshape(1, 1, -1) * token_bytes
+        dst = self.copy_sfa_local_device_bases + destinations.reshape(1, 1, -1) * token_bytes
+        sizes = (lengths.reshape(1, 1, -1) * token_bytes).expand_as(src).contiguous()
+        batch_memcpy_kernel[(src.numel(),)](src, dst, sizes, BLOCK_SIZE=COPY_SFA_MEMCPY_BLOCK_BYTES)
 
     def offload_new_kv(
         self,
