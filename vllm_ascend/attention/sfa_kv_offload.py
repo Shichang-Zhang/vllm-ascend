@@ -53,6 +53,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     split_decodes_and_prefills,
 )
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
@@ -809,6 +810,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         layer_id = manager._get_offload_layer_id(layer_name)
         hbm_k = manager.topk_buffers_k[layer_id].view(-1, 128, 1, self.kv_lora_rank)
         hbm_v = manager.topk_buffers_v[layer_id].view(-1, 128, 1, self.qk_rope_head_dim)
+        manager.ensure_copy_sfa_host_visibility(capturing=self._in_graph_runtime())
         host_k = manager.k_caches_cpu[layer_id].view(-1, 128, self.kv_lora_rank)
         host_v = manager.v_caches_cpu[layer_id].view(-1, 128, self.qk_rope_head_dim)
         if reuse_indices:
@@ -968,9 +970,14 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if self._is_decode_only(attn_metadata):
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
-            if attn_metadata.fused_copy_sfa_enabled:
+            if (
+                attn_metadata.fused_copy_sfa_enabled
+                and not get_ascend_config().sparse_kv_offload_config.keep_device_kv_cache
+            ):
                 # Fused normalize/rotate/write: current-token KV is scattered
                 # directly into the resident tail pages by one operator.
+                # Colocate fallback (keep_device_kv_cache) instead takes the
+                # explicit path below so the paged main cache also stays fresh.
                 kv_cache = self._get_current_layer_resident_cache_tensors()
                 slot_mapping = attn_metadata.copy_sfa_device_slots
                 return super().exec_kv(
@@ -983,6 +990,26 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 )
             k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
             k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
+            if getattr(attn_metadata, "fused_copy_sfa_enabled", False):
+                layer_id = manager._get_offload_layer_id(layer_name)
+                device_slots = attn_metadata.copy_sfa_device_slots
+                assert device_slots is not None
+                for cache_tensor, value in (
+                    (manager.topk_buffers_k[layer_id], k_nope),
+                    (manager.topk_buffers_v[layer_id], k_pe),
+                ):
+                    rows = cache_tensor.view(-1, cache_tensor.shape[-1])
+                    rows.index_copy_(0, device_slots[: value.shape[0]], value.reshape(value.shape[0], -1))
+            if self.use_fused_copy_sfa and manager.sparse_kv_offload_config.keep_device_kv_cache:
+                # Mixed fallback recovers tails from this paged cache. Keep
+                # pure-decode writes there too, so it never reads stale KV.
+                DeviceOperator.reshape_and_cache(
+                    k_nope.reshape(-1, self.num_kv_heads, self.kv_lora_rank),
+                    k_pe.reshape(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                    kv_cache[0],
+                    kv_cache[1],
+                    slots.to(torch.int64),
+                )
             manager.offload_new_kv(
                 layer_name=layer_name,
                 slot_mapping=slots,
@@ -1021,14 +1048,13 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         return result
 
     def _copy_prefill_kv_to_copy_sfa_row(self, kv_cache, attn_metadata: M, manager, layer_name: str) -> None:
-        """Colocate: D2D this batch's new prefill KV from the paged main cache
-        into each request's topk row, mirroring the PD pull D2D.
+        """Colocate: maintain Copy-SFA rows while a mixed batch uses fallback.
 
         Routing mirrors the PD connector: short requests (kv_len <= hot) copy
         their new tokens front-to-back into the dense row; long requests copy
-        only the incomplete last block into the circular tail slots. Per-batch
-        new-token granularity keeps chunked prefill incremental and stateless;
-        the last chunk leaves exactly the state the first decode expects.
+        the whole incomplete last block into the circular tail slots. Include
+        decode rows so their tails stay current across repeated mixed batches.
+        Dense prefix recovery depends on the runner's eager refill path.
         """
         if not self.use_fused_copy_sfa or not get_ascend_config().sparse_kv_offload_config.keep_device_kv_cache:
             return
@@ -1038,8 +1064,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         pool_slots = getattr(attn_metadata, "copy_sfa_prefill_pool_slots", None)
         if pool_slots is None:
             return
-        first = int(attn_metadata.num_decodes)
-        last = first + int(attn_metadata.num_prefills)
+        first = 0
+        last = int(attn_metadata.num_decodes) + int(attn_metadata.num_prefills)
         if first >= last:
             return
         q_ends = attn_metadata.cum_query_lens
@@ -1055,7 +1081,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             start = kv_len - q_len  # this batch's new tokens [start, kv_len)
             is_short = kv_len <= hot
             if not is_short:
-                start = max(start, (kv_len // LIM_CACHE_BLOCK_SIZE) * LIM_CACHE_BLOCK_SIZE)  # long: tail block only
+                # A mixed decode may have skipped Copy-SFA for several steps.
+                # Recover the full partial block, including its prior tokens.
+                start = (kv_len // LIM_CACHE_BLOCK_SIZE) * LIM_CACHE_BLOCK_SIZE
             if start >= kv_len:
                 continue
             positions = torch.arange(start, kv_len, dtype=torch.int64, device=device)

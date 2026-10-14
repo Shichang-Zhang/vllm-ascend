@@ -1,0 +1,395 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Mooncake recovery copies and writeback visibility for device-managed residency."""
+
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+import torch
+
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import sparse_kv_offload_manager as manager_module
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import prepare_copy_sfa_request_slots
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import MooncakeHostPool
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import SparseKVOffloadManager
+
+
+def manager():
+    result = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+    result.use_fused_copy_sfa = True
+    result.use_fused_overlap = False
+    result._host_kv_allocator = object.__new__(MooncakeHostPool)
+    result.topk_buffers_k = [torch.zeros((2, 8448, 1, 2), dtype=torch.bfloat16)]
+    result.topk_buffers_v = [torch.zeros((2, 8448, 1, 1), dtype=torch.bfloat16)]
+    result.k_caches_cpu = [torch.arange(1024).reshape(4, 128, 1, 2).to(torch.bfloat16)]
+    result.v_caches_cpu = [torch.arange(512).reshape(4, 128, 1, 1).to(torch.bfloat16)]
+    return result
+
+
+@pytest.mark.parametrize("computed", [0, 128, 129])
+def test_fresh_dense_request_restores_local_views(computed):
+    result = manager()
+    with patch.object(manager_module.offload, "sparse_copy") as memfabric:
+        result.dense_fill_copy_sfa_rows({1: (0, computed)}, block_size=128, block_table=np.array([[2, 0, 1]]))
+    expected = torch.cat((result.k_caches_cpu[0][2], result.k_caches_cpu[0][0]))[:computed]
+    torch.testing.assert_close(result.topk_buffers_k[0][1, :computed], expected)
+    assert not result.topk_buffers_k[0][1, computed:].count_nonzero()
+    memfabric.assert_not_called()
+
+
+def test_tail_restore_copies_every_layer_through_its_own_local_mapping():
+    result = manager()
+    result.topk_buffers_k.append(torch.zeros_like(result.topk_buffers_k[0]))
+    result.topk_buffers_v.append(torch.zeros_like(result.topk_buffers_v[0]))
+    result.k_caches_cpu.append(result.k_caches_cpu[0] + 10)
+    result.v_caches_cpu.append(result.v_caches_cpu[0] + 20)
+    metadata = SimpleNamespace(
+        copy_sfa_copy_src_offsets=torch.empty(4),
+        copy_sfa_copy_dst_offsets=torch.empty(4),
+        copy_sfa_copy_lengths=torch.empty(4),
+        copy_sfa_copy_count=torch.tensor([4]),
+        copy_sfa_tail_src=torch.tensor([[256, 384]]),
+        copy_sfa_tail_dst=torch.tensor([[8448 + 8192, 8448 + 8320]]),
+        copy_sfa_tail_lengths=torch.tensor([[17, 0]]),
+    )
+    with patch.object(manager_module.offload, "sparse_copy") as memfabric:
+        result.restore_copy_sfa_tails(metadata)
+    for layer in range(2):
+        torch.testing.assert_close(result.topk_buffers_k[layer][1, 8192:8209], result.k_caches_cpu[layer][2, :17])
+        torch.testing.assert_close(result.topk_buffers_v[layer][1, 8192:8209], result.v_caches_cpu[layer][2, :17])
+        assert not result.topk_buffers_k[layer][1, 8320:].count_nonzero()
+    memfabric.assert_not_called()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_tp_visibility_waits_for_writeback_before_broadcast(rank):
+    result = manager()
+    result.tp_rank = rank
+    result.tp_size = 2
+    result.tp_group = MagicMock()
+    result.current_kv_save_stream = MagicMock()
+    result.copy_sfa_visibility_token = torch.zeros(1, dtype=torch.int32)
+    events = []
+    stream = MagicMock()
+    stream.wait_stream.side_effect = lambda other: events.append("wait")
+    result.tp_group.broadcast.side_effect = lambda *args, **kwargs: events.append("broadcast")
+    with patch.object(manager_module.torch_npu.npu, "current_stream", return_value=stream):
+        result.ensure_copy_sfa_host_visibility(capturing=True)
+    assert events == (["wait", "broadcast"] if rank == 0 else ["broadcast"])
+
+
+@pytest.mark.parametrize("computed", [128, 8192, 8193, 8320])
+def test_new_pd_requests_restore_dense_or_tail_once(computed):
+    kwargs = dict(
+        req_ids=["a"],
+        live_req_ids=["a"],
+        slots=np.zeros(4, dtype=np.int32),
+        generations=np.zeros(4, dtype=np.int64),
+        request_slots={},
+        slot_generations={},
+        last_prefixes={},
+        generation=0,
+        prebound_slots={},
+        computed_tokens=np.array([computed]),
+        padded_reqs=2,
+        block_size=128,
+        hot_tokens=8192,
+        dummy=False,
+        restore_new_requests=True,
+    )
+    mapping, generation, restore_tails, dense = prepare_copy_sfa_request_slots(**kwargs)
+    assert restore_tails is (computed > 8192)
+    assert dense == ({0: (0, computed)} if computed <= 8192 else {})
+    kwargs.update(request_slots=mapping, generation=generation)
+    _, _, restore_tails, dense = prepare_copy_sfa_request_slots(**kwargs)
+    assert not restore_tails
+    assert not dense
+
+
+def test_recycled_request_slot_clears_previous_prefix_history():
+    kwargs = dict(
+        req_ids=["new"],
+        live_req_ids=["new"],
+        slots=np.zeros(4, dtype=np.int32),
+        generations=np.zeros(4, dtype=np.int64),
+        request_slots={"old": 0},
+        slot_generations={0: 1},
+        last_prefixes={0: 16384},
+        generation=1,
+        prebound_slots={},
+        computed_tokens=np.array([128]),
+        padded_reqs=2,
+        block_size=128,
+        hot_tokens=8192,
+        dummy=False,
+    )
+    mapping, generation, restore_tails, dense = prepare_copy_sfa_request_slots(**kwargs)
+    assert mapping == {"new": 0}
+    assert generation == 2
+    assert not restore_tails
+    assert not dense
+    assert kwargs["last_prefixes"] == {0: 128}
+
+
+def test_v2_mooncake_writeback_selects_typed_index_copy():
+    result = manager()
+    result.tp_rank = 0
+    result._offload_new_kv_via_index_copy = MagicMock()
+    slots, kv = torch.tensor([1]), torch.ones((1, 1, 1, 2), dtype=torch.bfloat16)
+    with patch.object(manager_module.offload, "sparse_copy") as memfabric:
+        result._offload_new_kv_on_current_stream(
+            slots, result.k_caches_cpu[0], result.v_caches_cpu[0], None, None, kv, kv[..., :1], capturing=True
+        )
+    result._offload_new_kv_via_index_copy.assert_called_once()
+    memfabric.assert_not_called()
+
+
+def test_v2_registration_skips_cpu_lru_workspace_and_warmup():
+    result = manager()
+    result.tp_rank = 0
+    result.tp_size = 1
+    result.num_layers = 1
+    result.host_backend = "mooncake"
+    result.max_num_tokens = 8
+    result.max_num_reqs = 2
+    result.max_num_topk_rows = 8
+    result.max_d2h_index_copy_tokens = 8
+    result.block_size = 128
+    result.topk_buffer_size = 8192
+    result.topk = 2048
+    result.sparse_kv_offload_config = SimpleNamespace(keep_device_kv_cache=False)
+    result.offload_layer_names = ["layer.0"]
+    result._register_offload_layers = MagicMock()
+    result._register_local_mooncake_views = MagicMock()
+    result._initialize_fused_writeback_descriptors = MagicMock()
+    result._initialize_paired_current_scatter = MagicMock()
+    result._warmup_external_lru_planner_threads = MagicMock()
+    caches = {
+        "layer.0": (
+            None,
+            None,
+            result.k_caches_cpu[0],
+            result.v_caches_cpu[0],
+            result.topk_buffers_k[0],
+            result.topk_buffers_v[0],
+        )
+    }
+    empty, zeros = torch.empty, torch.zeros
+
+    def cpu_empty(*args, **kwargs):
+        kwargs["pin_memory"] = False
+        return empty(*args, **kwargs)
+
+    def cpu_zeros(*args, **kwargs):
+        kwargs["pin_memory"] = False
+        return zeros(*args, **kwargs)
+
+    with (
+        patch.object(manager_module.torch, "empty", side_effect=cpu_empty),
+        patch.object(manager_module.torch, "zeros", side_effect=cpu_zeros),
+    ):
+        result.register_kv_caches(caches)
+    result._warmup_external_lru_planner_threads.assert_not_called()
+    assert not hasattr(result, "lru_topk_indices_cpu")
+    assert not hasattr(result, "lru_slot_to_token_cpu_list")
+    assert len(result.copy_sfa_host_bases) == 1
+    assert result.copy_sfa_host_bases[0][0].item() == caches["layer.0"][2].data_ptr()
+
+
+def test_v2_writeback_descriptors_are_reused_per_forward_and_draft_step():
+    result = manager()
+    result.tp_rank = 0
+    result.layer_name_to_offload_id = {f"layer.{index}": index for index in range(4)}
+    result.current_kv_save_stream = MagicMock()
+    result._offload_new_kv_on_current_stream = MagicMock()
+    context = SimpleNamespace(is_draft_model=False)
+    slot_layouts = [torch.arange(4), torch.arange(4) + 10, torch.arange(2) + 20]
+    kv = torch.ones((4, 1, 1, 2), dtype=torch.bfloat16)
+    with (
+        patch.object(manager_module, "is_forward_context_available", return_value=True),
+        patch.object(manager_module, "get_forward_context", side_effect=lambda: context),
+        patch.object(manager_module.torch_npu.npu, "current_stream") as stream,
+    ):
+        groups = [(0, slot_layouts[0]), (2, slot_layouts[1]), (2, slot_layouts[2]), (2, slot_layouts[2])]
+        for first_layer, slots in groups:
+            if first_layer == 2:
+                context.is_draft_model = True
+            for layer in (first_layer, first_layer + 1):
+                result.offload_new_kv(f"layer.{layer}", slots, None, None, None, None, kv, kv, capturing=True)
+        context = SimpleNamespace(is_draft_model=False)
+        for layer in (0, 1):
+            result.offload_new_kv(f"layer.{layer}", slot_layouts[0], None, None, None, None, kv, kv, capturing=True)
+    prepared = [
+        call.kwargs["prepare_index_copy_descriptors"]
+        for call in result._offload_new_kv_on_current_stream.call_args_list
+    ]
+    assert prepared == [True, False] * 5
+    stream.return_value.wait_stream.assert_not_called()
+
+
+class WritebackCaptureStreams:
+    """Reject waits on a side stream that has not joined this capture."""
+
+    def __init__(self):
+        self.main = MagicMock()
+        self.save = MagicMock()
+        self.current = self.main
+        self.scope = None
+        self.save_scope = None
+        self.events = []
+        self.main.record_event.side_effect = self.record
+        self.save.wait_event.side_effect = self.fork
+        self.main.wait_stream.side_effect = self.join
+
+    def begin_capture(self):
+        self.scope = object()
+        self.events = []
+
+    def record(self):
+        self.events.append("record")
+        return self.scope
+
+    def fork(self, event):
+        assert event is self.scope
+        self.save_scope = event
+        self.events.append("fork")
+
+    def join(self, stream):
+        assert stream is self.save
+        if self.save_scope is not self.scope:
+            raise RuntimeError("event wait has no corresponding event record in this capture")
+        self.events.append("join")
+
+    @contextmanager
+    def use(self, stream):
+        previous = self.current
+        self.current = stream
+        try:
+            yield
+        finally:
+            self.current = previous
+
+
+@pytest.mark.parametrize("warmup", [False, True])
+def test_writeback_forks_each_capture_before_reusing_target_and_draft_descriptors(warmup):
+    result = manager()
+    result.tp_rank = 0
+    result.tp_size = 1
+    result.layer_name_to_offload_id = {f"layer.{index}": index for index in range(4)}
+    element_size = torch.bfloat16.itemsize
+    result.token_size_bytes_k = 2 * element_size
+    result.token_size_bytes_v = element_size
+    result.max_d2h_index_copy_tokens = 4
+    for name in ("slot_mapping", "src_idx", "dst_idx"):
+        setattr(result, f"d2h_{name}_cpu", torch.zeros(4, dtype=torch.int64))
+    result.d2h_src_idx_npu = torch.zeros(4, dtype=torch.int64)
+    result.d2h_dst_idx_npu = torch.zeros(4, dtype=torch.int64)
+    result.d2h_index_count_cpu = torch.zeros(1, dtype=torch.int32)
+    result.d2h_index_count_npu = torch.zeros(1, dtype=torch.int32)
+    streams = WritebackCaptureStreams()
+    result.current_kv_save_stream = streams.save
+    context = SimpleNamespace(is_draft_model=False)
+    host_k = torch.zeros((16, 2), dtype=torch.bfloat16)
+    host_v = torch.zeros((16, 1), dtype=torch.bfloat16)
+    preparation_streams = []
+
+    def prepare(slots, token_count, capacity, num_slots, src, dst, count):
+        preparation_streams.append(streams.current)
+        streams.events.append("prepare")
+        src.zero_()
+        dst.fill_(slots[0])
+        src[:token_count].copy_(torch.arange(token_count))
+        dst[:token_count].copy_(slots[:token_count])
+        count.fill_(token_count)
+
+    result.sparse_kv_offload_cpp = SimpleNamespace(enqueue_current_kv_index_copy_descriptors=prepare)
+    index_copy = torch.Tensor.index_copy_
+
+    def write(destination, *args):
+        assert streams.current is streams.save
+        streams.events.append("write")
+        return index_copy(destination, *args)
+
+    def offload_pair(first_layer, slots):
+        k = torch.arange(slots.numel() * 2).reshape(-1, 2).to(torch.bfloat16) + first_layer * 10
+        v = k[:, :1].contiguous()
+        for layer in (first_layer, first_layer + 1):
+            result.offload_new_kv(f"layer.{layer}", slots, host_k, host_v, None, None, k, v, capturing=True)
+            result.ensure_copy_sfa_host_visibility(capturing=True)
+        torch.testing.assert_close(host_k[slots], k)
+        torch.testing.assert_close(host_v[slots], v)
+
+    with (
+        patch.object(manager_module, "is_forward_context_available", return_value=True),
+        patch.object(manager_module, "get_forward_context", side_effect=lambda: context),
+        patch.object(manager_module.torch_npu.npu, "current_stream", side_effect=lambda: streams.current),
+        patch.object(manager_module.torch_npu.npu, "stream", side_effect=streams.use),
+        patch.object(torch.Tensor, "index_copy_", new=write),
+    ):
+        if warmup:
+            streams.begin_capture()
+            offload_pair(0, torch.tensor([2, 3, 4, 5]))
+        # Each shape is a separate capture. Previous save-stream records do
+        # not satisfy a wait in the next graph, including after warmup.
+        for token_count in (4, 2, 4):
+            streams.begin_capture()
+            context = SimpleNamespace(is_draft_model=False)
+            slots = torch.arange(token_count) + 2
+            offload_pair(0, slots)
+            context.is_draft_model = True
+            slots.add_(8)
+            offload_pair(2, slots)
+            # Repeating a draft layer starts another forward with the same
+            # storage, so it must republish only after the earlier reads.
+            offload_pair(2, slots)
+            pair_events = ["record", "fork", "prepare", "write", "write", "join"] + [
+                "record",
+                "fork",
+                "write",
+                "write",
+                "join",
+            ]
+            assert streams.events == pair_events * 3
+    assert all(stream is streams.save for stream in preparation_streams)
+
+
+def test_target_and_draft_using_the_same_slot_storage_prepare_distinct_descriptors():
+    result = manager()
+    result.layer_name_to_offload_id = {f"layer.{index}": index for index in range(4)}
+    result.current_kv_save_stream = MagicMock()
+    context = SimpleNamespace(is_draft_model=False)
+    slots = torch.arange(4)
+    with (
+        patch.object(manager_module, "is_forward_context_available", return_value=True),
+        patch.object(manager_module, "get_forward_context", return_value=context),
+        patch.object(manager_module.torch_npu.npu, "current_stream") as stream,
+    ):
+        assert result._prepare_copy_sfa_writeback_layout("layer.0", slots)
+        assert not result._prepare_copy_sfa_writeback_layout("layer.1", slots)
+        context.is_draft_model = True
+        slots.add_(10)
+        assert result._prepare_copy_sfa_writeback_layout("layer.2", slots)
+        assert not result._prepare_copy_sfa_writeback_layout("layer.3", slots)
+    stream.return_value.wait_stream.assert_not_called()
+
+
+def test_target_rollback_requests_eager_dense_refill():
+    _, _, restore_tails, dense_fills = prepare_copy_sfa_request_slots(
+        req_ids=["request"],
+        live_req_ids=["request"],
+        slots=np.zeros(4, dtype=np.int32),
+        generations=np.zeros(4, dtype=np.int64),
+        request_slots={"request": 0},
+        slot_generations={0: 7},
+        last_prefixes={0: 8192},
+        generation=7,
+        prebound_slots={},
+        computed_tokens=np.array([8191]),
+        padded_reqs=1,
+        block_size=128,
+        hot_tokens=8192,
+        dummy=False,
+    )
+    assert restore_tails
+    assert dense_fills == {0: (0, 8191)}

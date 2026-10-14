@@ -19,6 +19,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend
@@ -153,7 +154,16 @@ def allocate_kv_offload_topk_buffer_pair(
         # Query-row metadata still needs max_num_seqs * decode_width, but
         # multiplying the large hot K/V allocation by that width wastes HBM.
         request_rows = 2 * copy_sfa_pool_capacity(vllm_config.scheduler_config.max_num_seqs)
-        max_num_topk_rows = request_rows
+        if sparse_kv_offload_config.keep_device_kv_cache:
+            # The old planner addresses tightly packed C-token rows. Reserve
+            # a private suffix for fallback without changing the cache tuple;
+            # profiling sees these bytes through this same allocator.
+            max_num_topk_rows = request_rows + min(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.scheduler_config.max_num_seqs * decode_width,
+            )
+        else:
+            max_num_topk_rows = request_rows
         topk_buffer_size += COPY_SFA_TAIL_BLOCKS * vllm_config.cache_config.block_size
     topk_buffer_k_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * k_dim * torch.bfloat16.itemsize
     topk_buffer_v_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * v_dim * torch.bfloat16.itemsize
@@ -1259,6 +1269,11 @@ class SparseKVOffloadManager:
         kv_caches: dict[str, torch.Tensor],
     ) -> None:
         self._register_offload_layers(kv_caches)
+        self._copy_sfa_writeback_context = None
+        self._copy_sfa_writeback_key = None
+        self._copy_sfa_writeback_layers: set[int] = set()
+
+        # Mooncake hands every TP rank local Host KV views; MemFabric uses tp0 allocation + pointer broadcast.
         uses_local_views = self.host_backend == "mooncake"
 
         # register topk_buffer and cpu kv_cache
@@ -1279,6 +1294,8 @@ class SparseKVOffloadManager:
             if uses_local_views or self.tp_rank == 0:
                 self.k_caches_cpu.append(cache_or_caches[OFFLOAD_K_CACHE_CPU_INDEX])
                 self.v_caches_cpu.append(cache_or_caches[OFFLOAD_V_CACHE_CPU_INDEX])
+
+        self._bind_resident_fallback_buffers()
 
         kv_head_num = self.topk_buffers_k[0].size(-2)
         head_dim_k = self.topk_buffers_k[0].size(-1)
@@ -1339,18 +1356,22 @@ class SparseKVOffloadManager:
         self.d2h_src_ptrs_npu = torch.empty(d2h_descriptor_rows, dtype=torch.int64, device=device)
         self.d2h_dst_ptrs_npu = torch.empty(d2h_descriptor_rows, dtype=torch.int64, device=device)
         self.d2h_lengths_npu = torch.empty(d2h_descriptor_rows, dtype=torch.int32, device=device)
-        if self.use_fused_overlap:
+        if self.use_fused_overlap or self.use_fused_copy_sfa:
             self.current_kv_save_stream = torch_npu.npu.Stream()
-            self.fused_plan_stream = torch_npu.npu.Stream()
-            metadata = torch.zeros(
-                1 + self.max_num_topk_rows,
-                dtype=torch.int32,
-                device=device,
-            )
-            self.fused_plan_metadata_npu = metadata
-            self.fused_plan_status_npu = metadata[:1]
-            self.fused_plan_current_linear_slots_npu = metadata[1:]
-            self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            if self.use_fused_overlap:
+                self.fused_plan_stream = torch_npu.npu.Stream()
+                self.fused_async_plan = envs.VLLM_ASCEND_FSA_ASYNC_PLAN
+                self.fused_reuse_writeback_layout = envs.VLLM_ASCEND_FSA_REUSE_WRITEBACK_LAYOUT
+                self.fused_writeback_capture_token = None
+                self.fused_writeback_layouts = {}
+                self.fused_plan_metadata_npu = torch.zeros(
+                    1 + self.max_num_topk_rows,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.fused_plan_status_npu = self.fused_plan_metadata_npu[:1]
+                self.fused_plan_current_linear_slots_npu = self.fused_plan_metadata_npu[1:]
+                self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
             if self._uses_mooncake_host_pool() and self.tp_rank == 0:
                 self.d2h_dst_idx_npu = torch.empty(
                     self.max_d2h_index_copy_tokens,
@@ -1362,10 +1383,11 @@ class SparseKVOffloadManager:
         self._initialize_mooncake_index_copy_descriptors()
         self._initialize_paired_current_scatter()
 
-        # Base addresses of the device resident rows, shared by sparse_copy
-        # descriptor assembly and the delayed D2H pipeline.
-        self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
-        self.addr_v_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_v]
+        # Base addresses of the planner-packed resident rows: sparse_copy
+        # descriptor assembly and the delayed D2H pipeline share them. Without
+        # the colocate fallback arena these equal the topk buffers.
+        self.addr_k_bases: list[int] = [t.data_ptr() for t in self.resident_buffers_k]
+        self.addr_v_bases: list[int] = [t.data_ptr() for t in self.resident_buffers_v]
         # Broadcast the shared host KV pool bases and shapes.
         self.gvas_k_bases: list[int] = []
         self.gvas_v_bases: list[int] = []
@@ -1445,8 +1467,14 @@ class SparseKVOffloadManager:
             self._allocate_d2h_execution_state()
         if self.use_fused_copy_sfa:
             self._bind_copy_sfa_bases()
+            self.copy_sfa_visibility_token = torch.zeros(1, dtype=torch.int32, device=device)
+            if not self.sparse_kv_offload_config.keep_device_kv_cache:
+                # LIM owns residency on NPU; no CPU LRU planner or workspace is used.
+                return
 
-        if self.use_fused_overlap:
+        if self.use_fused_overlap or (
+            self.use_fused_copy_sfa and self.sparse_kv_offload_config.keep_device_kv_cache
+        ):
             self._init_fused_overlap_planner()
 
     def _init_fused_overlap_planner(self) -> None:
@@ -1616,6 +1644,80 @@ class SparseKVOffloadManager:
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
         self.lru_physical_row_workspace_ptr = self.lru_physical_row_workspace.data_ptr()
 
+    def _bind_resident_fallback_buffers(self) -> None:
+        """Give the CPU planner packed rows separate from Copy-SFA residency."""
+        self.resident_buffers_k = self.topk_buffers_k
+        self.resident_buffers_v = self.topk_buffers_v
+        if not self.use_fused_copy_sfa or not self.sparse_kv_offload_config.keep_device_kv_cache:
+            return
+        pool_rows = 2 * copy_sfa_pool_capacity(self.max_num_reqs)
+        resident_tokens = self.max_num_topk_rows * self.topk_buffer_size
+
+        def views(buffers):
+            result = []
+            for buffer in buffers:
+                stride_tokens = buffer.shape[1]
+                flat = buffer.view(-1, *buffer.shape[-2:])
+                start = pool_rows * stride_tokens
+                if flat.shape[0] - start < resident_tokens:
+                    raise RuntimeError("Copy-SFA allocation is missing its colocate fallback arena")
+                result.append(
+                    flat[start : start + resident_tokens].view(
+                        self.max_num_topk_rows, self.topk_buffer_size, *buffer.shape[-2:]
+                    )
+                )
+            return result
+
+        self.resident_buffers_k = views(self.topk_buffers_k)
+        self.resident_buffers_v = views(self.topk_buffers_v)
+
+    def _initialize_paired_current_scatter(self) -> None:
+        self.fused_current_scatter = None
+        if not self.use_fused_overlap or self.max_num_tokens == 0 or not envs.VLLM_ASCEND_FSA_PAIRED_CURRENT_SCATTER:
+            return
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.current_kv_scatter import (
+            try_paired_current_scatter,
+            warmup_current_scatter,
+        )
+
+        warmup_current_scatter(self)
+        self.fused_current_scatter = try_paired_current_scatter
+
+    def _initialize_fused_writeback_descriptors(self) -> None:
+        self.fused_writeback_descriptor_builder = None
+        if (
+            not self.use_fused_overlap
+            or self.tp_rank != 0
+            or self.max_num_tokens == 0
+            or not envs.VLLM_ASCEND_FSA_FUSED_WRITEBACK_DESCRIPTORS
+        ):
+            return
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.writeback_descriptors import (
+            build_writeback_descriptors,
+            warmup_writeback_descriptors,
+        )
+
+        warmup_writeback_descriptors(self)
+        self.fused_writeback_descriptor_builder = build_writeback_descriptors
+        self.fused_reuse_writeback_layout = False
+
+    def _initialize_mooncake_index_copy_descriptors(self) -> None:
+        self.fused_index_copy_descriptor_builder = None
+        if (
+            not (self.use_fused_overlap or self.use_fused_copy_sfa)
+            or self.tp_rank != 0
+            or self.max_d2h_index_copy_tokens == 0
+            or not self._uses_mooncake_host_pool()
+        ):
+            return
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.index_copy_descriptors import (
+            build_index_copy_destinations,
+            warmup_index_copy_destinations,
+        )
+
+        warmup_index_copy_destinations(self)
+        self.fused_index_copy_descriptor_builder = build_index_copy_destinations
+
     def _bind_copy_sfa_bases(self) -> None:
         """Pin host/device row bases used by eager prefix-rollback tail restore."""
         if not self.k_caches_cpu or not self.topk_buffers_k:
@@ -1669,7 +1771,16 @@ class SparseKVOffloadManager:
         )
         block_bytes = token_bytes * block_size
         for slot, (row, computed) in dense_fills.items():
+            if computed <= 0:
+                continue
             nblocks = (computed + block_size - 1) // block_size
+            if self._uses_mooncake_host_pool():
+                for block in range(nblocks):
+                    source = int(block_table[row, block]) * block_size
+                    destination = slot * stride_tokens + block * block_size
+                    length = min(block_size, computed - block * block_size)
+                    self._copy_sfa_local_rows(source, destination, length)
+                continue
             if isinstance(block_table, torch.Tensor):
                 if block_table.device != topk_k.device:
                     raise ValueError("Tensor block table must be on the same device as the top-k buffers")
@@ -1680,7 +1791,6 @@ class SparseKVOffloadManager:
                 src_tokens = torch.tensor(
                     [int(block_table[row, b]) * block_size for b in range(nblocks)], dtype=torch.int64
                 ).to(topk_k.device)
-                src_offsets = src_tokens.view(1, -1) * token_bytes
             lengths = torch.clamp(
                 torch.arange(nblocks, dtype=torch.int64, device=topk_k.device) * (-block_size) + computed,
                 min=0,
@@ -1703,6 +1813,22 @@ class SparseKVOffloadManager:
         count = getattr(metadata, "copy_sfa_copy_count", None)
         if src_off is None or dst_off is None or lengths is None or count is None:
             return
+        if self._uses_mooncake_host_pool():
+            # Exact tail geometry stays on NPU during normal decode. Request
+            # admission and prefix rollback run eagerly, outside graph capture;
+            # stage their bounded recovery descriptors once for typed VMM copies.
+            descriptors = (
+                torch.stack(
+                    (metadata.copy_sfa_tail_src, metadata.copy_sfa_tail_dst, metadata.copy_sfa_tail_lengths), dim=-1
+                )
+                .reshape(-1, 3)
+                .cpu()
+                .tolist()
+            )
+            for source, destination, length in descriptors:
+                if length:
+                    self._copy_sfa_local_rows(source, destination, length)
+            return
         if not getattr(self, "copy_sfa_host_bases", None):
             raise RuntimeError("fused_copy_sfa KV base addresses must be bound before tail restore")
         n = src_off.numel()
@@ -1713,9 +1839,20 @@ class SparseKVOffloadManager:
 
     def copy_sfa_kv(self, sources, destinations, lengths, count) -> None:
         """Enqueue bounded descriptor copies on the current compute stream."""
+        if self._uses_mooncake_host_pool():
+            raise RuntimeError("Mooncake fused_copy_sfa must copy through local typed Host KV views")
         result = offload.sparse_copy(sources, destinations, lengths, count, sources.device)
         if result not in (None, 0):
             raise RuntimeError(f"memfabric fused_copy_sfa tail H2D failed with result={result}")
+
+    def _copy_sfa_local_rows(self, source: int, destination: int, length: int) -> None:
+        """Restore an eager recovery range through each rank's own VMM mapping."""
+        for host_k, host_v, device_k, device_v in zip(
+            self.k_caches_cpu, self.v_caches_cpu, self.topk_buffers_k, self.topk_buffers_v
+        ):
+            for host, device in ((host_k, device_k), (host_v, device_v)):
+                source_rows = host.view(-1, host.shape[-1])[source : source + length]
+                device.view(-1, device.shape[-1])[destination : destination + length].copy_(source_rows)
 
     def offload_new_kv(
         self,
@@ -1736,7 +1873,22 @@ class SparseKVOffloadManager:
             self.current_kv_by_layer[layer_id] = (k, v)
             # All decode layers share one slot mapping within a forward step.
             prepare_index_copy_descriptors = layer_id == 0
-        use_mooncake_index_copy = self.use_fused_overlap and self._uses_mooncake_host_pool()
+        use_mooncake_index_copy = (
+            self.use_fused_overlap or self.use_fused_copy_sfa
+        ) and self._uses_mooncake_host_pool()
+        if self.use_fused_copy_sfa and use_mooncake_index_copy and capturing and not has_prefill and self.tp_rank == 0:
+            prepare_index_copy_descriptors = self._prepare_copy_sfa_writeback_layout(layer_name, slot_mapping)
+        if (
+            capturing
+            and not has_prefill
+            and self.tp_rank == 0
+            and self.use_fused_overlap
+            and getattr(self, "fused_reuse_writeback_layout", False)
+        ):
+            capture_token = getattr(get_forward_context(), "ascend_graph_capture_token", None)
+            if capture_token is not getattr(self, "fused_writeback_capture_token", None):
+                self.fused_writeback_capture_token = capture_token
+                self.fused_writeback_layouts = {}
         use_side_stream = (
             self.tp_rank == 0
             and self.use_fused_overlap
@@ -1775,6 +1927,25 @@ class SparseKVOffloadManager:
                 prepare_index_copy_descriptors=prepare_index_copy_descriptors,
             )
 
+    def _prepare_copy_sfa_writeback_layout(self, layer_name: str, slots: torch.Tensor) -> bool:
+        """Reuse one descriptor set until a new forward or draft layout starts."""
+        context = get_forward_context() if is_forward_context_available() else None
+        key = (slots.data_ptr(), slots.numel(), bool(getattr(context, "is_draft_model", False)))
+        layer_id = self._get_offload_layer_id(layer_name)
+        layers = getattr(self, "_copy_sfa_writeback_layers", set())
+        prepare = (
+            context is not getattr(self, "_copy_sfa_writeback_context", None)
+            or key != getattr(self, "_copy_sfa_writeback_key", None)
+            or layer_id in layers
+        )
+        if prepare:
+            self._copy_sfa_writeback_context = context
+            self._copy_sfa_writeback_key = key
+            layers = set()
+            self._copy_sfa_writeback_layers = layers
+        layers.add(layer_id)
+        return prepare
+
     def _offload_new_kv_on_current_stream(
         self,
         slot_mapping: torch.Tensor,
@@ -1812,7 +1983,7 @@ class SparseKVOffloadManager:
             if k is None or v is None:
                 raise ValueError("decode offload requires current-token K/V")
             device = k.device
-            if self.use_fused_overlap and self._uses_mooncake_host_pool():
+            if (self.use_fused_overlap or self.use_fused_copy_sfa) and self._uses_mooncake_host_pool():
                 self._offload_new_kv_via_index_copy(
                     slot_mapping=slot_mapping,
                     k_cache_cpu=k_cache_cpu,
@@ -2185,7 +2356,7 @@ class SparseKVOffloadManager:
         torch_npu.npu_scatter_nd_update_(flat_rope, indices, current_rope)
 
     def wait_for_current_kv_writeback(self, capturing: bool = False) -> None:
-        if self.use_fused_overlap and capturing and self.tp_rank == 0:
+        if (self.use_fused_overlap or self.use_fused_copy_sfa) and capturing and self.tp_rank == 0:
             torch_npu.npu.current_stream().wait_stream(self.current_kv_save_stream)
 
     # ===== Delayed batch D2H (merged 2026-10-22) =====
@@ -2792,6 +2963,12 @@ class SparseKVOffloadManager:
             f"source_over_48_bits={source_over_48_bits}, "
             f"destination_over_48_bits={destination_over_48_bits}"
         )
+
+    def ensure_copy_sfa_host_visibility(self, capturing: bool = False) -> None:
+        """Order TP0 writeback before every rank reads the shared host pool."""
+        self.wait_for_current_kv_writeback(capturing)
+        if self.tp_size > 1:
+            self.tp_group.broadcast(self.copy_sfa_visibility_token, src=0)
 
 
 _SPARSE_KV_OFFLOAD_MANAGER: SparseKVOffloadManager | None = None

@@ -1867,8 +1867,6 @@ class SparseKVOffloadConfig:
             raise ValueError("sparse_kv_offload_config.store_port_base must be a valid TCP port")
 
         if self.enabled and self.host_backend == "mooncake":
-            if not self.use_fused_overlap:
-                raise ValueError("sparse_kv_offload_config.host_backend='mooncake' requires use_fused_overlap=true")
             if self.keep_device_kv_cache:
                 raise ValueError(
                     "sparse_kv_offload_config.host_backend='mooncake' is only supported for "
