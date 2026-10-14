@@ -433,6 +433,15 @@ void npu_fused_lightning_indexer_manage_meta(
 {
 }
 
+void npu_fused_quant_lightning_indexer_manage_meta(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+    at::Tensor)
+{
+}
+
 void npu_fused_scatter_copy_sparse_flash_attention_meta(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -2137,6 +2146,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // Fused lightning indexer manage
     ops.impl("npu_fused_lightning_indexer_manage",
              &vllm_ascend::meta::npu_fused_lightning_indexer_manage_meta);
+    ops.impl("npu_fused_quant_lightning_indexer_manage",
+             &vllm_ascend::meta::npu_fused_quant_lightning_indexer_manage_meta);
     // Fused copy and sparse flash attention for MTP
     ops.impl("npu_fused_scatter_copy_sparse_flash_attention",
              &vllm_ascend::meta::npu_fused_scatter_copy_sparse_flash_attention_meta);
