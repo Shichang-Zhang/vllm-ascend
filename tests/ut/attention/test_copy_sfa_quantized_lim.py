@@ -52,7 +52,7 @@ def inputs(*, draft_index=None, scale_ndim=4):
 
 @pytest.mark.parametrize("draft_index", [None, 0], ids=["target", "draft0"])
 @pytest.mark.parametrize("scale_ndim", [3, 4])
-def test_split_cache_dispatch_passes_real_scales_and_preserves_mtp_reuse(draft_index, scale_ndim):
+def test_split_cache_dispatch_passes_real_scales_and_preserves_dense_recovery(draft_index, scale_ndim):
     impl, md, query, query_scale, key, key_scale, weights = inputs(draft_index=draft_index, scale_ndim=scale_ndim)
     with (
         patch(MODULE + ".torch.ops._C_ascend.npu_fused_quant_lightning_indexer_manage", create=True) as quant,
@@ -70,9 +70,9 @@ def test_split_cache_dispatch_passes_real_scales_and_preserves_mtp_reuse(draft_i
     torch.testing.assert_close(args[3], key_scale.reshape(BLOCKS, HEAD_DIM, 1))
     assert args[1].data_ptr() == query_scale.data_ptr()
     assert args[3].data_ptr() == key_scale.data_ptr()
-    assert args[9].data_ptr() == md.copy_sfa_cache_tokens.data_ptr()
-    assert args[10].tolist() == [-1, -3]
-    assert args[9].tolist() == [8192, 0]
+    assert args[9].data_ptr() == md.lim_cache_tokens.data_ptr()
+    assert args[10].tolist() == [-1, -4]
+    assert args[9].tolist() == [8192, 498]
     assert md.copy_sfa_cache_tokens.tolist() == [8192, 0]
     assert result.data_ptr() == impl.lim_topk_src.data_ptr()
     if draft_index == 0:

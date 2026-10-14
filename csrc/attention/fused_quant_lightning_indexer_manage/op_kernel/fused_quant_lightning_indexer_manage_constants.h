@@ -21,6 +21,8 @@ constexpr uint32_t MAX_SOURCE_CAPACITY = 1U << 21U;
 constexpr uint32_t MAX_CACHE_TOKENS = 32640U;
 
 constexpr int32_t REQUEST_STATE_NON_OFFLOAD = -3;
+// Identity prefix copies for sparse-to-dense recovery; attention keeps C=0.
+constexpr int32_t REQUEST_STATE_DENSE_RESTORE = -4;
 constexpr int32_t REQUEST_STATE_FIRST_DECODE = -2;
 constexpr int32_t REQUEST_STATE_STEADY = -1;
 constexpr int32_t PADDING_SOURCE_ID = -1;

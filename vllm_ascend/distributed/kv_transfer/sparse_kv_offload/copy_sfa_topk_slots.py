@@ -8,6 +8,9 @@ from collections.abc import Collection, Sequence
 import numpy as np
 
 COPY_SFA_POOL_PADDING_ROWS = 2
+# Keep in sync with LIMConfig::REQUEST_STATE_DENSE_RESTORE. LIM publishes an
+# identity copy plan for the computed prefix; Copy-SFA still consumes C == 0.
+COPY_SFA_REQUEST_STATE_DENSE_RESTORE = -4
 
 
 def copy_sfa_pool_capacity(max_num_seqs: int) -> int:
@@ -124,10 +127,9 @@ def prepare_copy_sfa_request_slots(
                 last_prefix = last_prefixes.get(slot)
                 if last_prefix is not None and prefix < last_prefix:
                     restore_tails = True
-                    # A rollback across the hot boundary leaves a sparse-layout
-                    # row under a dense (-3) reader: refill the whole row.
-                    if hot_tokens and last_prefix >= hot_tokens > prefix:
-                        dense_fills[slot] = (row, int(computed_tokens[row]))
+                    # Each physical attention layer restores its own dense
+                    # layout through LIM. An all-layer CPU refill here would
+                    # corrupt a draft bank that still owns a sparse mapping.
                 last_prefixes[slot] = prefix
     return request_slots, generation, restore_tails, dense_fills
 

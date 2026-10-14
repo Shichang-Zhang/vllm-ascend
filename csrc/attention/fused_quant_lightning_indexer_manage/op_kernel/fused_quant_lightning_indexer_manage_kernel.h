@@ -17,6 +17,7 @@
 #define FUSED_QUANT_LIGHTNING_INDEXER_MANAGE_KERNEL_H
 
 #include "kernel_operator.h"
+#include "fused_quant_lightning_indexer_manage_constants.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
@@ -236,7 +237,8 @@ __aicore__ inline void LIMtpC8Preload<LIT>::InitActualSeqLen(__gm__ uint8_t *act
 template <typename LIT>
 __aicore__ inline bool LIMtpC8Preload<LIT>::IsCausal(uint32_t bIdx)
 {
-    return requestStateGm.GetValue(bIdx) == -3;
+    const int32_t state = requestStateGm.GetValue(bIdx);
+    return state == -3 || state == LIMQuantConfig::REQUEST_STATE_DENSE_RESTORE;
 }
 
 template <typename LIT>
@@ -266,7 +268,7 @@ __aicore__ inline void LIMtpC8Preload<LIT>::GetS1S2ActualSeqLen(uint32_t bIdx, u
     const int32_t state = requestStateGm.GetValue(bIdx);
     if (queryEnd <= queryStart || queryEnd > totalQueries ||
         queryEnd - queryStart > 14U ||
-        (state != -3 && state != -2 && state != -1) ||
+        (state != -3 && state != LIMQuantConfig::REQUEST_STATE_DENSE_RESTORE && state != -2 && state != -1) ||
         actS2Size > constInfo.kSeqSize || actS2Size < actS1Size) {
         actS1Size = 0U;
         actS2Size = 0U;

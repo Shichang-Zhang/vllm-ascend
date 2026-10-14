@@ -38,8 +38,8 @@
 | actual_seq_lengths_query | 输入 | 各请求Query在T维的累计结束位置，shape为(B)。元素严格递增，最后一个元素必须等于T。 | INT32 | ND |
 | actual_seq_lengths_key | 输入 | 每个请求最后一路Query对应的实际KV长度，shape为(B)。其他路Query的因果可见长度由该值和Query位置推导。 | INT32 | ND |
 | offload_seq_lengths_key | 输入 | 每个请求可检索、可卸载的稳定Source Prefix长度，shape为(B)，仅`request_state`为-2或-1时使用。 | INT32 | ND |
-| num_cache_tokens | 输入 | 每个请求的HBM稀疏缓存容量，shape为(B)，仅`request_state`为-2或-1时使用。 | INT32 | ND |
-| request_state | 输入 | 请求状态，shape为(B)。仅支持-3（非卸载）、-2（首次卸载）和-1（稳态卸载）。 | INT32 | ND |
+| num_cache_tokens | 输入 | 每个请求的HBM稀疏缓存容量，shape为(B)，当`request_state=-4`时表示需要恢复的已计算Prefix长度，其他状态下仅-2或-1使用。 | INT32 | ND |
+| request_state | 输入 | 请求状态，shape为(B)。支持-4（恢复Dense布局）、-3（非卸载）、-2（首次卸载）和-1（稳态卸载）。 | INT32 | ND |
 | req_pool_entries | 输入 | 每个请求占用的`cache_slots_pool`行号，shape为(B)。同一次调用中的有效请求必须使用不同的行号。 | INT32 | ND |
 | cache_slots_pool | 输入/输出（原地更新） | 跨Decode Step持久化的Source Token到HBM Logical Slot映射，shape为(pool_size,source_capacity)，其中source_capacity=index_max_blocks*128。 | INT32 | ND |
 | topk_src_ids | 输出 | 每一路Query的TopK Source Token ID，shape为(T,1,2048)。可见长度不足2048时使用-1填充。 | INT32 | ND |
@@ -94,7 +94,16 @@ visible_length = actual_seq_lengths_key[i] - (query_end - 1 - query_row)
 - `miss_src_ids[i,:miss_counts[i]]`是所有路TopK Miss Source的有序去重Union，`miss_dst_slots`保存这些Source获得的回收Slot。
 - 当输入Pool行来自非卸载状态的Identity Mapping时，算子会保留`[0,C)`并将后缀归一化为`INT32_MIN`，再执行稳态更新。正常稳态调用不会重复扫描完整Pool行。
 
-除-3、-2和-1之外的`request_state`均不支持。
+### 恢复Dense布局（`request_state=-4`）
+
+- 用于同一物理MTP层从Sparse布局返回Dense布局，以及从Colocate Fallback返回Copy-SFA。
+- Lightning Indexer和`cache_slots_pool`使用与`-3`相同的因果检索和Identity Mapping。
+- `C=num_cache_tokens[i]`此时表示需要恢复的已计算Prefix长度，要求`0<=C<=actual_seq_lengths_key[i]-Q`且`C<=32768`，不要求128对齐。
+- `miss_src_ids[i,:C]`和`miss_dst_slots[i,:C]`均为`[0,1,...,C-1]`，`miss_counts[i]=C`，`topk_miss_counts`为0。
+- 当前Query已写入HBM的KV不包含在恢复计划中。Copy-SFA消费者仍传入`num_cache_tokens=0`，由现有Scatter阶段执行恢复并在Attention前同步。
+- 恢复完成后，框架继续使用`-3`，无需重复恢复或新增CPU回调。
+
+除-4、-3、-2和-1之外的`request_state`均不支持。
 
 ## 约束说明
 

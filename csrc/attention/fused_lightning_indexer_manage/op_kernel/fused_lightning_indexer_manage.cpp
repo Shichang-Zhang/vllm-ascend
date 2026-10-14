@@ -68,6 +68,7 @@ __aicore__ inline void PrepareNonOffloadRows(
     for (uint32_t batch = 0U; batch < batchSize; ++batch) {
         const int32_t state = states.GetValue(batch);
         if (state != LIMConfig::REQUEST_STATE_NON_OFFLOAD &&
+            state != LIMConfig::REQUEST_STATE_DENSE_RESTORE &&
             state != LIMConfig::REQUEST_STATE_STEADY) continue;
         if (state == LIMConfig::REQUEST_STATE_STEADY &&
             batch % owners != owner) continue;
@@ -82,6 +83,14 @@ __aicore__ inline void PrepareNonOffloadRows(
         }
         const int32_t row = entries.GetValue(batch);
         if (row < 0 || static_cast<uint32_t>(row) >= poolSize) continue;
+        if (state == LIMConfig::REQUEST_STATE_DENSE_RESTORE) {
+            const int32_t restoreCount = cacheTokens.GetValue(batch);
+            if (restoreCount < 0 ||
+                restoreCount > keyLength - routes ||
+                static_cast<uint32_t>(restoreCount) > LIMConfig::MISS_CAPACITY) {
+                continue;
+            }
+        }
         const uint64_t base = static_cast<uint64_t>(row) * sourceCapacity;
         if (state == LIMConfig::REQUEST_STATE_STEADY) {
             const int32_t length = offloadLengths.GetValue(batch);

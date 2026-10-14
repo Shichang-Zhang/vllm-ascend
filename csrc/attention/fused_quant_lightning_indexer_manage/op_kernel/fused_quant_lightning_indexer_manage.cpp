@@ -66,7 +66,7 @@ __aicore__ inline void PrepareNonOffloadRows(
     // cleanup on its established one-owner-per-request assignment below.
     for (uint32_t batch = 0U; batch < batchSize; ++batch) {
         const int32_t state = states.GetValue(batch);
-        if (state != -3 && state != -1) continue;
+        if (state != -3 && state != LIMQuantConfig::REQUEST_STATE_DENSE_RESTORE && state != -1) continue;
         if (state == -1 && batch % owners != owner) continue;
         const int32_t queryEnd = queryEnds.GetValue(batch);
         const int32_t queryStart = batch == 0U ? 0 : queryEnds.GetValue(batch - 1U);
@@ -78,6 +78,13 @@ __aicore__ inline void PrepareNonOffloadRows(
         }
         const int32_t row = entries.GetValue(batch);
         if (row < 0 || static_cast<uint32_t>(row) >= poolSize) continue;
+        if (state == LIMQuantConfig::REQUEST_STATE_DENSE_RESTORE) {
+            const int32_t restoreCount = cacheTokens.GetValue(batch);
+            if (restoreCount < 0 || restoreCount > keyLength - routes ||
+                static_cast<uint32_t>(restoreCount) > LIMQuantConfig::MISS_CAPACITY) {
+                continue;
+            }
+        }
         const uint64_t base = static_cast<uint64_t>(row) * sourceCapacity;
         if (state == -1) {
             const int32_t length = offloadLengths.GetValue(batch);

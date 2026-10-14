@@ -421,7 +421,8 @@ __aicore__ inline void LIVector<LIT>::DecodeTopkHitMiss(
         ? requestStateGm.GetValue(batch) : 0;
     ExtractIndex(indexLocal.template ReinterpretCast<uint32_t>(),
                  pairLocal.template ReinterpretCast<uint32_t>(), constInfo_.sparseCount);
-    if (requestState == LIMConfig::REQUEST_STATE_NON_OFFLOAD) {
+    if (requestState == LIMConfig::REQUEST_STATE_NON_OFFLOAD ||
+        requestState == LIMConfig::REQUEST_STATE_DENSE_RESTORE) {
         // Causal masking changes scores to -inf, but the shared chunk payload
         // still contains later queries' source IDs.  Invalidate the fixed
         // TopK suffix when this route sees fewer than TopK keys.
@@ -1092,7 +1093,8 @@ __aicore__ inline void LIVector<LIT>::ProcessLD()
         LocalTensor<uint32_t> outIdxUb = ldOutIdxBuf_.Get<uint32_t>();
         if (!constInfo_.returnValue) {
             const bool standardMode =
-                requestStateGm.GetValue(bIdx) == LIMConfig::REQUEST_STATE_NON_OFFLOAD;
+                requestStateGm.GetValue(bIdx) == LIMConfig::REQUEST_STATE_NON_OFFLOAD ||
+                requestStateGm.GetValue(bIdx) == LIMConfig::REQUEST_STATE_DENSE_RESTORE;
             if (!standardMode) {
                 SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
                 // The final LD owner may differ from the later eviction owner.

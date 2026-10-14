@@ -10,6 +10,7 @@ import torch
 
 from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl, AscendSFAKVOffloadMetadataBuilder
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
+    COPY_SFA_REQUEST_STATE_DENSE_RESTORE,
     prepare_copy_sfa_dummy_slots,
     prepare_copy_sfa_request_slots,
 )
@@ -195,12 +196,21 @@ def test_physical_mtp_layers_have_independent_history():
 
 
 @pytest.mark.parametrize("draft_index", [None, 0, 1, 2], ids=["target", "draft0", "draft1", "draft2"])
-def test_lim_consumes_shared_state_without_modifying_it(draft_index):
+@pytest.mark.parametrize("restore_dense", [False, True])
+def test_lim_consumes_shared_state_without_modifying_it(draft_index, restore_dense):
     builder = make_builder()
     cm = common([4, 8, 12], [10371, 500, 0], pools=(1, 0, 0), generations=(11, 12, -1))
     populate(builder, cm, draft_index=draft_index)
+    populate(builder, cm, draft_index=draft_index)
+    if restore_dense:
+        populate(
+            builder,
+            common([4, 8, 12], [10371, 9000, 0], pools=(1, 0, 0), generations=(11, 12, -1)),
+            draft_index=draft_index,
+        )
     metadata = populate(builder, cm, draft_index=draft_index)
-    assert metadata.lim_request_state.cpu().tolist() == [-1, -3, -3]
+    expected_states = [-1, COPY_SFA_REQUEST_STATE_DENSE_RESTORE if restore_dense else -3, -3]
+    assert metadata.lim_request_state.cpu().tolist() == expected_states
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
     impl._copy_sfa_metadata = metadata
     impl.lim_slot_map = torch.empty((8, 16384), dtype=torch.int32, device="cpu")
@@ -225,7 +235,10 @@ def test_lim_consumes_shared_state_without_modifying_it(draft_index):
     with patch(MODULE + ".torch.ops._C_ascend.npu_fused_lightning_indexer_manage", create=True) as lim:
         impl._lim_select(query, weights, indexer.k_cache.kv_cache[0], cm.block_table_tensor)
         assert lim.call_args.args[10].data_ptr() == metadata.lim_request_state.data_ptr()
-        assert metadata.lim_request_state.cpu().tolist() == [-1, -3, -3]
+        assert lim.call_args.args[9].data_ptr() == metadata.lim_cache_tokens.data_ptr()
+        assert metadata.lim_request_state.cpu().tolist() == expected_states
+        if restore_dense:
+            assert lim.call_args.args[9][1] == 496
     bank = 0 if draft_index is None else 1
     assert builder.lim_last_generation[bank, 1].item() == 11
     if draft_index == 0:
@@ -312,9 +325,13 @@ def test_short_lifecycle_minus3_minus2_minus1():
     cm.seq_lens[0] = 8196
     assert populate(builder, cm).lim_request_state.cpu().tolist() == [-2]
     assert populate(builder, cm).lim_request_state.cpu().tolist() == [-1]
-    # Rollback below the budget: directly back to -3; the runner separately
-    # refills the row because the sparse layout is unreadable in dense mode.
+    # The physical layer restores the computed prefix on NPU before its
+    # next dense attention; the target runner does not own this transition.
     cm.seq_lens[0] = 5000
+    restored = populate(builder, cm)
+    assert restored.lim_request_state.cpu().tolist() == [COPY_SFA_REQUEST_STATE_DENSE_RESTORE]
+    assert restored.lim_cache_tokens.cpu().tolist() == [4996]
+    assert restored.copy_sfa_cache_tokens.cpu().tolist() == [0]
     assert populate(builder, cm).lim_request_state.cpu().tolist() == [-3]
 
 
@@ -436,3 +453,48 @@ def test_host_buffers_are_persistent_and_device_lengths_are_authoritative():
     assert addresses == {
         name: (buffers[0].cpu.data_ptr(), buffers[0].gpu.data_ptr()) for name, buffers in builder.copy_sfa_host.items()
     }
+
+
+def test_mtp_sparse_to_dense_recovery_uses_physical_bank_without_cpu_prefix_rollback():
+    builder = make_builder(num_mtp_layers=1)
+    old = common([1], [8193], pools=(0,), generations=(7,))
+    old.copy_sfa_restore_tails = False
+    old.max_query_len = 1
+    assert populate(builder, old, draft_index=2, reuse_topk=False).lim_request_state.tolist() == [-2]
+    current = common([4], [8195], pools=(0,), generations=(7,))
+    current.copy_sfa_restore_tails = False
+    with patch.object(torch.Tensor, "item", side_effect=AssertionError("unexpected device scalar read")):
+        restored = populate(builder, current, draft_index=0, reuse_topk=False)
+    assert restored.lim_request_state.tolist() == [COPY_SFA_REQUEST_STATE_DENSE_RESTORE]
+    assert restored.lim_cache_tokens.tolist() == [8191]
+    assert restored.copy_sfa_cache_tokens.tolist() == [0]
+    assert restored.copy_sfa_copy_src_offsets is None
+    assert restored.copy_sfa_device_slots.tolist() == [8191, 8192, 8193, 8194]
+    assert builder.lim_last_cache[0, 0] == 0  # target bank unchanged
+    assert populate(builder, current, draft_index=0, reuse_topk=False).lim_request_state.tolist() == [-3]
+
+
+def test_dense_recovery_is_private_to_the_physical_mtp_layer_and_generation():
+    builder = make_builder(num_mtp_layers=2)
+    old = common([1], [8193], pools=(0,), generations=(7,))
+    old.max_query_len = 1
+    populate(builder, old, draft_index=2, reuse_topk=False)  # bank 1
+    current = common([4], [8195], pools=(0,), generations=(7,))
+    assert populate(builder, current, draft_index=1, reuse_topk=False).lim_request_state.tolist() == [-3]  # bank 2
+    current.req_topk_buffer_generations[0] = 8
+    assert populate(builder, current, draft_index=0, reuse_topk=False).lim_request_state.tolist() == [-3]
+
+
+def test_mixed_fallback_then_pure_decode_restores_identity_or_cold_fills():
+    builder = make_builder()
+    cm = common([1, 2], [5000, 10371])
+    populate(builder, cm)
+    with patch(MODULE + ".split_decodes_and_prefills", return_value=(1, 1, 1, 1)):
+        fallback = builder._populate_offload_metadata(SimpleNamespace(), cm)
+    assert not fallback.fused_copy_sfa_enabled
+    cm.copy_sfa_restore_tails = False
+    restored = populate(builder, cm)
+    assert restored.lim_request_state.tolist() == [COPY_SFA_REQUEST_STATE_DENSE_RESTORE, -2]
+    assert restored.lim_cache_tokens.tolist() == [4999, 8192]
+    assert restored.copy_sfa_cache_tokens.tolist() == [0, 8192]
+    assert populate(builder, cm).lim_request_state.tolist() == [-3, -1]

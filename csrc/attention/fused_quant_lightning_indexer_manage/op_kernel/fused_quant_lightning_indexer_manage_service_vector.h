@@ -16,6 +16,7 @@
 #define FUSED_QUANT_LIGHTNING_INDEXER_MANAGE_SERVICE_VECTOR_H
 
 #include "kernel_operator.h"
+#include "fused_quant_lightning_indexer_manage_constants.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
@@ -460,7 +461,7 @@ __aicore__ inline void LIVectorMtpC8<LIT>::DecodeTopkHitMiss(
         ? requestStateGm.GetValue(batch) : 0;
     ExtractIndex(indexLocal.template ReinterpretCast<uint32_t>(),
                  pairLocal.template ReinterpretCast<uint32_t>(), constInfo_.sparseCount);
-    if (requestState == -3) {
+    if (requestState == -3 || requestState == LIMQuantConfig::REQUEST_STATE_DENSE_RESTORE) {
         // Causal masking changes scores to -inf, but the shared chunk
         // payload still contains later queries' source IDs. When fewer than
         // TopK keys are visible, those masked positions must be invalid in
@@ -1173,7 +1174,8 @@ __aicore__ inline void LIVectorMtpC8<LIT>::ProcessLD()
         LocalTensor<float> outValueUb = ldOutValueBuf_.Get<float>();
         LocalTensor<uint32_t> outIdxUb = ldOutIdxBuf_.Get<uint32_t>();
         if (!constInfo_.returnValue) {
-            const bool standardMode = requestStateGm.GetValue(bIdx) == -3;
+            const int32_t state = requestStateGm.GetValue(bIdx);
+            const bool standardMode = state == -3 || state == LIMQuantConfig::REQUEST_STATE_DENSE_RESTORE;
             if (!standardMode) {
                 SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
                 // The final LD owner may differ from the later eviction owner.

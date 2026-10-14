@@ -230,7 +230,9 @@ __aicore__ inline void LIPreload<LIT>::InitActualSeqLen(__gm__ uint8_t *actualSe
 template <typename LIT>
 __aicore__ inline bool LIPreload<LIT>::IsCausal(uint32_t bIdx)
 {
-    return requestStateGm.GetValue(bIdx) == LIMConfig::REQUEST_STATE_NON_OFFLOAD;
+    const int32_t state = requestStateGm.GetValue(bIdx);
+    return state == LIMConfig::REQUEST_STATE_NON_OFFLOAD ||
+           state == LIMConfig::REQUEST_STATE_DENSE_RESTORE;
 }
 
 template <typename LIT>
@@ -261,6 +263,7 @@ __aicore__ inline void LIPreload<LIT>::GetS1S2ActualSeqLen(uint32_t bIdx, uint32
     if (queryEnd <= queryStart || queryEnd > totalQueries ||
         queryEnd - queryStart > LIMConfig::MAX_ROUTES ||
         (state != LIMConfig::REQUEST_STATE_NON_OFFLOAD &&
+         state != LIMConfig::REQUEST_STATE_DENSE_RESTORE &&
          state != LIMConfig::REQUEST_STATE_FIRST_DECODE &&
          state != LIMConfig::REQUEST_STATE_STEADY) ||
         actS2Size > constInfo.kSeqSize || actS2Size < actS1Size) {

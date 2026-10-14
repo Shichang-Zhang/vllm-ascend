@@ -213,8 +213,14 @@ LIM selects TopK and updates its membership map on NPU. Copy-SFA loads cache
 misses and computes attention, with two extra blocks reserved for a circular
 tail. Request generations isolate reused rows, and padded requests use private
 rows. `lru_max_threads` does not control this residency path.
-Initial requests and prefix rollback restore dense KV or tails eagerly;
-ordinary decode does not rebuild CPU LRU plans or repeat these recovery copies.
+Initial requests restore dense KV or tails eagerly. On speculative rollback,
+each physical attention layer uses LIM state `-4` to restore its dense layout
+on NPU before reading it; tail recovery remains eager. LIM receives the computed
+prefix length, while Copy-SFA keeps its dense-mode cache budget at zero.
+The recovery excludes the current query KV and returns to state `-3` on the
+next ordinary dense step. BF16 and quantized LIM both support this state;
+rebuild the Ascend custom operators when upgrading to this implementation.
+Ordinary fused decode does not rebuild CPU LRU plans or repeat recovery copies.
 
 ## 4. Use Them Together
 

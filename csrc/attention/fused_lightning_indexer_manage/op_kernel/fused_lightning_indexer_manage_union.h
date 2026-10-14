@@ -2506,6 +2506,43 @@ private:
         Sync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
     }
 
+    __aicore__ inline void RestoreDenseRow(uint32_t batch,
+                                         uint32_t queryStart,
+                                         uint32_t queryEnd)
+    {
+        const int32_t count = cacheTokensGm.GetValue(batch);
+        const int32_t row = reqEntriesGm.GetValue(batch);
+        const int32_t actual = actualSeqLengthsKeyGm.GetValue(batch);
+        if (queryEnd <= queryStart || queryEnd > tSize ||
+            queryEnd - queryStart > MAX_ROUTES || row < 0 ||
+            static_cast<uint32_t>(row) >= poolSize || count < 0 ||
+            static_cast<uint32_t>(count) > MISS_CAPACITY ||
+            static_cast<uint32_t>(count) > sourceCapacity ||
+            actual < static_cast<int32_t>(queryEnd - queryStart) ||
+            count > actual - static_cast<int32_t>(queryEnd - queryStart)) {
+            PublishSafeFailure(batch, queryStart, queryEnd);
+            return;
+        }
+        // The current query is already resident. Publish identity copies for
+        // only its computed prefix, retaining the existing Copy-SFA barrier
+        // between scatter-copy and attention without a CPU layout callback.
+        LocalTensor<int32_t> ids = unionSourceBuf.Get<int32_t>();
+        const uint64_t base = static_cast<uint64_t>(batch) * MISS_CAPACITY;
+        for (uint32_t offset = 0U; offset < static_cast<uint32_t>(count);
+             offset += TOPK) {
+            const uint32_t remaining = static_cast<uint32_t>(count) - offset;
+            const uint32_t valid = remaining < TOPK ? remaining : TOPK;
+            ArithProgression<int32_t>(ids, static_cast<int32_t>(offset), 1, TOPK);
+            Sync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+            DataCopyPad(missSourcesGm[base + offset], ids,
+                        {1, static_cast<uint16_t>(valid * sizeof(int32_t)), 0, 0});
+            DataCopyPad(missDestinationsGm[base + offset], ids,
+                        {1, static_cast<uint16_t>(valid * sizeof(int32_t)), 0, 0});
+            Sync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+        }
+        PublishCounts(batch, queryStart, queryEnd, count, 0);
+    }
+
     __aicore__ inline void ProcessBatch(uint32_t batch)
     {
         const uint32_t queryStart = batch == 0U ? 0U :
@@ -2513,6 +2550,10 @@ private:
         const uint32_t queryEnd =
             static_cast<uint32_t>(actualSeqLengthsQueryGm.GetValue(batch));
         const int32_t state = requestStateGm.GetValue(batch);
+        if (state == LIMConfig::REQUEST_STATE_DENSE_RESTORE) {
+            RestoreDenseRow(batch, queryStart, queryEnd);
+            return;
+        }
         if (state == LIMConfig::REQUEST_STATE_NON_OFFLOAD) {
             if (queryStart >= queryEnd || queryEnd > tSize ||
                 queryEnd - queryStart > MAX_ROUTES) {

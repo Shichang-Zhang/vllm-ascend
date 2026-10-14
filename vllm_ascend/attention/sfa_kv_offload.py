@@ -55,6 +55,9 @@ from vllm_ascend.attention.utils import (
     split_decodes_and_prefills,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
+    COPY_SFA_REQUEST_STATE_DENSE_RESTORE,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
@@ -79,6 +82,7 @@ class AscendSFAOffloadMetadata(AscendSFAMetadata):
     copy_sfa_reuse_logical_lens: torch.Tensor | None = None
     copy_sfa_pool_entries: torch.Tensor | None = None
     lim_request_state: torch.Tensor | None = None
+    lim_cache_tokens: torch.Tensor | None = None
     # Per-batch-row topk row slots, populated for every batch (prefill
     # included) so exec_kv can D2D prefill KV into the rows at chunk end.
     copy_sfa_prefill_pool_slots: torch.Tensor | None = None
@@ -232,6 +236,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 "logical_lens",
                 "reuse_logical_lens",
                 "request_state",
+                "lim_cache_tokens",
             )
         }
         # Target and physical MTP-layer histories are independent. Request
@@ -240,6 +245,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         self.lim_last_generation = np.full((banks, 2 * requests), -1, dtype=np.int64)
         self.lim_last_prefix = torch.zeros((banks, 2 * requests), dtype=torch.int32, device=device)
         self.lim_last_cache = torch.zeros_like(self.lim_last_prefix)
+        self.lim_dense_invalid = torch.zeros_like(self.lim_last_prefix, dtype=torch.bool)
         self.copy_sfa_hbm_block_table = torch.empty(
             (steps, requests, self.copy_sfa_stride_blocks), dtype=torch.int32, device=device
         )
@@ -304,6 +310,9 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         if not metadata.fused_copy_sfa_enabled:
             metadata.copy_sfa_prefill_pool_slots = upload("pool_entries", pools_np)
             self.lim_last_generation[bank].fill(-1)
+            # Fallback owns a separate resident arena. Its KV writes can still
+            # invalidate the dense contents of a v2 row before we return to it.
+            self.lim_dense_invalid[bank].fill_(True)
             return metadata
         query_loc = common_attn_metadata.query_start_loc_cpu[: count + 1].numpy()
         ends_np, starts_np = query_loc[1:], query_loc[:-1]
@@ -334,6 +343,8 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             buffer.copy_(value)
             setattr(metadata, "copy_sfa_" + name, buffer)
         state = self.copy_sfa_vectors["request_state"][step, :count]
+        lim_cache = self.copy_sfa_vectors["lim_cache_tokens"][step, :count]
+        lim_cache.copy_(cache)
         if draft_index is not None and draft_index > 0 and self.lim_reuse_topk:
             # Reusing draft steps never run LIM or advance its history.
             state.fill_(-3)
@@ -345,11 +356,25 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 & (self.lim_last_cache[bank, pool_indices] == cache)
                 & (self.lim_last_prefix[bank, pool_indices] <= prefix)
             )
-            state.copy_(torch.where(active, torch.where(is_short, -3, torch.where(ready, -1, -2)), -3))
+            restore_dense = (
+                active
+                & is_short
+                & (
+                    (same_generation & (self.lim_last_cache[bank, pool_indices] > 0))
+                    | self.lim_dense_invalid[bank, pool_indices]
+                )
+            )
+            dense_state = torch.where(restore_dense, COPY_SFA_REQUEST_STATE_DENSE_RESTORE, -3)
+            state.copy_(torch.where(active, torch.where(is_short, dense_state, torch.where(ready, -1, -2)), -3))
+            # Restore only prior KV. exec_kv has already scattered this query's
+            # new values into their dense slots before Copy-SFA executes.
+            lim_cache.copy_(torch.where(restore_dense, (seq_lens - widths).clamp_min(0), cache))
             self.lim_last_generation[bank, pools_np] = generations_np
             self.lim_last_prefix[bank].scatter_(0, pool_indices, prefix)
             self.lim_last_cache[bank].scatter_(0, pool_indices, cache)
+            self.lim_dense_invalid[bank].scatter_(0, pool_indices, torch.zeros_like(active))
         metadata.lim_request_state = state
+        metadata.lim_cache_tokens = lim_cache
         if draft_index == 0:
             buffer = self.copy_sfa_vectors["reuse_logical_lens"][step, :count]
             buffer.copy_(torch.where(active, torch.where(is_short, seq_lens, cache), 0))
@@ -686,7 +711,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         tokens = metadata.num_decode_tokens
         request_state = metadata.lim_request_state
         prefix = metadata.copy_sfa_prefix_lens
-        cache = metadata.copy_sfa_cache_tokens
+        cache = metadata.lim_cache_tokens
         index_cache = index_cache.view(-1, 128, 1, 128)
         table = block_table[:count].contiguous()
         if getattr(self, "enable_sparse_li_c8", False):
@@ -739,7 +764,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             self.lim_reuse_request_count = count
             # Dense short rows retain seq with C == 0; long rows retain C.
             self.copy_sfa_reuse_logical_lens[:count].copy_(metadata.copy_sfa_reuse_logical_lens)
-            self.copy_sfa_reuse_cache_tokens[:count].copy_(cache)
+            self.copy_sfa_reuse_cache_tokens[:count].copy_(metadata.copy_sfa_cache_tokens)
         return self.lim_topk_src[:tokens]
 
     def bind_copy_sfa_kv_cache(self, manager, layer_name) -> None:

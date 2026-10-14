@@ -12,6 +12,7 @@ import torch_npu  # noqa: F401
 
 from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl, AscendSFAKVOffloadMetadataBuilder
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
+    COPY_SFA_REQUEST_STATE_DENSE_RESTORE,
     prepare_copy_sfa_dummy_slots,
     prepare_copy_sfa_request_slots,
 )
@@ -314,9 +315,13 @@ def test_short_lifecycle_minus3_minus2_minus1():
     cm.seq_lens[0] = 8196
     assert populate(builder, cm).lim_request_state.cpu().tolist() == [-2]
     assert populate(builder, cm).lim_request_state.cpu().tolist() == [-1]
-    # Rollback below the budget: directly back to -3; the runner separately
-    # refills the row because the sparse layout is unreadable in dense mode.
+    # The physical layer restores the computed prefix on NPU before its
+    # next dense attention; the target runner does not own this transition.
     cm.seq_lens[0] = 5000
+    restored = populate(builder, cm)
+    assert restored.lim_request_state.cpu().tolist() == [COPY_SFA_REQUEST_STATE_DENSE_RESTORE]
+    assert restored.lim_cache_tokens.cpu().tolist() == [4996]
+    assert restored.copy_sfa_cache_tokens.cpu().tolist() == [0]
     assert populate(builder, cm).lim_request_state.cpu().tolist() == [-3]
 
 
