@@ -2,6 +2,7 @@
 """Mooncake recovery copies and writeback visibility for device-managed residency."""
 
 import ctypes
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -211,6 +212,8 @@ def test_v2_registration_skips_cpu_lru_workspace_and_warmup(batched_copy):
     result._register_offload_layers = MagicMock()
     result._register_local_mooncake_views = MagicMock()
     result._initialize_fused_writeback_descriptors = MagicMock()
+    result._initialize_mooncake_index_copy_descriptors = MagicMock()
+    result._get_mooncake_writeback_view = MagicMock()
     result._initialize_paired_current_scatter = MagicMock()
     result._warmup_external_lru_planner_threads = MagicMock()
     caches = {
@@ -331,29 +334,25 @@ def test_writeback_forks_each_capture_before_reusing_target_and_draft_descriptor
     result.token_size_bytes_k = 2 * element_size
     result.token_size_bytes_v = element_size
     result.max_d2h_index_copy_tokens = 4
-    for name in ("slot_mapping", "src_idx", "dst_idx"):
-        setattr(result, f"d2h_{name}_cpu", torch.zeros(4, dtype=torch.int64))
-    result.d2h_src_idx_npu = torch.zeros(4, dtype=torch.int64)
     result.d2h_dst_idx_npu = torch.zeros(4, dtype=torch.int64)
-    result.d2h_index_count_cpu = torch.zeros(1, dtype=torch.int32)
-    result.d2h_index_count_npu = torch.zeros(1, dtype=torch.int32)
     streams = WritebackCaptureStreams()
     result.current_kv_save_stream = streams.save
     context = SimpleNamespace(is_draft_model=False)
-    host_k = torch.zeros((16, 2), dtype=torch.bfloat16)
-    host_v = torch.zeros((16, 1), dtype=torch.bfloat16)
+    physical_k = torch.zeros((17, 2), dtype=torch.bfloat16)
+    physical_v = torch.zeros((17, 1), dtype=torch.bfloat16)
+    host_k, host_v = physical_k[:-1], physical_v[:-1]
+    result._mooncake_writeback_raw_views = {
+        host_k.data_ptr(): physical_k.view(torch.int8),
+        host_v.data_ptr(): physical_v.view(torch.int8),
+    }
     preparation_streams = []
 
-    def prepare(slots, token_count, capacity, num_slots, src, dst, count):
+    def prepare(slots, destinations, num_slots):
         preparation_streams.append(streams.current)
         streams.events.append("prepare")
-        src.zero_()
-        dst.fill_(slots[0])
-        src[:token_count].copy_(torch.arange(token_count))
-        dst[:token_count].copy_(slots[:token_count])
-        count.fill_(token_count)
+        destinations[: slots.numel()].copy_(slots.masked_fill((slots < 0) | (slots >= num_slots), num_slots))
 
-    result.sparse_kv_offload_cpp = SimpleNamespace(enqueue_current_kv_index_copy_descriptors=prepare)
+    result.fused_index_copy_descriptor_builder = prepare
     index_copy = torch.Tensor.index_copy_
 
     def write(destination, *args):
@@ -443,3 +442,20 @@ def test_target_rollback_requests_eager_dense_refill():
     )
     assert restore_tails
     assert dense_fills == {0: (0, 8191)}
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_copy_sfa_initializes_npu_index_copy_descriptors(rank):
+    result = manager()
+    result.tp_rank = rank
+    result.max_d2h_index_copy_tokens = 4
+    descriptors = MagicMock()
+    module_name = "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.index_copy_descriptors"
+    with patch.dict(sys.modules, {module_name: descriptors}):
+        result._initialize_mooncake_index_copy_descriptors()
+    if rank == 0:
+        descriptors.warmup_index_copy_destinations.assert_called_once_with(result)
+        assert result.fused_index_copy_descriptor_builder is descriptors.build_index_copy_destinations
+    else:
+        descriptors.warmup_index_copy_destinations.assert_not_called()
+        assert result.fused_index_copy_descriptor_builder is None
