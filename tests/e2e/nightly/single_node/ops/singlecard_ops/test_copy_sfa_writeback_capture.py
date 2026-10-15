@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise Copy-SFA writeback stream capture with the real host callback.
+"""Exercise Copy-SFA writeback stream capture with NPU destination descriptors.
 
 Device tensors stand in for the NPU-addressable Host KV views, isolating ACL
 event ordering from Mooncake allocation and tensor-parallel communication.
@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-import torch.utils.cpp_extension
 
 torch_npu = pytest.importorskip("torch_npu")
 
@@ -29,14 +28,7 @@ DRAFT_SLOT_OFFSET = 8
 pytestmark = pytest.mark.skipif(not torch_npu.npu.is_available(), reason="requires an Ascend NPU")
 
 
-@pytest.fixture(scope="module")
-def writeback_extension():
-    result = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
-    result._build_cpp()
-    return result.sparse_kv_offload_cpp
-
-
-def make_manager(extension):
+def make_manager():
     result = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
     result.use_fused_copy_sfa = True
     result.use_fused_overlap = False
@@ -49,21 +41,21 @@ def make_manager(extension):
     result.token_size_bytes_k = 2 * element_size
     result.token_size_bytes_v = element_size
     result.max_d2h_index_copy_tokens = MAX_ROWS
-    result.sparse_kv_offload_cpp = extension
-    for name in ("slot_mapping", "src_idx", "dst_idx"):
-        setattr(result, f"d2h_{name}_cpu", torch.zeros(MAX_ROWS, dtype=torch.int64, pin_memory=True))
-    result.d2h_index_count_cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
-    result.d2h_src_idx_npu = torch.zeros(MAX_ROWS, dtype=torch.int64, device="npu")
     result.d2h_dst_idx_npu = torch.zeros(MAX_ROWS, dtype=torch.int64, device="npu")
-    result.d2h_index_count_npu = torch.zeros(1, dtype=torch.int32, device="npu")
+    result._initialize_mooncake_index_copy_descriptors()
     return result
 
 
 @pytest.mark.parametrize("warmup", [False, True])
-def test_copy_sfa_writeback_capture_after_warmup_and_across_shapes(writeback_extension, warmup):
-    result = make_manager(writeback_extension)
-    host_k = torch.zeros((HOST_SLOTS, 2), dtype=torch.bfloat16, device="npu")
-    host_v = torch.zeros((HOST_SLOTS, 1), dtype=torch.bfloat16, device="npu")
+def test_copy_sfa_writeback_capture_after_warmup_and_across_shapes(warmup):
+    result = make_manager()
+    physical_k = torch.zeros((HOST_SLOTS + 1, 2), dtype=torch.bfloat16, device="npu")
+    physical_v = torch.zeros((HOST_SLOTS + 1, 1), dtype=torch.bfloat16, device="npu")
+    host_k, host_v = physical_k[:-1], physical_v[:-1]
+    result._mooncake_writeback_raw_views = {
+        host_k.data_ptr(): physical_k.view(torch.int8),
+        host_v.data_ptr(): physical_v.view(torch.int8),
+    }
     context = SimpleNamespace(is_draft_model=False)
 
     def offload_pair(first_layer, slots, k, v):
@@ -100,7 +92,7 @@ def test_copy_sfa_writeback_capture_after_warmup_and_across_shapes(writeback_ext
                 slots.sub_(DRAFT_SLOT_OFFSET)
             captures.append((graph, slots, k, v, draft_k, draft_v))
         # Replay older graphs with fresh KV and slots after all captures have
-        # shared the descriptor buffers. Callbacks must republish each layout.
+        # shared the descriptor buffers. Descriptors must be rebuilt for each layout.
         for step in (1, 2):
             for graph, slots, k, v, draft_k, draft_v in reversed(captures):
                 slots.copy_(torch.arange(slots.numel(), dtype=torch.int64, device="npu") + step)
