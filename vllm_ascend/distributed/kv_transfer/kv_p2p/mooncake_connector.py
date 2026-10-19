@@ -849,6 +849,9 @@ class KVCacheRecvingThread(threading.Thread):
                 continue
             combined = ([], [], [])
             statistics = {}
+            # Private to this endpoint invocation/phase, bounded by the builder.
+            # Other requests/threads cannot observe or reuse these mappings.
+            mapping_cache = {}
             for local in layout:
                 transformer_layer = self._dsa_transformer_layers[local.layer_name]
                 if not first <= transformer_layer < last:
@@ -885,6 +888,7 @@ class KVCacheRecvingThread(threading.Thread):
                     writer_size=self.vllm_config.parallel_config.tensor_parallel_size,
                     indexer=indexer,
                     statistics=statistics,
+                    mapping_cache=mapping_cache,
                 )
                 for output, values in zip(combined, part):
                     output.extend(values)

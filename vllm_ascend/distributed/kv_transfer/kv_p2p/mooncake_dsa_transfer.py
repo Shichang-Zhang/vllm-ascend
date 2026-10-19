@@ -5,8 +5,14 @@
 from collections import OrderedDict
 from collections.abc import Hashable
 from dataclasses import dataclass
+from math import gcd
+
+import numpy as np
 
 MAX_REGISTER_MEMORY_BYTES = 64 * 1024**3
+MAX_CACHED_DSA_MAPPINGS = 4
+MAX_VECTORIZED_DSA_SEGMENTS = 65536
+_MAX_INT64 = np.iinfo(np.int64).max
 
 
 @dataclass(frozen=True)
@@ -143,7 +149,7 @@ def collect_bounded_register_regions(
     return DsaRegisterRegions(ptrs, lengths, locations)
 
 
-def build_component_read(
+def _build_component_read_scalar(
     local: DsaCacheLayout,
     remote: DsaCacheLayout,
     source_ids: tuple[int, ...],
@@ -241,6 +247,221 @@ def build_component_read(
         )
     if statistics is not None:
         statistics["entries_before"] = statistics.get("entries_before", 0) + len(result[0])
+        statistics["entries_after"] = statistics.get("entries_after", 0) + len(merged[0])
+    return merged
+
+
+@dataclass(frozen=True)
+class _DsaPageMapping:
+    local_pages: np.ndarray
+    remote_pages: np.ndarray
+    local_offsets: np.ndarray
+    remote_offsets: np.ndarray
+    counts: np.ndarray
+    max_local_id: int
+    max_remote_id: int
+
+
+def _aligned_page_mapping(
+    local, remote, source_ids, destination_ids, start, end, cp_size, cp_rank, writer_rank, writer_size, indexer
+):
+    """Select logical blocks before expanding their page segments.
+
+    Only equal manager-block geometry with nested page boundaries is handled.
+    Partial first/last blocks are clipped without changing full-request
+    ordinals. Main ownership solves BOTH CP and writer congruences; Indexer
+    remains replicated and is never writer-filtered.
+    """
+    block = local.block_tokens
+    local_page = block // local.scale
+    remote_page = remote.block_tokens * (cp_size if indexer else 1) // remote.scale
+    if (
+        block != remote.block_tokens
+        or remote_page > block
+        or max(local_page, remote_page) % min(local_page, remote_page)
+    ):
+        return None
+    if max(end, block, cp_size, writer_size) > _MAX_INT64:
+        return None
+    first_block = start // block
+    last_block = first_block if start == end else (end + block - 1) // block
+    if last_block * block > _MAX_INT64:
+        return None
+    if indexer:
+        first, period = first_block, 1
+    else:
+        divisor = gcd(cp_size, writer_size)
+        if (writer_rank - cp_rank) % divisor:
+            first, period = last_block, 1
+        else:
+            writer_period = writer_size // divisor
+            residue = cp_rank + cp_size * (
+                ((writer_rank - cp_rank) // divisor * pow(cp_size // divisor, -1, writer_period)) % writer_period
+            )
+            period = cp_size * writer_period
+            first = first_block + (residue - first_block) % period
+    step = min(local_page, remote_page)
+    block_count = max(0, (last_block - first + period - 1) // period)
+    if (
+        block_count * (block // step) > MAX_VECTORIZED_DSA_SEGMENTS
+        or period > _MAX_INT64
+        or first > _MAX_INT64
+    ):
+        return None
+    blocks = np.arange(first, last_block, period, dtype=np.int64)
+    source_ordinals = blocks // cp_size
+    if blocks.size and (int(source_ordinals[-1]) >= len(source_ids) or int(blocks[-1]) >= len(destination_ids)):
+        # Let the reference preserve first-error ordering if an earlier block
+        # also has invalid capacity, rather than prioritizing later coverage.
+        return None
+    try:
+        source = np.asarray(source_ids)
+        destination = np.asarray(destination_ids)
+        if source.dtype.kind not in "iu" or destination.dtype.kind not in "iu":
+            return None
+        source = source[source_ordinals]
+        destination = destination[blocks]
+    except (OverflowError, ValueError):
+        return None
+    if (
+        np.any(source < 0) or np.any(destination < 0)
+        or np.any(source > _MAX_INT64) or np.any(destination > _MAX_INT64)
+    ):
+        return None  # Preserve scalar behavior for unusual physical IDs.
+    source = source.astype(np.int64, copy=False)
+    destination = destination.astype(np.int64, copy=False)
+    max_local_id = int(destination.max()) if destination.size else -1
+    max_remote_id = int(source.max()) if source.size else -1
+    if (max_local_id + 1) * local.scale > _MAX_INT64 or (max_remote_id + 1) * remote.scale > _MAX_INT64:
+        return None
+    offsets = np.arange(0, block, step, dtype=np.int64)
+    tokens = blocks[:, None] * block + offsets
+    clipped = np.maximum(tokens, start)
+    counts = np.minimum(tokens + step, end) - clipped
+    active = counts > 0
+    local_offsets = clipped - blocks[:, None] * block
+    remote_offsets = local_offsets + (blocks[:, None] % cp_size * block if indexer else 0)
+    arrays = (
+        (destination[:, None] * local.scale + local_offsets // local_page)[active],
+        (source[:, None] * remote.scale + remote_offsets // remote_page)[active],
+        (local_offsets % local_page)[active],
+        (remote_offsets % remote_page)[active],
+        counts[active],
+    )
+    for array in arrays:
+        array.flags.writeable = False
+    return _DsaPageMapping(*arrays, max_local_id, max_remote_id)
+
+
+def build_component_read(
+    local: DsaCacheLayout,
+    remote: DsaCacheLayout,
+    source_ids: tuple[int, ...],
+    destination_ids: tuple[int, ...],
+    start_token: int,
+    end_token: int,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    writer_rank: int,
+    writer_size: int,
+    indexer: bool,
+    statistics: dict[str, int] | None = None,
+    mapping_cache: dict[tuple, _DsaPageMapping] | None = None,
+) -> tuple[list[int], list[int], list[int]]:
+    """Vectorize compatible page mappings, otherwise use the scalar reference.
+
+    The caller may share a bounded cache ONLY within one endpoint task. Keys
+    include request IDs' block tuples, interval, component and ownership/page
+    geometry. Bases, strides, token bytes and capacities are deliberately not
+    cached: they are checked/applied separately for every layer. No final
+    addresses, device tensors or mutable command state are retained.
+    """
+    # Keep validation before fast-path selection, including empty/unowned tasks.
+    if cp_size <= 0 or not 0 <= cp_rank < cp_size:
+        raise ValueError("invalid source CP geometry")
+    if writer_size <= 0 or not 0 <= writer_rank < writer_size:
+        raise ValueError("invalid Main writer geometry")
+    if start_token < 0 or end_token < start_token:
+        raise ValueError("invalid request token interval")
+    remote_span = remote.block_tokens * (cp_size if indexer else 1)
+    if (
+        local.scale <= 0
+        or remote.scale <= 0
+        or local.block_tokens <= 0
+        or remote.block_tokens <= 0
+        or local.block_tokens % local.scale
+        or remote_span % remote.scale
+    ):
+        raise ValueError("cache pages must divide manager token geometry")
+    local_page, remote_page = local.block_tokens // local.scale, remote_span // remote.scale
+    if (
+        local.block_bytes % local_page
+        or remote.block_bytes % remote_page
+        or local.block_bytes // local_page != remote.block_bytes // remote_page
+        or local.dtype != remote.dtype
+    ):
+        raise ValueError("incompatible DSA component dtype/token bytes")
+    if local.stride < local.block_bytes or remote.stride < remote.block_bytes:
+        raise ValueError("overlapping component page stride")
+    token_bytes = local.block_bytes // local_page
+    fallback_args = dict(
+        cp_size=cp_size, cp_rank=cp_rank, writer_rank=writer_rank, writer_size=writer_size,
+        indexer=indexer, statistics=statistics,
+    )
+
+    def scalar():
+        return _build_component_read_scalar(
+            local, remote, source_ids, destination_ids, start_token, end_token, **fallback_args
+        )
+
+    if token_bytes <= 0 or token_bytes * (end_token - start_token) > _MAX_INT64:
+        return scalar()
+    key = (
+        source_ids, destination_ids, start_token, end_token, cp_size, cp_rank, writer_rank, writer_size, indexer,
+        local.block_tokens, remote.block_tokens, local.scale, remote.scale,
+    )
+    mapping = None if mapping_cache is None else mapping_cache.get(key)
+    if mapping is None:
+        mapping = _aligned_page_mapping(
+            local, remote, source_ids, destination_ids, start_token, end_token,
+            cp_size, cp_rank, writer_rank, writer_size, indexer,
+        )
+        if mapping is None:
+            return scalar()
+        if mapping_cache is not None and len(mapping_cache) < MAX_CACHED_DSA_MAPPINGS:
+            mapping_cache[key] = mapping
+    if (local.capacity and mapping.max_local_id >= local.capacity) or (
+        remote.capacity and mapping.max_remote_id >= remote.capacity
+    ):
+        if mapping.counts.size:
+            raise ValueError("DSA physical block ID exceeds registered capacity")
+    # Guard every multiply/add in Python integers before int64 address math.
+    # Wider/negative address layouts preserve the scalar Python-int semantics.
+    for layout, maximum, page in (
+        (local, mapping.max_local_id, local_page), (remote, mapping.max_remote_id, remote_page)
+    ):
+        if layout.base < 0 or layout.stride < 0 or (
+            layout.base + (maximum + 1) * layout.scale * layout.stride + page * token_bytes > _MAX_INT64
+        ):
+            return scalar()
+    dst = local.base + mapping.local_pages * local.stride + mapping.local_offsets * token_bytes
+    src = remote.base + mapping.remote_pages * remote.stride + mapping.remote_offsets * token_bytes
+    lengths = mapping.counts * token_bytes
+    if lengths.size:
+        contiguous = (dst[1:] == dst[:-1] + lengths[:-1]) & (src[1:] == src[:-1] + lengths[:-1])
+        starts = np.concatenate((np.array([0], dtype=np.int64), np.flatnonzero(~contiguous) + 1))
+        merged = (dst[starts].tolist(), src[starts].tolist(), np.add.reduceat(lengths, starts).tolist())
+    else:
+        merged = ([], [], [])
+    if local.capacity and remote.capacity and (
+        layout_span_bytes(local) > MAX_REGISTER_MEMORY_BYTES or layout_span_bytes(remote) > MAX_REGISTER_MEMORY_BYTES
+    ):
+        merged = split_transfer_lists_at_region_boundaries(
+            *merged, local_base=local.base, remote_base=remote.base
+        )
+    if statistics is not None:
+        statistics["entries_before"] = statistics.get("entries_before", 0) + int(lengths.size)
         statistics["entries_after"] = statistics.get("entries_after", 0) + len(merged[0])
     return merged
 
