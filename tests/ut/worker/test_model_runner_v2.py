@@ -1338,14 +1338,21 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     assert runner.model_state.pcp_manager is runner.pcp_manager
 
 
-def test_initialize_kv_cache_forwards_allocation_context():
+@pytest.mark.parametrize("sparse_offload_enabled", [False, True])
+def test_initialize_kv_cache_forwards_allocation_context(sparse_offload_enabled):
     """Forward allocation context before preparing KDA state-copy plans."""
     runner = _make_runner()
+    sparse_cfg = runner.ascend_config.sparse_kv_offload_config
+    sparse_cfg.enabled = sparse_offload_enabled
+    sparse_cfg.use_fused_copy_sfa = False
+    manager = Mock()
+    runner.req_states = SimpleNamespace(req_id_to_index={})
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     runner.vllm_config = SimpleNamespace(
         compilation_config=runner.compilation_config,
         scheduler_config=SimpleNamespace(max_num_seqs=8),
         kv_transfer_config=None,
+        parallel_config=SimpleNamespace(data_parallel_index=2),
     )
     runner.max_num_reqs = runner.vllm_config.scheduler_config.max_num_seqs
     runner.pcp_manager = None
@@ -1363,6 +1370,9 @@ def test_initialize_kv_cache_forwards_allocation_context():
 
     def _super(self, kv_cache_config, **kwargs):
         nonlocal called
+        if sparse_offload_enabled:
+            assert self.sparse_kv_offload_manager is manager
+            manager.prepare_host_kv_allocation.assert_called_once_with(device_id=0, dp_rank=2)
         called = True
         captured_kwargs.update(kwargs)
         self.kv_cache_config = kv_cache_config
@@ -1376,6 +1386,10 @@ def test_initialize_kv_cache_forwards_allocation_context():
         assert maximum == 8
 
     with (
+        patch(
+            "vllm_ascend.worker.v2.model_runner.init_sparse_kv_offload_manager", return_value=manager
+        ) as init_manager,
+        patch.object(torch.npu, "current_device", return_value=0),
         patch("vllm_ascend.ops.kda_state_copy_plan.initialize_kda_state_copy", side_effect=_prepare_kda) as prepare_kda,
         patch.object(GPUModelRunner, "initialize_kv_cache", _super),
         patch("vllm_ascend.worker.v2.model_runner.ModelAclGraphManager", return_value="acl"),
@@ -1389,6 +1403,12 @@ def test_initialize_kv_cache_forwards_allocation_context():
     prepare_kda.assert_called_once_with(runner.compilation_config.static_forward_context, 8)
     assert called is True
     assert captured_kwargs["kv_cache_allocation_context"] is allocation_context
+
+    if sparse_offload_enabled:
+        init_manager.assert_called_once_with(runner.vllm_config, runner.kv_cache_config, sparse_cfg)
+    else:
+        init_manager.assert_not_called()
+        manager.prepare_host_kv_allocation.assert_not_called()
 
 
 @pytest.mark.parametrize("moe_type", [MoECommType.MC2, MoECommType.FUSED_MC2])
@@ -2070,3 +2090,26 @@ def test_dflash_rejection_reorder_and_padding_keep_device_lengths_without_d2h(re
     runner.num_computed_tokens_event.record.assert_not_called()
     runner.num_computed_tokens_event.synchronize.assert_not_called()
     assert runner.num_computed_tokens_cpu.tolist() == [-99] * 4
+
+
+@pytest.mark.parametrize("runner_version", ["v1", "v2"])
+@pytest.mark.parametrize("parent_fails", [False, True])
+def test_shutdown_closes_sparse_host_allocator_even_if_parent_fails(runner_version, parent_fails):
+    if runner_version == "v1":
+        from vllm_ascend.worker.v1.model_runner import NPUModelRunner as V1Runner
+
+        runner = V1Runner.__new__(V1Runner)
+    else:
+        runner = _make_runner()
+    manager = Mock()
+    runner.sparse_kv_offload_manager = manager
+    parent_class = type(runner).__bases__[0]
+    with patch.object(parent_class, "shutdown", create=True) as parent:
+        if parent_fails:
+            parent.side_effect = RuntimeError("parent shutdown failed")
+            with pytest.raises(RuntimeError, match="parent shutdown failed"):
+                runner.shutdown()
+        else:
+            runner.shutdown()
+    parent.assert_called_once_with()
+    manager.close.assert_called_once_with()
