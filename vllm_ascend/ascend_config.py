@@ -1705,11 +1705,20 @@ class SparseKVOffloadConfig:
     keep_device_kv_cache: bool = False
     topk: int = dataclasses.field(default=0, init=False)
     use_fused_overlap: bool = False
+    lru_max_threads: int = 8
+    host_backend: Literal["memfabric", "mooncake"] = "memfabric"
 
     @property
     def use_fused_copy_sfa(self) -> bool:
         """Use fused LIM + Copy-SFA unless the overlap operator is selected."""
         return self.enabled and not self.use_fused_overlap
+
+    @field_validator("lru_max_threads", mode="before")
+    @classmethod
+    def _validate_lru_max_threads(cls, value: Any) -> int:
+        if type(value) is not int or value <= 0:
+            raise ValueError("sparse_kv_offload_config.lru_max_threads must be a positive integer")
+        return value
 
     @model_validator(mode="after")
     def _validate_values(self):
@@ -1717,6 +1726,14 @@ class SparseKVOffloadConfig:
             raise ValueError("sparse_kv_offload_config.topk_buffer_size must be -1 or positive")
         if self.dram_size_per_dp_GB <= 0:
             raise ValueError("sparse_kv_offload_config.dram_size_per_dp_GB must be positive")
+        if self.enabled and self.host_backend == "mooncake":
+            if not self.use_fused_overlap:
+                raise ValueError("sparse_kv_offload_config.host_backend='mooncake' requires use_fused_overlap=true")
+            if self.keep_device_kv_cache:
+                raise ValueError(
+                    "sparse_kv_offload_config.host_backend='mooncake' is only supported for "
+                    "PD-disaggregated decode; keep_device_kv_cache must be false"
+                )
         return self
 
     @classmethod
