@@ -21,6 +21,7 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from vllm_ascend import envs as ascend_envs
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
