@@ -762,6 +762,12 @@ class KVCacheRecvingThread(threading.Thread):
                 participant=participant,
                 cancelled=cancelled,
                 all_task_done=all_task_done,
+                # Temporary PD diagnostics: scalar timestamps only, no per-layer logs.
+                pd_enqueued_ns=time.perf_counter_ns(),
+                pd_enqueued_unix_ns=time.time_ns(),
+                pd_indexer_ns=(0, 0),
+                pd_main_ns=(0, 0),
+                pd_status="ok",
             )
         )
 
@@ -775,6 +781,7 @@ class KVCacheRecvingThread(threading.Thread):
         elif task["cancelled"].is_set():
             skip_reason = "cancelled"
         if skip_reason is not None:
+            task["pd_status"] = skip_reason
             logger.debug(
                 "DSA skip transfer request=%s decode_rank=%s reason=%s",
                 command.request_id,
@@ -890,6 +897,7 @@ class KVCacheRecvingThread(threading.Thread):
             )
         for indexer, plan, statistics in plans:
             if task["cancelled"].is_set():
+                task["pd_status"] = "cancelled"
                 logger.debug(
                     "DSA stop remaining phases request=%s decode_rank=%s reason=cancelled",
                     command.request_id,
@@ -898,18 +906,23 @@ class KVCacheRecvingThread(threading.Thread):
                 break
             task["failure_phase"] = DsaTransferPhase.INDEXER_D2D if indexer else DsaTransferPhase.MAIN_D2RH
             if plan[0]:
-                started = time.perf_counter()
-                result = self.engine.batch_transfer_sync_read(session, *plan)
-                logger.debug(
-                    "DSA receive request=%s rank=%s indexer=%s bytes=%s entries=%s seconds=%s coalescing=%s",
-                    command.request_id,
-                    self.tp_rank,
-                    indexer,
-                    sum(plan[2]),
-                    len(plan[0]),
-                    time.perf_counter() - started,
-                    statistics,
-                )
+                started_ns = time.perf_counter_ns()
+                try:
+                    result = self.engine.batch_transfer_sync_read(session, *plan)
+                finally:
+                    finished_ns = time.perf_counter_ns()
+                    task["pd_indexer_ns" if indexer else "pd_main_ns"] = (started_ns, finished_ns)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "DSA receive request=%s rank=%s indexer=%s bytes=%s entries=%s seconds=%s coalescing=%s",
+                        command.request_id,
+                        self.tp_rank,
+                        indexer,
+                        sum(plan[2]),
+                        len(plan[0]),
+                        (finished_ns - started_ns) / 1e9,
+                        statistics,
+                    )
                 if result < 0:
                     raise RuntimeError(f"DSA transfer failed: {result}")
 
@@ -917,10 +930,15 @@ class KVCacheRecvingThread(threading.Thread):
         command = task["dsa_command"]
         endpoint = task["dsa_remote_endpoint"]
         task["failure_phase"] = DsaTransferPhase.MAIN_D2RH
+        started_ns = time.perf_counter_ns()
+        notify_failed = False
         try:
             if not self._is_failed_recv_request(command.request_id):
                 self._execute_dsa_receive(task)
+            else:
+                task["pd_status"] = "previous_failure"
         except Exception:
+            task["pd_status"] = "failed"
             # The upstream invalid-block interface uses cache group 0's ID
             # space (R1). Preserve that space; never report Host IDs as group 0.
             self._mark_failed_recv_request(command.request_id, (list(command.invalid_block_ids),))
@@ -928,6 +946,7 @@ class KVCacheRecvingThread(threading.Thread):
                 self.dsa_failure_phases.setdefault(command.request_id, task["failure_phase"])
             logger.exception("DSA endpoint receive failed: %s", command.request_id)
         finally:
+            receive_end_ns = time.perf_counter_ns()
             try:
                 self._send_done_recv_signal(
                     command.source.remote_request_id,
@@ -937,7 +956,9 @@ class KVCacheRecvingThread(threading.Thread):
                     participant=task["participant"],
                 )
             except Exception:
+                notify_failed = True
                 logger.exception("DSA endpoint done notification failed: %s", command.request_id)
+            notify_end_ns = time.perf_counter_ns()
             if self._mark_request_task_done(command.request_id, task["all_task_done"]):
                 failed = self._is_failed_recv_request(command.request_id)
                 with self.failed_recv_requests_lock:
@@ -959,6 +980,31 @@ class KVCacheRecvingThread(threading.Thread):
                     )
                 )
             self.request_queue.task_done()
+            # One compact record per endpoint, emitted after the completion callback.
+            # Phase timestamps bracket only synchronous TE calls; 0 means not run.
+            # Monotonic ns are comparable on the same host. Use the enqueue wall-clock
+            # anchor (and verify clock synchronization) when correlating different hosts.
+            logger.info(
+                "DSA_PD_TIMING request_id=%s remote_request_id=%s rank=%s peer=%s:%s participant=%s "
+                "status=%s notify_failed=%s enqueue_unix_ns=%d enqueue_ns=%d start_ns=%d "
+                "indexer_start_ns=%d indexer_end_ns=%d main_start_ns=%d main_end_ns=%d "
+                "receive_end_ns=%d notify_end_ns=%d",
+                command.request_id,
+                command.source.remote_request_id,
+                self.tp_rank,
+                endpoint.remote_host,
+                endpoint.remote_port,
+                task["participant"],
+                task["pd_status"],
+                notify_failed,
+                task["pd_enqueued_unix_ns"],
+                task["pd_enqueued_ns"],
+                started_ns,
+                *task["pd_indexer_ns"],
+                *task["pd_main_ns"],
+                receive_end_ns,
+                notify_end_ns,
+            )
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """

@@ -525,3 +525,117 @@ def test_remote_group_and_layer_order_does_not_change_component_addresses():
     indexer_call, main_call = thread.engine.batch_transfer_sync_read.call_args_list
     assert all(src >= 30000 for src in indexer_call.args[2])
     assert all(10000 <= src < 30000 for src in main_call.args[2])
+
+
+def pd_timing_fields(info):
+    (call,) = info.call_args_list
+    message = call.args[0] % call.args[1:]
+    assert message.startswith("DSA_PD_TIMING ")
+    return dict(field.split("=", 1) for field in message.split()[1:])
+
+
+def test_pd_timing_records_both_phases_in_one_post_completion_log(monkeypatch):
+    worker, thread, command = make_worker()
+    # A single endpoint makes this a full local request, including its callback.
+    task = submit(worker, command)[0]
+    task["all_task_done"] = True
+    thread.request_task_counts[command.request_id] = 1
+    thread.finished_request_markers.add(command.request_id)
+    task["pd_enqueued_ns"] = 1000
+    task["pd_enqueued_unix_ns"] = 1700000000000000000
+    ticks = iter((1010, 1020, 1025, 1030, 1040, 1045, 1050))
+    monkeypatch.setattr(mooncake_connector.time, "perf_counter_ns", lambda: next(ticks))
+    info = MagicMock()
+    monkeypatch.setattr(mooncake_connector.logger, "info", info)
+    events = []
+    thread.engine.batch_transfer_sync_read.side_effect = lambda *args: events.append("read") or 0
+    thread._send_done_recv_signal.side_effect = lambda *args, **kwargs: events.append("notify")
+    callback = task["dsa_on_result"]
+    task["dsa_on_result"] = lambda result: (events.append("complete"), callback(result))
+    info.side_effect = lambda *args: events.append("log")
+
+    thread._handle_dsa_request(task)
+
+    assert events == ["read", "read", "notify", "complete", "log"]
+    fields = pd_timing_fields(info)
+    assert fields == {
+        "request_id": "request",
+        "remote_request_id": "remote",
+        "rank": "0",
+        "peer": "127.0.0.1:5000",
+        "participant": task["participant"],
+        "status": "ok",
+        "notify_failed": "False",
+        "enqueue_unix_ns": "1700000000000000000",
+        "enqueue_ns": "1000",
+        "start_ns": "1010",
+        "indexer_start_ns": "1020",
+        "indexer_end_ns": "1025",
+        "main_start_ns": "1030",
+        "main_end_ns": "1040",
+        "receive_end_ns": "1045",
+        "notify_end_ns": "1050",
+    }
+    assert worker.build_connector_worker_meta().results[0].kind is DsaLocalResultKind.RECEIVE_COMPLETE
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_pd_timing_preserves_failed_call_duration_and_failure_result(monkeypatch, raises):
+    worker, thread, command = make_worker()
+    task = submit(worker, command)[0]
+    info = MagicMock()
+    monkeypatch.setattr(mooncake_connector.logger, "info", info)
+    if raises:
+        thread.engine.batch_transfer_sync_read.side_effect = RuntimeError("transfer failed")
+    else:
+        thread.engine.batch_transfer_sync_read.return_value = -1
+
+    thread._handle_dsa_request(task)
+
+    fields = pd_timing_fields(info)
+    assert fields["status"] == "failed"
+    assert int(fields["indexer_end_ns"]) >= int(fields["indexer_start_ns"]) > 0
+    assert fields["main_start_ns"] == fields["main_end_ns"] == "0"
+    assert thread.get_and_clear_invalid_block_ids() == {81, 83}
+    thread.engine.batch_transfer_sync_read.assert_called_once()
+    thread._send_done_recv_signal.assert_called_once()
+
+
+@pytest.mark.parametrize("status", ["cancelled", "notify_only", "zero_reader_cleanup", "previous_failure"])
+def test_pd_timing_does_not_count_skipped_tasks_as_zero_latency_transfers(monkeypatch, status):
+    worker, thread, command = make_worker()
+    task = submit(worker, command)[0]
+    if status == "cancelled":
+        task["cancelled"].set()
+    elif status == "notify_only":
+        task["dsa_command"] = replace(command, notify_only=True)
+    elif status == "zero_reader_cleanup":
+        task["expected"] = 0
+    else:
+        thread.failed_recv_requests.add(command.request_id)
+    info = MagicMock()
+    monkeypatch.setattr(mooncake_connector.logger, "info", info)
+
+    thread._handle_dsa_request(task)
+
+    fields = pd_timing_fields(info)
+    assert fields["status"] == status
+    assert all(fields[key] == "0" for key in ("indexer_start_ns", "indexer_end_ns", "main_start_ns", "main_end_ns"))
+    thread.engine.batch_transfer_sync_read.assert_not_called()
+    thread._send_done_recv_signal.assert_called_once()
+
+
+def test_pd_timing_flags_notification_failure_without_changing_transfer_result(monkeypatch):
+    worker, thread, command = make_worker()
+    task = submit(worker, command)[0]
+    thread._send_done_recv_signal.side_effect = RuntimeError("notify failed")
+    info = MagicMock()
+    monkeypatch.setattr(mooncake_connector.logger, "info", info)
+
+    thread._handle_dsa_request(task)
+
+    fields = pd_timing_fields(info)
+    assert fields["status"] == "ok"
+    assert fields["notify_failed"] == "True"
+    assert int(fields["main_end_ns"]) >= int(fields["main_start_ns"]) > 0
+    assert int(fields["notify_end_ns"]) >= int(fields["receive_end_ns"])
