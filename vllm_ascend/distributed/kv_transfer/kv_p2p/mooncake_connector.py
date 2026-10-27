@@ -2029,8 +2029,11 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
         self._dsa_cancelled: set[str] = set()
         prefill = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {})
         self._dsa_prefill_tp_size = int(prefill.get("tp_size", 0))
+        self._prefill_pp_size = int(prefill.get("pp_size", 1))
         if self._dsa_prefill_tp_size <= 0:
             raise ValueError("Blockwise DSA requires kv_connector_extra_config.prefill.tp_size")
+        if self._prefill_pp_size <= 0:
+            raise ValueError("Blockwise DSA requires positive kv_connector_extra_config.prefill.pp_size")
         self._expected_tp_ranks = frozenset(range(vllm_config.parallel_config.tensor_parallel_size))
 
     def get_num_new_matched_tokens(
@@ -2057,7 +2060,7 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
             raise ValueError("DSA remote multi-group metadata requires explicit Main/Indexer group IDs")
         remote_tp = int(params.get("remote_ptp_size", self._dsa_prefill_tp_size))
         remote_pcp = int(params.get("remote_pcp_size", 1))
-        remote_pp = int(params.get("remote_pp_size", 1))
+        remote_pp = self._prefill_pp_size
         source = RemoteSource(
             remote_request_id=params["remote_request_id"],
             endpoints_by_prefill_rank=_project_remote_endpoints(
@@ -2800,7 +2803,6 @@ class MooncakeConnectorScheduler:
             ].kv_cache_spec.block_size
         return delay_free_blocks, dict(
             **component_groups,
-            remote_pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
             do_remote_prefill=True,
             do_remote_decode=False,
             remote_block_ids=computed_block_ids,
