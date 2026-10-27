@@ -3153,6 +3153,7 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
                 assert params is not None
                 self.assertEqual(params["remote_block_ids"], expected)
                 self.assertEqual(params["remote_pcp_size"], pcp_size)
+                self.assertNotIn("remote_pp_size", params)
                 self.assertEqual(params["remote_dcp_size"], dcp_size)
                 self.assertEqual(params["num_prompt_blocks"], 5)
                 self.assertIn(request.request_id, self.scheduler._reqs_need_send)
