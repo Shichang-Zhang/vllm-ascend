@@ -1189,7 +1189,7 @@ class SparseKVOffloadManager:
             )
         return self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]
 
-    def _register_local_mooncake_views(self) -> None:
+    def _validate_and_bind_local_mooncake_views(self) -> None:
         pool = self.get_mooncake_host_pool()
         descriptor, error = None, None
         try:
@@ -1306,7 +1306,7 @@ class SparseKVOffloadManager:
         # RD2H consumers need byte strides for each TP-shared host KV block.
         self.cpu_block_lens: list[tuple[int, int]] = []
         if self._uses_mooncake_host_pool():
-            self._register_local_mooncake_views()
+            self._validate_and_bind_local_mooncake_views()
         else:
             gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device="npu")
             gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device="npu")
