@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import ctypes
+import math
 import queue
 import threading
 from collections import defaultdict
@@ -37,6 +39,7 @@ def make_worker(rank=0, ptp=8, dcp=8, dtp=4):
     worker._prefill_pp_size = 1
     worker.use_mla = worker.use_sparse = True
     worker.pcp_size = worker.dcp_size = 1
+    worker.pcp_rank = worker.dcp_rank = 0
     worker.num_key_value_heads = 1
     worker.tp_num_need_pulls = 1
     worker.side_channel_port = 6000
@@ -444,43 +447,16 @@ def test_prefill_pp_keeps_indexer_task_in_every_stage():
     assert [(rank, pp, indexer) for rank, _, pp, indexer, _, _ in readers] == [(0, 0, True), (4, 1, True)]
 
 
-@pytest.mark.parametrize("dsa", [False, True])
-def test_dcp_pp_missing_source_stage_is_reported_before_transfer(dsa):
+def test_dcp_pp_missing_source_stage_is_reported_before_transfer():
     worker, thread, command = make_worker(ptp=8, dcp=8, dtp=4)
     worker._prefill_pp_size = 2
     endpoints = tuple(RemoteEndpoint("127.0.0.1", 5000 + p, "prefill") for p in range(16))
     command = replace(command, source=replace(command.source, remote_pp_size=2, endpoints_by_prefill_rank=endpoints))
-    with pytest.raises(AssertionError, match="Mooncake KV source coverage incomplete") as error:
-        if dsa:
-            worker._dispatch_dsa_commands((command,))
-        else:
-            worker._is_hma_required = False
-            worker.pcp_rank = worker.dcp_rank = 0
-            worker.block_size = 4
-            worker.block_size_scale = [[1]]
-            worker.kv_group2layeridx = {0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0])}
-            worker.local_remote_block_port_mapping = {}
-            worker.remote_port_send_num = {}
-            meta = SimpleNamespace(
-                remote_pcp_size=1,
-                remote_dcp_size=8,
-                remote_ptp_size=8,
-                remote_port=5000,
-                remote_host="localhost",
-                remote_engine_id="prefill",
-                remote_request_id="remote",
-                remote_multi_nodes_meta_mapping={},
-                remote_block_size=4,
-                num_external_tokens=32,
-                num_computed_tokens=0,
-                num_prompt_blocks=8,
-                local_block_ids=(list(range(8)),),
-                remote_block_ids=([9],),
-            )
-            worker._get_kv_split_metadata("remote", meta)
+    with pytest.raises(ValueError, match="Mooncake DSA source coverage incomplete") as error:
+        worker._dispatch_dsa_commands((command,))
     message = str(error.value)
     assert "request=remote" in message
-    assert f"missing_(pp_rank,cp_rank)={[(1, rank) for rank in range(8)]}" in message
+    assert f"missing_(pp_rank,dcp_rank)={[(1, rank) for rank in range(8)]}" in message
     assert "selected_ports=[5000, 5001, 5002, 5003, 5004, 5005, 5006, 5007]" in message
     assert thread.request_queue.empty()
     thread.engine.batch_transfer_sync_read.assert_not_called()
@@ -614,3 +590,144 @@ def test_request_level_results_reach_core_before_worker_metadata(transfer_result
     core = SimpleNamespace(requests={command.request_id: request}, recompute_kv_load_failures=False)
     assert Scheduler._handle_failed_recving(core, native.failed_recving) == expected_failed
     assert request.num_computed_tokens == 128
+
+
+@pytest.mark.parametrize(
+    "ptp,pcp,dcp,dtp", [(4, 1, 4, 2), (4, 2, 1, 2), (4, 2, 2, 2), (4, 2, 8, 2), (8, 2, 2, 4), (8, 2, 16, 4)]
+)
+@pytest.mark.parametrize("start,length", [(0, 37), (5, 32)])
+def test_mrv2_pcp_dcp_copies_global_tokens_to_shared_host(ptp, pcp, dcp, dtp, start, length):
+    # Build source contents from logical DCP groups, independently of the
+    # connector's physical-port decoder. PCP varies first within each group.
+    block, capacity = 4, 128
+    stop = start + length
+    request_blocks = math.ceil(stop / block)
+    source_ids = (9, 7, 11, 5, 13, 3, 15, 1, 17, 19)[: math.ceil(request_blocks / dcp)]
+    destination_ids = tuple(range(20, 20 + request_blocks))
+    indexer_ids = tuple(range(40, 40 + request_blocks))
+    physical_order = [p * ptp + t for t in range(ptp) for p in range(pcp)]
+    source_caches = {}
+    source_regions = []
+    for ordinal, physical_rank in enumerate(physical_order):
+        cache = [torch.full((capacity, block), -3, dtype=torch.bfloat16) for _ in range(2)]
+        indexer = torch.full((capacity * dcp, block), -3, dtype=torch.bfloat16)
+        for virtual_block, block_id in enumerate(source_ids):
+            global_block = virtual_block * dcp + ordinal % dcp
+            for position in range(block):
+                for component, tensor in enumerate(cache):
+                    tensor[block_id, position] = global_block * block + position + 100 * component
+            for offset in range(dcp * block):
+                indexer.view(capacity, dcp * block)[block_id, offset] = virtual_block * dcp * block + offset
+        source_caches[physical_rank] = (*cache, indexer)
+        source_regions.extend(
+            (tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * 2) for tensor in (*cache, indexer)
+        )
+
+    host = [torch.full((capacity, block), -1, dtype=torch.bfloat16) for _ in range(2)]
+    expected_host = [tensor.clone() for tensor in host]
+    for token in range(start, stop):
+        ordinal, offset = divmod(token, block)
+        for component, tensor in enumerate(expected_host):
+            tensor[destination_ids[ordinal], offset] = token + 100 * component
+    written_main_bytes = set()
+    notifications = defaultdict(int)
+    expected_notifications = {}
+    for rank in range(dtp):
+        worker, thread, command = make_worker(rank, ptp, dcp, dtp)
+        worker.block_size = block
+        endpoints = tuple(RemoteEndpoint("127.0.0.1", 5000 + p, "prefill") for p in range(ptp * pcp))
+        command = replace(
+            command,
+            source=replace(
+                command.source,
+                endpoints_by_prefill_rank=endpoints,
+                remote_pcp_size=pcp,
+                main_block_ids=source_ids,
+                indexer_block_ids=source_ids,
+                num_computed_tokens=start,
+                num_external_tokens=length,
+            ),
+            main_host_block_ids=destination_ids,
+            indexer_hbm_block_ids=indexer_ids,
+        )
+        local_indexer = torch.full((capacity, block), -1, dtype=torch.bfloat16)
+        expected_indexer = local_indexer.clone()
+        for token in range(start, stop):
+            ordinal, offset = divmod(token, block)
+            expected_indexer[indexer_ids[ordinal], offset] = token
+        thread._dsa_main_local_layout = [
+            DsaCacheLayout(MAIN, i, tensor.data_ptr(), 8, 8, 1, block, "bf16") for i, tensor in enumerate(host)
+        ]
+        thread._dsa_indexer_local_layout = [
+            DsaCacheLayout(INDEXER, 0, local_indexer.data_ptr(), 8, 8, 1, block, "bf16")
+        ]
+        groups = thread.kv_group2layeridx
+        thread.remote_metadata_hosts = {"prefill": {5000 + p: "127.0.0.1" for p in range(ptp * pcp)}}
+        thread.remote_kv_group2layeridx = {"prefill": {5000 + p: groups for p in range(ptp * pcp)}}
+        thread.kv_caches_base_addr = {
+            "prefill": {
+                5000 + p: [[cache[0].data_ptr(), cache[1].data_ptr()], [cache[2].data_ptr()]]
+                for p, cache in source_caches.items()
+            }
+        }
+        for attr, value in (
+            ("remote_block_stride_per_addr", [[8, 8], [8]]),
+            ("remote_block_size_scale", [[1, 1], [dcp]]),
+            ("remote_block_len_per_addr", [[8, 8], [8]]),
+            ("remote_cache_dtypes", [["bf16", "bf16"], ["bf16"]]),
+            ("remote_num_blocks", capacity),
+        ):
+            setattr(thread, attr, {"prefill": {5000 + p: value for p in range(ptp * pcp)}})
+        thread.remote_te_port = {"prefill": {5000 + p: 7000 + p for p in range(ptp * pcp)}}
+        destination_regions = [
+            (tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * 2) for tensor in (*host, local_indexer)
+        ]
+
+        def transfer(_session, dsts, srcs, lengths, *, destination_regions=destination_regions):
+            for src, dst, size in zip(srcs, dsts, lengths):
+                assert any(begin <= src and src + size <= end for begin, end in source_regions)
+                target = next(
+                    i for i, (begin, end) in enumerate(destination_regions) if begin <= dst and dst + size <= end
+                )
+                if target < 2:
+                    addresses = set(range(dst, dst + size))
+                    assert not written_main_bytes.intersection(addresses)
+                    written_main_bytes.update(addresses)
+                ctypes.memmove(dst, src, size)
+            return 0
+
+        thread.engine.batch_transfer_sync_read.side_effect = transfer
+        tasks = submit(worker, command)
+        if dcp == 1:
+            selected_pcp = worker._get_selected_pcp_rank(command.source.remote_request_id, pcp)
+            assert all(
+                (task["dsa_remote_endpoint"].remote_port - 5000) // ptp == selected_pcp
+                for task in tasks
+                if task["expected"]
+            )
+        for task in reversed(tasks):
+            thread._handle_dsa_request(task)
+        (result,) = worker.build_connector_worker_meta().results
+        assert result.kind is DsaLocalResultKind.RECEIVE_COMPLETE
+        torch.testing.assert_close(local_indexer, expected_indexer)
+        for call in thread._send_done_recv_signal.call_args_list:
+            _, _, port, counts = call.args
+            if counts[port]["num"]:
+                notifications[port] += 1
+                expected_notifications[port] = counts[port]["num"]
+    assert len(written_main_bytes) == length * 2 * len(host)
+    for actual, expected in zip(host, expected_host):
+        torch.testing.assert_close(actual, expected)
+    assert dict(notifications) == expected_notifications
+
+
+@pytest.mark.parametrize("pcp_rank", [0, 1])
+def test_dsa_without_dcp_uses_the_same_pcp_replica_as_prefill(pcp_rank):
+    worker, _, command = make_worker(ptp=4, dcp=1, dtp=2)
+    endpoints = tuple(RemoteEndpoint("127.0.0.1", 5000 + rank, "prefill") for rank in range(8))
+    command = replace(command, source=replace(command.source, remote_pcp_size=2, endpoints_by_prefill_rank=endpoints))
+    with patch.object(worker, "_get_selected_pcp_rank", return_value=pcp_rank) as select:
+        plan = worker._plan_dsa_endpoints(command)
+    select.assert_called_once_with(command.source.remote_request_id, 2)
+    assert all(rank // 4 == pcp_rank for rank, _, _, _, expected, _ in plan if expected)
+    assert {pp for _, _, pp, _, expected, _ in plan if expected} == {0}

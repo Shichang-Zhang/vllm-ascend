@@ -885,7 +885,7 @@ class KVCacheRecvingThread(threading.Thread):
                     command.indexer_hbm_block_ids if indexer else command.main_host_block_ids,
                     start,
                     end,
-                    cp_size=source.remote_pcp_size * source.remote_dcp_size,
+                    cp_size=source.remote_dcp_size,
                     cp_rank=task["cp_rank"],
                     writer_rank=self.tp_rank,
                     writer_size=self.vllm_config.parallel_config.tensor_parallel_size,
@@ -4073,133 +4073,6 @@ class MooncakeConnectorWorker:
                 remote_block_ids_list,
             )
 
-        def context_parallel_parameters_check():
-            assert remote_cp_size % local_cp_size == 0 or local_cp_size % remote_cp_size == 0, (
-                f"P/D CP sizes must be divisible in either direction, got P={remote_cp_size}, D={local_cp_size}."
-            )
-            if not (self.use_mla or self.use_sparse):
-                p_node_heads_per_rank = math.ceil(self.num_key_value_heads / prefill_tp_size)
-                d_node_heads_per_rank = math.ceil(self.num_key_value_heads / self.tp_size)
-                assert d_node_heads_per_rank % p_node_heads_per_rank == 0
-
-        def get_kv_head_groups(tp_size):
-            if self.use_mla or self.use_sparse:
-                kv_head_groups = []
-                kv_head_ids = [0]
-                kv_head_groups.append(tuple(kv_head_ids))
-                return kv_head_groups
-            if self.num_key_value_heads // tp_size >= 1:
-                kv_head_groups = []
-                for tp_rank in range(tp_size):
-                    kv_head_ids = [
-                        head_idx + tp_rank * (self.num_key_value_heads // tp_size)
-                        for head_idx in range(self.num_key_value_heads // tp_size)
-                    ]
-                    kv_head_groups.append(tuple(kv_head_ids))
-                return kv_head_groups
-            if tp_size // self.num_key_value_heads > 1:
-                kv_head_groups = []
-                for kv_head_ids_ in range(self.num_key_value_heads):
-                    kv_head_groups.append(tuple([kv_head_ids_]))
-                return kv_head_groups
-
-        def get_cp_group_meta(tp_size, pcp_size, dcp_size, port_base):
-            # key is kv_head_group, value is cp_groups and which cp_groups to select
-            cp_group_meta: dict = {}
-            kv_head_groups = get_kv_head_groups(tp_size)
-            dcp_repeat_num = tp_size * pcp_size // len(kv_head_groups) // dcp_size
-
-            for kv_head_group_idx, kv_head_group in enumerate(kv_head_groups):
-                if kv_head_group not in cp_group_meta:
-                    cp_group_meta[kv_head_group] = {}
-                    cp_group_meta[kv_head_group]["cp_groups"] = []
-                    cp_group_meta[kv_head_group]["select_cp_groups_id"] = 0
-                kv_head_group_offset = tp_size // len(kv_head_groups) * kv_head_group_idx
-                for dcp_repeat_idx in range(dcp_repeat_num):
-                    # MRV2 orders DCP ranks along PCP first, then TP.
-                    cp_group = []
-                    dcp_repeat_offset = dcp_size * dcp_repeat_idx
-                    for dcp_rank in range(dcp_size):
-                        flat_rank = dcp_repeat_offset + dcp_rank
-                        pcp_rank = flat_rank % pcp_size
-                        tp_rank = flat_rank // pcp_size + kv_head_group_offset
-                        cp_group.append(port_base + pcp_rank * tp_size + tp_rank)
-                    cp_group_meta[kv_head_group]["cp_groups"].append(cp_group)
-
-            return cp_group_meta
-
-        def get_local_remote_block_port_mappings():
-            context_parallel_parameters_check()
-            p_node_cp_group_meta = get_cp_group_meta(
-                prefill_tp_size, meta.remote_pcp_size, meta.remote_dcp_size, meta.remote_port
-            )
-            d_node_cp_group_meta = get_cp_group_meta(self.tp_size, self.pcp_size, self.dcp_size, self.side_channel_port)
-            local_remote_block_port_mappings: dict[int, list[list[int]]] = {}
-            for d_node_head_key in d_node_cp_group_meta:
-                for p_node_head_key in p_node_cp_group_meta:
-                    if not set(p_node_head_key).issubset(set(d_node_head_key)):
-                        continue
-                    d_node_head_group = d_node_cp_group_meta[d_node_head_key]
-                    p_node_head_group = p_node_cp_group_meta[p_node_head_key]
-                    for d_cp_group in d_node_head_group["cp_groups"]:
-                        select_cp_groups_id = p_node_head_group["select_cp_groups_id"]
-                        p_cp_groups = p_node_head_group["cp_groups"]
-                        p_cp_group = p_cp_groups[select_cp_groups_id]
-                        p_node_head_group["select_cp_groups_id"] = (
-                            select_cp_groups_id + 1 if select_cp_groups_id + 1 < len(p_cp_groups) else 0
-                        )
-                        for d_idx, d_port in enumerate(d_cp_group):
-                            if d_port not in local_remote_block_port_mappings:
-                                local_remote_block_port_mappings[d_port] = []
-                            p_port_remote_list = []
-                            for p_idx, p_port in enumerate(p_cp_group):
-                                # When Bd == Bp, r_blk = 1, which degenerates to the original `p_idx % Lcp` rule.
-                                # When Bd = r * Bp, all blocks of P CP rank q are mapped to D rank `(q // r) % Lcp`.
-                                if (p_idx // r_blk - d_idx) % min(len(d_cp_group), len(p_cp_group)) == 0:
-                                    p_port_remote_list.append(p_port)
-                            local_remote_block_port_mappings[d_port].append(p_port_remote_list)
-
-            logger.info(
-                "p_node_cp_group_meta is:: %s. d_node_cp_group_meta is:: %s. "
-                "local_remote_block_port_mappings is:: %s. ",
-                p_node_cp_group_meta,
-                d_node_cp_group_meta,
-                local_remote_block_port_mappings,
-            )
-
-            return local_remote_block_port_mappings
-
-        def get_remote_port_send_num(
-            local_remote_block_port_mappings: dict[int, list[list[int]]],
-        ) -> dict[int, RemotePortInfo]:
-            remote_port_send_num: dict[int, RemotePortInfo] = {}
-            remote_ports: set[int] = set(
-                range(meta.remote_port, meta.remote_port + prefill_tp_size * meta.remote_pcp_size)
-            )
-            kv_port = self.vllm_config.kv_transfer_config.kv_port
-            for key, remote_host_info in meta.remote_multi_nodes_meta_mapping.items():
-                remote_ports.add(int(remote_host_info.get("handshake_port", kv_port + int(key))))
-            for remote_port_head_list in local_remote_block_port_mappings.values():
-                for remote_port_list in remote_port_head_list:
-                    for remote_port in remote_port_list:
-                        remote_ports.add(remote_port)
-
-            for remote_port in remote_ports:
-                remote_host, _ = self._get_remote_host_info_by_port(
-                    meta.remote_port,
-                    remote_port,
-                    meta.remote_host,
-                    meta.remote_engine_id,
-                    meta.remote_multi_nodes_meta_mapping,
-                )
-                remote_port_send_num[remote_port] = {"num": 0, "host": remote_host}
-
-            for remote_port_head_list in local_remote_block_port_mappings.values():
-                for remote_port_list in remote_port_head_list:
-                    for remote_port in remote_port_list:
-                        remote_port_send_num[remote_port]["num"] += 1
-            return remote_port_send_num
-
         def _set_hma_shared_port(prefill_tp_size, meta, remote_handshake_port_list, req_id):
             """Rewrite remote attention ports for HMA load balancing and append Mamba ports.
 
@@ -4218,7 +4091,7 @@ class MooncakeConnectorWorker:
             """
             if self._is_hma_required and not (self.use_mla or self.use_sparse):
                 remote_dcp = max(meta.remote_dcp_size, 1)
-                group_span = prefill_tp_size // len(get_kv_head_groups(prefill_tp_size))
+                group_span = prefill_tp_size // len(self._get_kv_head_groups(prefill_tp_size))
                 n_replica = max(group_span // remote_dcp, 1)
                 chosen_tp_list = self._get_remote_rank(req_id, prefill_tp_size)
                 if n_replica > 1:
@@ -4254,14 +4127,11 @@ class MooncakeConnectorWorker:
             self.local_remote_block_port_mapping[meta.remote_engine_id] = None
 
         if self.local_remote_block_port_mapping[meta.remote_engine_id] is None:
-            local_remote_block_port_mappings = get_local_remote_block_port_mappings()
-            self._validate_cp_source_coverage(local_remote_block_port_mappings, meta, prefill_tp_size)
+            local_remote_block_port_mappings, reader_counts = self._get_cp_source_ports(meta, prefill_tp_size, r_blk)
             self.local_remote_block_port_mapping[meta.remote_engine_id] = local_remote_block_port_mappings[
                 self.handshake_port
             ]
-            self.remote_port_send_num[meta.remote_engine_id] = get_remote_port_send_num(
-                local_remote_block_port_mappings
-            )
+            self.remote_port_send_num[meta.remote_engine_id] = reader_counts
 
         local_remote_block_port_mapping = copy.deepcopy(self.local_remote_block_port_mapping[meta.remote_engine_id])
 
@@ -4436,71 +4306,71 @@ class MooncakeConnectorWorker:
 
         return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
 
-    def _validate_cp_source_coverage(self, mappings, meta: ReqMeta, prefill_tp_size: int) -> None:
-        """Reject missing PP/CP source shards before any transfer is submitted."""
-        if self._prefill_pp_size > 1:
-            # Inspect selected sources, not advertised endpoints or zero-reader
-            # notification entries. DCP is inside TP; PCP is inside each PP stage.
-            stage_width = prefill_tp_size * meta.remote_pcp_size
-            selected_ports = {port for groups in mappings.values() for ports in groups for port in ports}
-            selected_shards = set()
-            for port in selected_ports:
-                pp_rank, stage_rank = divmod(port - meta.remote_port, stage_width)
-                pcp_rank, tp_rank = divmod(stage_rank, prefill_tp_size)
-                selected_shards.add((pp_rank, pcp_rank * meta.remote_dcp_size + tp_rank % meta.remote_dcp_size))
-            required_shards = {
-                (pp_rank, cp_rank)
-                for pp_rank in range(self._prefill_pp_size)
-                for cp_rank in range(meta.remote_pcp_size * meta.remote_dcp_size)
-            }
-            missing_shards = required_shards - selected_shards
-            assert not missing_shards, (
-                "Mooncake KV source coverage incomplete before transfer: "
-                f"request={getattr(meta, 'remote_request_id', '<unknown>')}, remote_engine={meta.remote_engine_id}, "
-                f"P(TP={prefill_tp_size}, PCP={meta.remote_pcp_size}, "
-                f"DCP={meta.remote_dcp_size}, PP={self._prefill_pp_size}), "
-                f"D(TP={self.tp_size}, PCP={self.pcp_size}, DCP={self.dcp_size}), "
-                f"base_port={meta.remote_port}, selected_ports={sorted(selected_ports)}, "
-                f"missing_(pp_rank,cp_rank)={sorted(missing_shards)}. "
-                "These source shards have no planned reader; KV byte contents have not been checked."
+    def _validate_dsa_cp_source_coverage(self, mappings, meta: ReqMeta, prefill_tp_size: int) -> None:
+        """Check logical DCP shards, allowing unused physical cache replicas."""
+        stage_width = prefill_tp_size * meta.remote_pcp_size
+        selected_ports = {port for groups in mappings.values() for ports in groups for port in ports}
+        selected_shards = set()
+        for port in selected_ports:
+            pp_rank, stage_rank = divmod(port - meta.remote_port, stage_width)
+            pcp_rank, tp_rank = divmod(stage_rank, prefill_tp_size)
+            dcp_rank = (tp_rank * meta.remote_pcp_size + pcp_rank) % meta.remote_dcp_size
+            selected_shards.add((pp_rank, dcp_rank))
+        required_shards = {
+            (pp_rank, dcp_rank) for pp_rank in range(self._prefill_pp_size) for dcp_rank in range(meta.remote_dcp_size)
+        }
+        missing_shards = required_shards - selected_shards
+        if missing_shards:
+            raise ValueError(
+                "Mooncake DSA source coverage incomplete before transfer: "
+                f"request={meta.remote_request_id}, selected_ports={sorted(selected_ports)}, "
+                f"missing_(pp_rank,dcp_rank)={sorted(missing_shards)}"
             )
 
+    def _get_kv_head_groups(self, tp_size):
+        if self.use_mla or self.use_sparse:
+            kv_head_groups = []
+            kv_head_ids = [0]
+            kv_head_groups.append(tuple(kv_head_ids))
+            return kv_head_groups
+        if self.num_key_value_heads // tp_size >= 1:
+            kv_head_groups = []
+            for tp_rank in range(tp_size):
+                kv_head_ids = [
+                    head_idx + tp_rank * (self.num_key_value_heads // tp_size)
+                    for head_idx in range(self.num_key_value_heads // tp_size)
+                ]
+                kv_head_groups.append(tuple(kv_head_ids))
+            return kv_head_groups
+        if tp_size // self.num_key_value_heads > 1:
+            kv_head_groups = []
+            for kv_head_ids_ in range(self.num_key_value_heads):
+                kv_head_groups.append(tuple([kv_head_ids_]))
+            return kv_head_groups
+
     def _get_cp_source_ports(self, meta: ReqMeta, prefill_tp_size: int, r_blk: int):
-        """Shared ordinary CP source mapping and logical notification counts."""
+        """Plan source ports and reader counts using the main DCP layout.
+
+        DCP owns sequence sharding; PCP participates in physical rank ordering
+        and source-replica selection, without multiplying the shard count.
+        """
+        local_cp_size = self.dcp_size
+        remote_cp_size = meta.remote_dcp_size
 
         def context_parallel_parameters_check():
-            assert (meta.remote_pcp_size * meta.remote_dcp_size) % (self.pcp_size * self.dcp_size) == 0
+            assert remote_cp_size % local_cp_size == 0 or local_cp_size % remote_cp_size == 0, (
+                f"P/D CP sizes must be divisible in either direction, got P={remote_cp_size}, D={local_cp_size}."
+            )
             if not (self.use_mla or self.use_sparse):
                 p_node_heads_per_rank = math.ceil(self.num_key_value_heads / prefill_tp_size)
                 d_node_heads_per_rank = math.ceil(self.num_key_value_heads / self.tp_size)
                 assert d_node_heads_per_rank % p_node_heads_per_rank == 0
 
-        def get_kv_head_groups(tp_size):
-            if self.use_mla or self.use_sparse:
-                kv_head_groups = []
-                kv_head_ids = [0]
-                kv_head_groups.append(tuple(kv_head_ids))
-                return kv_head_groups
-            if self.num_key_value_heads // tp_size >= 1:
-                kv_head_groups = []
-                for tp_rank in range(tp_size):
-                    kv_head_ids = [
-                        head_idx + tp_rank * (self.num_key_value_heads // tp_size)
-                        for head_idx in range(self.num_key_value_heads // tp_size)
-                    ]
-                    kv_head_groups.append(tuple(kv_head_ids))
-                return kv_head_groups
-            if tp_size // self.num_key_value_heads > 1:
-                kv_head_groups = []
-                for kv_head_ids_ in range(self.num_key_value_heads):
-                    kv_head_groups.append(tuple([kv_head_ids_]))
-                return kv_head_groups
-
         def get_cp_group_meta(tp_size, pcp_size, dcp_size, port_base):
             # key is kv_head_group, value is cp_groups and which cp_groups to select
             cp_group_meta: dict = {}
-            kv_head_groups = get_kv_head_groups(tp_size)
-            dcp_repeat_num = tp_size // len(kv_head_groups) // dcp_size
+            kv_head_groups = self._get_kv_head_groups(tp_size)
+            dcp_repeat_num = tp_size * pcp_size // len(kv_head_groups) // dcp_size
 
             for kv_head_group_idx, kv_head_group in enumerate(kv_head_groups):
                 if kv_head_group not in cp_group_meta:
@@ -4509,15 +4379,14 @@ class MooncakeConnectorWorker:
                     cp_group_meta[kv_head_group]["select_cp_groups_id"] = 0
                 kv_head_group_offset = tp_size // len(kv_head_groups) * kv_head_group_idx
                 for dcp_repeat_idx in range(dcp_repeat_num):
-                    # len(cp_group) == pcp_size * dcp_size
+                    # MRV2 orders DCP ranks along PCP first, then TP.
                     cp_group = []
                     dcp_repeat_offset = dcp_size * dcp_repeat_idx
-                    for pcp_rank in range(pcp_size):
-                        pcp_rank_offset = tp_size * pcp_rank
-                        for dcp_rank in range(dcp_size):
-                            cp_group.append(
-                                dcp_rank + port_base + pcp_rank_offset + dcp_repeat_offset + kv_head_group_offset
-                            )
+                    for dcp_rank in range(dcp_size):
+                        flat_rank = dcp_repeat_offset + dcp_rank
+                        pcp_rank = flat_rank % pcp_size
+                        tp_rank = flat_rank // pcp_size + kv_head_group_offset
+                        cp_group.append(port_base + pcp_rank * tp_size + tp_rank)
                     cp_group_meta[kv_head_group]["cp_groups"].append(cp_group)
 
             return cp_group_meta
@@ -4549,7 +4418,7 @@ class MooncakeConnectorWorker:
                             for p_idx, p_port in enumerate(p_cp_group):
                                 # When Bd == Bp, r_blk = 1, which degenerates to the original `p_idx % Lcp` rule.
                                 # When Bd = r * Bp, all blocks of P CP rank q are mapped to D rank `(q // r) % Lcp`.
-                                if (p_idx // r_blk) % len(d_cp_group) == d_idx:
+                                if (p_idx // r_blk - d_idx) % min(len(d_cp_group), len(p_cp_group)) == 0:
                                     p_port_remote_list.append(p_port)
                             local_remote_block_port_mappings[d_port].append(p_port_remote_list)
 
@@ -4595,7 +4464,6 @@ class MooncakeConnectorWorker:
             return remote_port_send_num
 
         mappings = get_local_remote_block_port_mappings()
-        self._validate_cp_source_coverage(mappings, meta, prefill_tp_size)
         return mappings, get_remote_port_send_num(mappings)
 
     def _get_dcp_shard_pulls(self, remote_handshake_port_list, prefill_tp_size, remote_base_port, remote_pcp_size):
@@ -5107,7 +4975,7 @@ class MooncakeConnectorWorker:
     def _plan_dsa_endpoints(self, command: DsaStepRequest):
         """Adapt ordinary source participants; writer filtering cannot remove tasks."""
         source = command.source
-        cp_size = source.remote_pcp_size * source.remote_dcp_size
+        cp_size = source.remote_dcp_size
         endpoints = source.endpoints_by_prefill_rank
         expected_endpoints = source.remote_ptp_size * source.remote_pcp_size * source.remote_pp_size
         if len(endpoints) != expected_endpoints:
@@ -5133,6 +5001,7 @@ class MooncakeConnectorWorker:
                 source.remote_block_size,
             )
             mappings, counts = self._get_cp_source_ports(meta, source.remote_ptp_size, 1)
+            self._validate_dsa_cp_source_coverage(mappings, meta, source.remote_ptp_size)
             # Source planner's virtual offsets retain CP shard identity. Actual
             # host/port translation happens after planning, as in ordinary pulls.
             all_ranks = [
@@ -5141,18 +5010,25 @@ class MooncakeConnectorWorker:
             ]
             expected = {rank: counts[base + rank]["num"] for rank in range(len(endpoints))}
         else:
-            all_ranks = self._get_remote_ranks_for_req(source.remote_request_id, source.remote_ptp_size)
+            selected_pcp = self._get_selected_pcp_rank(source.remote_request_id, source.remote_pcp_size)
+            stage_width = source.remote_ptp_size * source.remote_pcp_size
+            all_ranks = [
+                [
+                    (rank // source.remote_ptp_size) * stage_width
+                    + selected_pcp * source.remote_ptp_size
+                    + rank % source.remote_ptp_size
+                    for rank in ranks
+                ]
+                for ranks in self._get_remote_ranks_for_req(source.remote_request_id, source.remote_ptp_size)
+            ]
             expected = {rank: sum(ranks.count(rank) for ranks in all_ranks) for rank in range(len(endpoints))}
         selected = all_ranks[self.tp_rank]
         tasks = []
         indexer_stages = set()
         for task_index, rank in enumerate(selected):
-            pp_rank = rank // source.remote_ptp_size if cp_size == 1 else 0
-            cp_rank = (
-                (rank // source.remote_ptp_size * source.remote_dcp_size + rank % source.remote_dcp_size)
-                if cp_size > 1
-                else 0
-            )
+            pp_rank, stage_rank = divmod(rank, source.remote_ptp_size * source.remote_pcp_size)
+            pcp_rank, tp_rank = divmod(stage_rank, source.remote_ptp_size)
+            cp_rank = (tp_rank * source.remote_pcp_size + pcp_rank) % cp_size
             include_indexer = pp_rank not in indexer_stages
             indexer_stages.add(pp_rank)
             tasks.append((rank, cp_rank, pp_rank, include_indexer, expected[rank], task_index))
