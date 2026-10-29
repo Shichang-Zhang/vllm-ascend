@@ -130,3 +130,6 @@ import vllm_ascend.patch.platform.patch_example_connector  # noqa
 #    Future Plan:
 #       Remove this patch when upstream supports per-group or backend-defined
 #       prefill boundaries.
+# PD disaggregation: tolerate duplicate/late KV-transfer receive terminals
+# (see patch_pd_xfer_terminal.py).
+import vllm_ascend.patch.platform.patch_pd_xfer_terminal  # noqa

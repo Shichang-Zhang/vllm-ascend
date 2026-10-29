@@ -1,4 +1,4 @@
-#
+﻿#
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
 #
@@ -23,7 +23,7 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, TypeAdapter, ValidationInfo, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -115,7 +115,7 @@ class AscendCompilationConfig:
 
     Migrated to ``@config`` (pydantic dataclass). Hardware-profile runtime
     downgrades (disable npugraph_ex / static_kernel / super_kernel) and the
-    super_kernel→static_kernel→npugraph_ex dependency checks are applied in
+    super_kernel鈫抯tatic_kernel鈫抧pugraph_ex dependency checks are applied in
     an ``after`` model_validator.
     """
 
@@ -174,7 +174,7 @@ class AscendFusionConfig:
     """Configuration for controlling whether to use a fused operator gmmswigluquant.
 
     Migrated to ``@config`` (pydantic dataclass): bool field gets lax coercion
-    (``"false"``→False) and unknown keys are forbidden (``extra="forbid"``),
+    (``"false"``鈫扚alse) and unknown keys are forbidden (``extra="forbid"``),
     fixing the ``bool("false")`` pitfall and surfacing typos.
     """
 
@@ -279,8 +279,7 @@ class EplbConfig:
     Migrated to ``@config`` (pydantic dataclass). Unknown-key detection is now
     handled by ``extra="forbid"`` (replaces the hand-written ``unknown`` check);
     int/range/enum checks moved to an ``after`` model_validator. The
-    ``__getattr__`` proxy over the internal ``self.config`` dict is removed —
-    fields are accessed directly (``self.dynamic_eplb`` etc.).
+    ``__getattr__`` proxy over the internal ``self.config`` dict is removed 鈥?    fields are accessed directly (``self.dynamic_eplb`` etc.).
     """
 
     dynamic_eplb: bool = False
@@ -398,12 +397,12 @@ class AscendConfig:
     """Configuration Object for additional_config from vllm.configs.
 
     Migrated to ``@config`` (pydantic dataclass). User-input switches are now
-    typed fields with lax bool/int coercion (``"false"``→False, ``"2"``→2),
+    typed fields with lax bool/int coercion (``"false"``鈫扚alse, ``"2"``鈫?),
     fixing the ``bool("false")``/``"2"==2`` pitfalls. Unknown keys are
     forbidden (``extra="forbid"``). Cross-config derivations, downgrades and
     mutex checks that need ``vllm_config`` run in
     ``derive_and_validate()``, a plain method invoked explicitly by
-    ``init_ascend_config`` (not a pydantic validator) — preserving original
+    ``init_ascend_config`` (not a pydantic validator) 鈥?preserving original
     ordering and error messages.
 
     ``vllm_config`` is NOT a member of AscendConfig (neither a declared
@@ -605,7 +604,7 @@ class AscendConfig:
     enable_fused_mc2: int = 0
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
-    # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have
+    # on kv_consumer D nodes. Trades NPU memory for stability 鈥?D nodes have
     # normal local-prefill paths (recompute / fallback / preempt) that crash
     # when the weights are freed (issue #11882). Default False (preserve
     # existing memory-saving behavior).
@@ -614,7 +613,7 @@ class AscendConfig:
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
 
-    # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
+    # ---- sub-configs (no vllm_config dep): pydantic dict鈫抎ataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
     ascend_fusion_config: AscendFusionConfig = dataclasses.field(default_factory=AscendFusionConfig)
     ascend_warmup_config: AscendWarmupConfig = dataclasses.field(default_factory=AscendWarmupConfig)
@@ -672,8 +671,7 @@ class AscendConfig:
 
     # ---- derivations + cross-config downgrades/mutex ----
     # Business validation: invoked explicitly by init_ascend_config (NOT a
-    # pydantic after-validator). Preserves the original __init__ ordering —
-    # multi-step downgrades are order-dependent (e.g. profiling_chunk reads
+    # pydantic after-validator). Preserves the original __init__ ordering 鈥?    # multi-step downgrades are order-dependent (e.g. profiling_chunk reads
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
@@ -1323,7 +1321,7 @@ class FinegrainedTPConfig:
     """Configuration Object for ``additional_config["finegrained_tp_config"]``.
 
     Migrated to ``@config`` (pydantic dataclass). 4 int fields get lax coercion
-    ('2'→2). vllm_config-dependent preconditions (TP/eager/kv_consumer/is_moe/
+    ('2'鈫?). vllm_config-dependent preconditions (TP/eager/kv_consumer/is_moe/
     data_parallel divisibility) are validated in ``_validate_preconditions()``,
     a plain method invoked explicitly by ``init_ascend_config`` (Plan B:
     business validation stays out of pydantic). ``vllm_config`` is no longer a
@@ -1481,8 +1479,8 @@ class ProfilingChunkConfig:
     Migrated to ``@config`` (pydantic dataclass). Range/positivity checks
     moved to an ``after`` model_validator. ``need_timing`` uses ``None`` as a
     "not provided" sentinel so the after-validator can distinguish "user did
-    not set it" (→ default to ``enabled``) from "user explicitly set False"
-    (→ keep False), mirroring the original ``config.get("need_timing", self.enabled)``.
+    not set it" (鈫?default to ``enabled``) from "user explicitly set False"
+    (鈫?keep False), mirroring the original ``config.get("need_timing", self.enabled)``.
     """
 
     enabled: bool = False
@@ -1693,6 +1691,26 @@ class SparseKVOffloadConfig:
     keep_device_kv_cache: bool = False
     topk: int = dataclasses.field(default=0, init=False)
     use_fused_overlap: bool = False
+    host_backend: str = "memfabric"
+    lru_max_threads: int = 8
+
+    @field_validator("enabled", "keep_device_kv_cache", "use_fused_overlap", mode="before")
+    @classmethod
+    def _parse_bool_option(cls, value: Any, info: ValidationInfo):
+        # Accept JSON-style booleans from additional_config and reject
+        # anything else with a config-scoped message (matches the UX of the
+        # upstream sparse-KV-offload option parser).
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        raise ValueError(f"sparse_kv_offload_config.{info.field_name} must be a boolean")
 
     @property
     def use_fused_copy_sfa(self) -> bool:
@@ -1705,6 +1723,19 @@ class SparseKVOffloadConfig:
             raise ValueError("sparse_kv_offload_config.topk_buffer_size must be -1 or positive")
         if self.dram_size_per_dp_GB <= 0:
             raise ValueError("sparse_kv_offload_config.dram_size_per_dp_GB must be positive")
+        if self.host_backend not in {"memfabric", "mooncake"}:
+            raise ValueError("sparse_kv_offload_config.host_backend must be 'memfabric' or 'mooncake'")
+        if type(self.lru_max_threads) is not int or self.lru_max_threads <= 0:
+            raise ValueError("sparse_kv_offload_config.lru_max_threads must be a positive integer")
+        if self.enabled and self.host_backend == "mooncake":
+            if not self.use_fused_overlap:
+                raise ValueError("sparse_kv_offload_config.host_backend='mooncake' requires use_fused_overlap=true")
+            if self.keep_device_kv_cache:
+                raise ValueError(
+                    "sparse_kv_offload_config.host_backend='mooncake' is "
+                    "only supported for PD-disaggregated decode; "
+                    "keep_device_kv_cache must be false"
+                )
         return self
 
     @classmethod
@@ -1773,7 +1804,7 @@ class SparseKVOffloadConfig:
 
 _ASCEND_CONFIG: AscendConfig | None = None
 # Identity key for the singleton cache: the vllm_config that initialized it.
-# Private module state (not a field on AscendConfig) — replaces the former
+# Private module state (not a field on AscendConfig) 鈥?replaces the former
 # ``getattr(_ASCEND_CONFIG, "vllm_config", None) is vllm_config`` check, now
 # that vllm_config is no longer a member of AscendConfig.
 _INIT_VLLM_CONFIG: Any = None
@@ -1915,7 +1946,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # Business validation (Plan B): pydantic did type/range/enum checks during
     # construction; the cross-config derivations and mutex checks that need
     # vllm_config run here, explicitly, before the instance is usable. This is
-    # the single legitimate entry point — bypassing the factory leaves derived
+    # the single legitimate entry point 鈥?bypassing the factory leaves derived
     # fields at their sentinel defaults.
     new_config.derive_and_validate(vllm_config)
     new_config.rl_config.apply(new_config)
@@ -1949,3 +1980,4 @@ def get_ascend_config():
     if _ASCEND_CONFIG is None or not _is_ascend_config_initialized(_ASCEND_CONFIG):
         raise RuntimeError("Ascend config is not initialized. Please call init_ascend_config first.")
     return _ASCEND_CONFIG
+

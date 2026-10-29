@@ -16,6 +16,8 @@ from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     get_current_hardware_profile,
 )
+from vllm_ascend import envs
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 MASK_BIT = 32  # Number of bits in a CPU affinity mask group
 MIN_CPUS_PER_NPU = 5  # 2(IRQ) + 1(main, at least 1 CPU) + 1(acl) + 1(release) = 5 CPUs per NPU
@@ -644,6 +646,9 @@ class CpuAlloc:
             anchor_cpu = cpu_pool[0]
             return self.cpu_node.get(anchor_cpu)
 
+        if envs.VLLM_ASCEND_SKIP_MIGRATEPAGES:
+            logger.info("[migrate] skipped because VLLM_ASCEND_SKIP_MIGRATEPAGES=1; CPU thread binding continues.")
+            return
         if not shutil.which("migratepages"):
             logger.info("The 'migratepages' command is not available, skipping memory binding.")
             return
