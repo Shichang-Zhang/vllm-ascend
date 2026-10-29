@@ -193,6 +193,12 @@ class CopySfaTailDest:
 class SfaPDConsumerMetadata(KVConnectorMetadata):
     def __init__(self) -> None:
         self.requests: list[SfaPDConsumerReqMeta] = []
+        # Requests whose P-side rendezvous (metaserver dispatch) failed. Each
+        # entry is (req_id, main_block_ids, indexer_block_ids); the consumer
+        # worker routes the block ids into the invalid-block channel so the
+        # scheduler fails the request instead of leaving it waiting for KV
+        # that will never arrive.
+        self.failed_requests: list[tuple[str, list[int], list[int]]] = []
 
     def add_request(
         self,
@@ -227,6 +233,14 @@ class SfaPDConsumerMetadata(KVConnectorMetadata):
                 ),
             )
         )
+
+    def add_failed_request(
+        self,
+        request_id: str,
+        main_block_ids: list[int],
+        indexer_block_ids: list[int],
+    ) -> None:
+        self.failed_requests.append((request_id, list(main_block_ids), list(indexer_block_ids)))
 
 
 @dataclass
