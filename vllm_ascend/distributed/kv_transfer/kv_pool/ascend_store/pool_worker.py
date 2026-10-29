@@ -2092,30 +2092,14 @@ class KVPoolWorker:
                 # target is therefore allocated fresh within this step; no
                 # cross-step GVA cache is kept.
                 block_gvas: list[int] = []
-                new_keys: list[str] = []
-                new_positions: list[int] = []
-                revalidated_keys = 0
-                for blk_idx in range(save_start_block, min(save_end_block, len(group_block_hashes))):
-                    key = self._make_layerwise_gva_key(group_id, block_hash_to_str(group_block_hashes[blk_idx]))
-                    if key in self._allocated_gvas:
-                        # Mid-segment cached key: the pool blob may still
-                        # exist, but the client-side gvaBlobTracker entry can
-                        # have expired (alloc TTL elapsed / operateQueue
-                        # drained) and batch_copy would fail with -3102
-                        # UNMATCHED_KEY. Never write through a cached GVA:
-                        # route every key through batch_alloc, which
-                        # re-registers the tracker for an existing blob (or
-                        # allocates a fresh one if it was evicted).
-                        revalidated_keys += 1
-                    new_keys.append(key)
-                    new_positions.append(len(block_gvas))
-                    block_gvas.append(0)
-
-                if new_keys:
-                    new_gvas = self.m_store.batch_alloc(
-                        new_keys, [alloc_size] * len(new_keys), LAYERWISE_READ_LEASE_TTL_MS
+                if transfer_blocks:
+                    transfer_keys = [key for key in candidate_keys if key in missing_keys]
+                    transfer_gvas = self.m_store.batch_alloc(
+                        transfer_keys, [alloc_size] * len(transfer_keys), LAYERWISE_READ_LEASE_TTL_MS
                     )
-                    if any(gva <= 0 for gva in new_gvas):
+                    if transfer_gvas is None or len(transfer_gvas) != len(transfer_keys):
+                        return False
+                    if any(gva <= 0 for gva in transfer_gvas):
                         logger.error(
                             "alloc_gvas FAIL: req=%s group=%d alloc_size=%d alloc_keys=%d gvas_sample=%s fail_count=%d",
                             request.req_id,
@@ -2147,12 +2131,24 @@ class KVPoolWorker:
                         partial_block_index,
                         request.target_token_len,
                     )
-                    partial_gva = self._allocated_gvas.get(partial_key)
-                    if partial_gva is None:
-                        allocated = self.m_store.batch_alloc(
-                            [partial_key],
-                            [alloc_size],
-                            LAYERWISE_READ_LEASE_TTL_MS,
+                    # Partial keys are request-scoped: allocate fresh each step.
+                    allocated = self.m_store.batch_alloc(
+                        [partial_key],
+                        [alloc_size],
+                        LAYERWISE_READ_LEASE_TTL_MS,
+                    )
+                    if not allocated or len(allocated) != 1:
+                        return False
+                    partial_gva = allocated[0]
+                    if 0 < partial_gva < MEMCACHE_SSD_HIT_GVA:
+                        all_group_save_keys.append(partial_key)
+                    elif partial_gva <= 0:
+                        logger.error(
+                            "alloc_gvas: partial allocation failed req=%s group=%d block=%d gva=%d",
+                            request.req_id,
+                            group_id,
+                            partial_block_index,
+                            partial_gva,
                         )
                     if self.layerwise_offload and partial_gva <= 0:
                         return False
@@ -2162,14 +2158,15 @@ class KVPoolWorker:
 
                 logger.debug(
                     "alloc_gvas: req=%s group=%d eff_bs=%d save_blocks=[%d,%d) "
-                    "new_keys=%d revalidated=%d alloc_size=%d",
+                    "transfer_keys=%d committed=%d masked=%s alloc_size=%d",
                     request.req_id,
                     group_id,
                     effective_block_size,
                     save_start_block,
                     save_end_block,
-                    len(new_keys),
-                    revalidated_keys,
+                    len(transfer_blocks),
+                    len(candidate_blocks) - len(transfer_blocks),
+                    group_store_mask is not None,
                     alloc_size,
                 )
 
@@ -2189,7 +2186,6 @@ class KVPoolWorker:
                 request.block_gvas_np = all_group_gvas[0]
                 request.gva_block_offset = 0
         return None
-
     def _prepare_load_gvas(self, requests: list[ReqMeta]) -> None:
         for request in requests:
             if self._prepare_load_gvas_for_request([request]) is False:
@@ -3031,15 +3027,26 @@ class KVPoolWorker:
         # Worker threads may still own the lists from the preceding step.
         self.layer_save_tasks = [[] for _ in range(self.num_layers)]
         self.layer_load_tasks = [[] for _ in range(self.num_layers)]
-        # Resolve load GVA/leases before creating save tasks. A scheduler hit
-        # is only provisional: if load preparation finds an invalid GVA or
-        # lease, it clears load_spec and the request must be planned as a
-        # fresh recompute/save in this same step.
+        if not requests:
+            return
+        # Mooncake uses the projected stage-local cache layout, including any
+        # draft layers. The GVA/key planes retain their existing PP key count.
+        if not self.use_block_key_layerwise and getattr(self, "pp_size", 1) > 1:
+            num_local = getattr(self, "layerwise_key_layers", 0) or self.num_layers
+        else:
+            num_local = self.num_layers
+        for request in requests:
+            request.store_masks = self._compute_reachable_store_masks(request)
+        group_requests = {}
+        if self.use_block_key_layerwise:
+            group_requests = self.layerwise_protocol.prepare_layerwise_sessions(self, requests)
+        for local_layer in range(num_local):
+            for group_id, layer_idx_in_group in self._groups_for_layerwise_transfer(local_layer):
+                self._process_save_for_layer_batch(
+                    group_requests.get(group_id, requests), local_layer, group_id, layer_idx_in_group
+                )
+        # Protect the previous partial before allocating the next snapshot.
         self._prepare_load_gvas(requests)
-        for physical_layer in range(self.num_layers):
-            group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, physical_layer)])
-            for group_id, layer_idx_in_group in group_layers:
-                self._process_save_for_layer_batch(requests, physical_layer, group_id, layer_idx_in_group)
         self._alloc_gvas_for_save(requests)
         self._build_shared_save_data()
         for local_layer in range(num_local):
@@ -3048,7 +3055,6 @@ class KVPoolWorker:
                     group_requests.get(group_id, requests), local_layer, group_id, layer_idx_in_group
                 )
         self._build_shared_load_data()
-
     def _check_hybrid_load_errors(self) -> None:
         # Memcache reports invalid blocks through the existing scheduler policy.
         if self.use_layerwise_transfer:

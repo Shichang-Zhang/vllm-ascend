@@ -104,6 +104,10 @@ FSA_WRITEBACK_MAX_TOKEN_CAPACITY = 1 << 31
 _SUBSCRIBED_COMPUTE_STREAMS: set[object] = set()
 
 
+def get_subscribed_compute_streams() -> set:
+    return _SUBSCRIBED_COMPUTE_STREAMS
+
+
 def _sparse_kv_ops():
     global _SPARSE_KV_OFFLOAD_OPS
     if _SPARSE_KV_OFFLOAD_OPS is not None:
@@ -1317,6 +1321,41 @@ class SparseKVOffloadManager:
 
         if self.use_fused_copy_sfa:
             self._bind_copy_sfa_bases()
+
+        gvas_buffer_offset = 0
+        gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8  # 2: k+v, 8: int64
+        addr_buffer_offset = gvas_buffer_offset + gvas_buffer_size_bytes
+        addr_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8
+        size_buffer_offset = addr_buffer_offset + addr_buffer_size_bytes
+        size_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 4  # 2: k+v, 4: int32
+        num_tokens_buffer_offset = size_buffer_offset + size_buffer_size_bytes
+        num_tokens_buffer_size_bytes = 4  # 1 * int32
+        sparse_copy_args_buffer_size_bytes = (
+            gvas_buffer_size_bytes + addr_buffer_size_bytes + size_buffer_size_bytes + num_tokens_buffer_size_bytes
+        )
+        self.sparse_copy_args_buffer_cpu = torch.zeros(
+            [sparse_copy_args_buffer_size_bytes], dtype=torch.int8, device="cpu", pin_memory=True
+        )
+        self.sparse_copy_args_buffer_npu = torch.zeros(
+            [sparse_copy_args_buffer_size_bytes], dtype=torch.int8, device="npu"
+        )
+
+        self.gvas_buffer_cpu = self.sparse_copy_args_buffer_cpu[
+            gvas_buffer_offset : gvas_buffer_offset + gvas_buffer_size_bytes
+        ].view(torch.int64)
+        self.addr_buffer_cpu = self.sparse_copy_args_buffer_cpu[
+            addr_buffer_offset : addr_buffer_offset + addr_buffer_size_bytes
+        ].view(torch.int64)
+        self.size_buffer_cpu = self.sparse_copy_args_buffer_cpu[
+            size_buffer_offset : size_buffer_offset + size_buffer_size_bytes
+        ].view(torch.int32)
+        self.num_tokens_buffer_cpu = self.sparse_copy_args_buffer_cpu[
+            num_tokens_buffer_offset : num_tokens_buffer_offset + num_tokens_buffer_size_bytes
+        ].view(torch.int32)
+        assert self.gvas_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
+        assert self.addr_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
+        assert self.size_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
+        assert self.num_tokens_buffer_cpu.shape == torch.Size([1])
 
         self.gvas_buffer_npu = self.sparse_copy_args_buffer_npu[
             gvas_buffer_offset : gvas_buffer_offset + gvas_buffer_size_bytes

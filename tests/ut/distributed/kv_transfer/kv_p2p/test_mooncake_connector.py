@@ -304,7 +304,6 @@ class TestKVCacheSendingThread(unittest.TestCase):
         self.assertIn(req_id, thread.task_tracker.finished_requests)
 
         sock.close()
-        context.term()
         thread.stop()
         thread.join(timeout=3)
         self.assertFalse(thread.is_alive())

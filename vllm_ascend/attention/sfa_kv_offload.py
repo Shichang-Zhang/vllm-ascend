@@ -21,8 +21,6 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple, TypeVar
-
 from dataclasses import dataclass
 from typing import Any, NamedTuple, TypeVar, cast
 
@@ -43,7 +41,6 @@ from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from vllm_ascend import envs as envs_ascend
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.indexer import (
     INDEXER_K_CACHE_SLOT,
@@ -57,6 +54,7 @@ from vllm_ascend.attention.sfa_v1 import (
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    build_valid_topk_mask,
     split_decodes_and_prefills,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (

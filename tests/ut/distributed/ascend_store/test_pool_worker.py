@@ -2583,7 +2583,6 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
 
         worker = self._make_gva_worker()
         fresh_key = worker._make_layerwise_full_key(0, "h0")
-        committed_key = worker._make_layerwise_full_key(0, "h1")
         worker.m_store.batch_is_exist.side_effect = lambda keys: [0 if key == fresh_key else 1 for key in keys]
         worker.m_store.batch_alloc.return_value = [202]
         request = ReqMeta(
@@ -2603,9 +2602,8 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
 
         worker._alloc_gvas_for_save([request])
 
-        worker.m_store.batch_alloc.assert_called_once_with([key], [64], LAYERWISE_READ_LEASE_TTL_MS)
-        self.assertEqual(worker._allocated_gvas[key], 202)
-        self.assertEqual(request.block_gvas_by_group_np[0].tolist(), [202])
+        worker.m_store.batch_alloc.assert_called_once_with([fresh_key], [64], LAYERWISE_READ_LEASE_TTL_MS)
+        self.assertEqual(request.block_gvas_by_group_np[0].tolist(), [202, 0])
 
     def test_partial_decode_is_saved_and_loaded_for_reused_layer(self):
         worker = self._make_worker()

@@ -574,11 +574,11 @@ class SFAPDRD2HScheduler:
                 for req_id, ts in self._cancelled_metaserver_requests.items()
                 if now - ts <= METASERVER_CANCELLED_TTL_SECONDS
             }
-            self._cancelled_metaserver_requests[request.request_id] = now
-            future = self._metaserver_futures.pop(request.request_id, None)
-            timer = self._metaserver_retry_timers.pop(request.request_id, None)
-            self._metaserver_retry_counts.pop(request.request_id, None)
-            self._rendezvous_failed_reqs.pop(request.request_id, None)
+            self._cancelled_metaserver_requests[request_id] = now
+            future = self._metaserver_futures.pop(request_id, None)
+            timer = self._metaserver_retry_timers.pop(request_id, None)
+            self._metaserver_retry_counts.pop(request_id, None)
+            self._rendezvous_failed_reqs.pop(request_id, None)
         if future is not None:
             future.cancel()
         if timer is not None:
