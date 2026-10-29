@@ -352,7 +352,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.lim_request_state = state
         if draft_index == 0:
             buffer = self.copy_sfa_vectors["reuse_logical_lens"][step, :count]
-            buffer.copy_(torch.where(active, torch.where(is_short, seq_lens, cache), 0))
+            buffer.copy_(logical)
             metadata.copy_sfa_reuse_logical_lens = buffer
 
         cache_blocks = cache[:, None] // 128
