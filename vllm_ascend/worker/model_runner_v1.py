@@ -4618,6 +4618,11 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config,
                 self.sparse_kv_offload_config,
             )
+            assert self.sparse_kv_offload_manager is not None
+            self.sparse_kv_offload_manager.prepare_host_kv_allocation(
+                device_id=torch.npu.current_device(),
+                dp_rank=int(self.dp_rank),
+            )
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config,
             kernel_block_sizes=kernel_block_sizes,
@@ -4638,7 +4643,6 @@ class NPUModelRunner(GPUModelRunner):
             for module in self.model.modules():
                 if isinstance(module, DeepseekV41Compressor) and module.ratio == 2:
                     module.prepare_ring_compressor(self.max_num_tokens, self.device)
-
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4689,6 +4693,16 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
             kv_caches=kv_caches,
         )
+
+    def shutdown(self) -> None:
+        parent_shutdown = getattr(super(), "shutdown", None)
+        try:
+            if callable(parent_shutdown):
+                parent_shutdown()
+        finally:
+            manager = getattr(self, "sparse_kv_offload_manager", None)
+            if manager is not None:
+                manager.close()
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
@@ -5369,23 +5383,23 @@ class NPUModelRunner(GPUModelRunner):
                         k_tensor_size = int(kv_cache_tensor_size // k_tensor_split_factor)
                         v_tensor_size = int(kv_cache_tensor_size // v_tensor_split_factor)
                     if self.sparse_kv_offload_enabled:
+                        assert self.sparse_kv_offload_manager is not None
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_packed_sfa_main_cache, (
                             "Sparse KV offload do not support a packed SFA main cache."
                         )
                         assert v_tensor_size is not None
-                        for layer_name_inner in allocation_layers:
-                            if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                                kv_cache_raw_tensors[layer_name_inner] = (
-                                    allocate_kv_cache_tensors_for_sparse_kv_offload(
-                                        k_tensor_size,
-                                        v_tensor_size,
-                                        alignment,
-                                        self.tp_rank,
-                                        self.sparse_kv_offload_config.keep_device_kv_cache,
-                                        self._allocate_int8_cache_tensor,
-                                    )
-                                )
+                        raw_tensors = allocate_kv_cache_tensors_for_sparse_kv_offload(
+                            k_tensor_size,
+                            v_tensor_size,
+                            alignment,
+                            self.tp_rank,
+                            self.sparse_kv_offload_config.keep_device_kv_cache,
+                            self._allocate_int8_cache_tensor,
+                            self.sparse_kv_offload_manager.allocate_host_kv_tensors,
+                        )
+                        assert len(kv_cache_tensor.shared_by) == 1, "Sparse KV offload do not support HMA."
+                        kv_cache_raw_tensors[layer_name] = raw_tensors
                         continue
                     # main: every layer owns its own region; give each layer a
                     # private (k, v) so block indices don't collide across layers.

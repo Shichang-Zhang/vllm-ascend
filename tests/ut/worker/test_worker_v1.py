@@ -1182,7 +1182,7 @@ class TestNPUWorker(TestBase):
             worker.cache_config = MagicMock()
             worker.cache_config.gpu_memory_utilization = 0.8
             worker.cache_config.kv_cache_memory_bytes = None
-            worker.device = "npu:0"
+            worker.device = torch.device("npu:0")
             worker._apply_kv_offload_decode_memory_constraints = MagicMock(
                 wraps=worker._apply_kv_offload_decode_memory_constraints
             )
