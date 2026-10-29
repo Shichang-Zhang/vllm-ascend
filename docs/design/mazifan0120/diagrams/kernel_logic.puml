@@ -1,0 +1,46 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam ArrowColor #37566F
+skinparam componentStyle rectangle
+skinparam defaultFontSize 14
+skinparam sequenceMessageAlign center
+title Copy-SFA Decode 逻辑视图
+participant "Runner / Metadata" as R
+participant "各 TP Attention" as A
+participant "Manager" as M
+participant "本 rank LIM" as L
+participant "本 rank Copy-SFA" as F
+database "共享 VMM Main" as V
+database "本 rank HBM" as H
+R -> R : 稳定请求行 + generation + padding 隔离
+opt 新请求或 target prefix 回退需要恢复
+ R -> M : dense / tail 范围
+ M -> V : 本地 VMM 地址
+ M -> H : 批量恢复全部层（eager）
+end
+R -> A : 状态 / block tables / query 范围
+A -> M : 新 KV 回写 callback
+M -> V : TP0 index-copy 写入
+A -> L : Indexer query/cache + request_state
+L -> L : -3 稠密 / -2 首次 / -1 稳态\n更新 source→slot 映射
+L --> A : TopK src/dst + miss 清单
+A -> M : ensure_copy_sfa_host_visibility
+M -> M : 协调 TP0 写回与各 TP 读取
+A -> F : query + LIM 结果 + Host/HBM views
+alt 首次填充
+ F -> V : 读取请求级 miss 集
+ F -> H : 填充驻留集；核内同步
+else 稳态
+ F -> V : 读取 TopK miss
+ F -> H : miss 搬运与 attention 流水重叠
+end
+H --> F : resident KV
+F --> A : attention 输出
+note over L,F
+后续 draft step 可复用 step 0 选择，
+按存活请求压紧元数据，不重复 miss 搬运。
+布局转换一致性需单独验收。
+end note
+@enduml

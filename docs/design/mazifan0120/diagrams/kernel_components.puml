@@ -1,0 +1,35 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam ArrowColor #37566F
+skinparam componentStyle rectangle
+skinparam defaultFontSize 14
+skinparam sequenceMessageAlign center
+title Mooncake 融合算子 v2 组件视图
+top to bottom direction
+component "配置校验\nfused_copy_sfa" as CFG
+component "Runner / row slots\ngeneration / prefix 历史" as R
+component "Metadata Builder\nblock tables / step buffers" as M
+component "SFA Offload Attention\nMTP indexer owner" as A
+component "LIM / Quantized LIM\nTopK + NPU 驻留管理" as L
+component "Copy-SFA\n缺失搬运 + attention" as F
+component "SparseKVOffloadManager\n回写 / 可见性 / 批量恢复" as O
+database "Mooncake VMM Main\n各 rank 本地 typed view" as V
+database "HBM\nIndexer + 热区 + 两个尾块" as H
+CFG --> R
+R --> M : 请求行与恢复任务
+M --> A : 元数据
+A --> L : BF16 或 LI C8
+L --> F : TopK / slots / miss 清单
+A --> F : query 与 block tables
+O --> V : TP0 新 KV 回写
+O --> H : 必要时批量恢复
+V --> F : 本地可寻址 Host 数据
+F <--> H : 填充 miss / 读取 hit
+A --> O : 共享 Host 可见性协调
+note bottom of R
+待细化：逐物理 MTP 层的布局状态，
+以及 KV 恢复与 LIM 映射更新协议。
+end note
+@enduml
