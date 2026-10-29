@@ -11,14 +11,17 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
   cache as usual, then the layer's cache rows are committed D2H
   (``cache_cpu[slot] = cache_npu[slot]``) through the manager;
 - decode: no NPU main K/V cache at all (indexer K cache only). The current
-  token's K/V is produced compute-only. Fused LIM and Copy-SFA manage the
-  hot buffer and attend to the selected KV by default.
-- fused_overlap decode (optional via ``use_fused_overlap``): replace fused
-  LIM + Copy-SFA with ``npu_fused_sparse_attention_overlap``, reading full KV
+  token's K/V is produced compute-only and committed D2H directly; top-k
+  misses are loaded H2D into the resident (topk) buffer and a single
+  resident SFA attention runs.
+- fused_overlap decode (optional via ``use_fused_overlap``): replace resident
+  onload + SFA with ``npu_fused_sparse_attention_overlap``, reading full KV
   from the shared CPU pool while keeping a selection buffer on NPU.
 """
 
 from __future__ import annotations
+
+from typing import Any, NamedTuple, TypeVar
 
 from dataclasses import dataclass
 from typing import Any, NamedTuple, TypeVar, cast
@@ -38,6 +41,9 @@ from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+from vllm_ascend import envs as envs_ascend
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.indexer import (
     INDEXER_K_CACHE_SLOT,
@@ -151,6 +157,10 @@ def prepare_copy_sfa_queries(query, query_rope):
             f"Generalized copy-SFA serving requires 1–8, 16, 32, 64 or 128 query heads per rank, got {heads}"
         )
     return query.contiguous(), query_rope.contiguous()
+
+
+M = TypeVar("M", bound=AscendSFAMetadata)
+_FSA_SELECTION_STATUS_ALIGNMENT = 8
 
 
 class _FusedOverlapDecodeCommonInputs(NamedTuple):
@@ -1111,11 +1121,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             or self._fused_overlap_selection_capacity[3] < cache_blocks_per_row
             or self.selection_kv_block_table.device != device
             or self.selection_kv_block_status.device != device
-            or self.selection_membership_map.device.type != "cpu"
+            or not get_sparse_kv_offload_manager().is_fused_membership_storage(self.selection_membership_map)
             or self.fused_overlap_last_req_ids.device != device
         )
         if needs_realloc:
-            if _EXTRA_CTX.capturing:
+            if get_forward_context().capturing:
                 raise RuntimeError(
                     "fused_overlap selection state must be preallocated before "
                     "NPUGraph capture: "
@@ -1181,7 +1191,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             raise RuntimeError("fused_overlap offload requires req_ids_tensor metadata for selection invalidation")
         device = last_req_ids.device
         token_to_req = attn_metadata.token_to_req[:num_tokens].to(device=device, dtype=torch.long)
-        if not _EXTRA_CTX.capturing:
+        if not get_forward_context().capturing and envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA:
             invalid_req_mapping = (token_to_req < 0) | (token_to_req >= num_reqs)
             if bool(invalid_req_mapping.any().item()):
                 raise RuntimeError(
@@ -1250,13 +1260,15 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 "fused_overlap full_kv_actual_seq must have one entry per decode "
                 f"request: got {full_kv_actual_seq.numel()} for num_reqs={num_reqs}"
             )
-        if _EXTRA_CTX.capturing:
+        if get_forward_context().capturing:
             return
         token_to_req = attn_metadata.token_to_req[:num_tokens]
         if token_to_req.numel() != num_tokens:
             raise RuntimeError(
                 f"fused_overlap token_to_req length mismatch: got {token_to_req.numel()} for num_tokens={num_tokens}"
             )
+        if not envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA:
+            return
         invalid_req_mapping = (token_to_req < 0) | (token_to_req >= num_reqs)
         if bool(invalid_req_mapping.any().item()):
             raise RuntimeError(
@@ -1296,7 +1308,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             .to(dtype=torch.int32)
             .contiguous()
         )
-        if not _EXTRA_CTX.capturing and bool((token_kv_lens <= 0).any().item()):
+        if (
+            not get_forward_context().capturing
+            and envs_ascend.VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA
+            and bool((token_kv_lens <= 0).any().item())
+        ):
             raise RuntimeError(
                 "fused_overlap MTP flatten produced non-positive per-token kv lenses: "
                 f"token_kv_lens={token_kv_lens.detach().cpu().tolist()}"
@@ -1531,7 +1547,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             stable_prefix_lens_npu=common_inputs.stable_prefix_lens,
             visible_seq_lens_npu=full_kv_actual_seq,
             selection_membership_map=selection_membership_map,
-            capturing=bool(_EXTRA_CTX.capturing),
+            capturing=get_forward_context().capturing,
             skip_topk=self.skip_topk,
         )
         if not external_plan_prepared:
@@ -1573,11 +1589,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             num_tokens=num_tokens,
             selection_kv_cache=selection_kv_cache,
             selection_k_rope=selection_k_rope,
-            capturing=bool(_EXTRA_CTX.capturing),
+            capturing=get_forward_context().capturing,
         )
         attn_output = fused_op(**fused_inputs)
         attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
-        manager.wait_for_current_kv_writeback(bool(_EXTRA_CTX.capturing))
+        manager.wait_for_current_kv_writeback(get_forward_context().capturing)
         return attn_output
 
     def _execute_sparse_flash_attention_process(
@@ -1617,6 +1633,69 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
 
         if attn_metadata.req_ids_tensor is None or attn_metadata.token_to_req is None:
             raise RuntimeError("Sparse KV offload requires req_ids_tensor/token_to_req metadata")
+
+        if self.use_fused_overlap:
+            decode_attn_output = self._execute_fused_overlap_offload_decode(
+                ql_nope[:num_decode_tokens],
+                q_pe[:num_decode_tokens],
+                topk_indices[:num_decode_tokens],
+                attn_metadata,
+                actual_seq_lengths_query[:num_decodes],
+                actual_seq_lengths_key[:num_decodes],
+                layer_name,
+            )
+            if num_prefills == 0:
+                return self._pad_to_input_tokens(decode_attn_output, ql_nope.shape[0])
+            _check_device_kv_cache_exist()
+            prefill_query_offset = actual_seq_lengths_query[num_decodes - 1]
+            prefill_query_lens = actual_seq_lengths_query[num_decodes:] - prefill_query_offset
+            prefill_block_table = attn_metadata.block_table[num_decodes : num_decodes + num_prefills]
+            prefill_attn_output = super()._execute_sparse_flash_attention_process(
+                ql_nope[num_decode_tokens:],
+                q_pe[num_decode_tokens:],
+                kv_cache,
+                topk_indices[num_decode_tokens:],
+                attn_metadata,
+                prefill_query_lens,
+                actual_seq_lengths_key[num_decodes:],
+                block_table=prefill_block_table,
+            )
+            attn_output = torch.cat([decode_attn_output, prefill_attn_output], dim=0)
+            return self._pad_to_input_tokens(attn_output, ql_nope.shape[0])
+
+        token_to_req = attn_metadata.token_to_req[:num_decode_tokens]
+        row_to_req = token_to_req.to(dtype=torch.int64)
+        decode_seq_lens = torch.index_select(
+            actual_seq_lengths_key[:num_decodes],
+            0,
+            row_to_req,
+        )
+        decode_cum_query_lens = actual_seq_lengths_query[:num_decodes]
+        decode_query_lens = decode_cum_query_lens.clone()
+        if num_decodes > 1:
+            decode_query_lens[1:] -= decode_cum_query_lens[:-1]
+        # Only the query span can be rewritten by the next MTP step.
+        stable_prefix_lens = (actual_seq_lengths_key[:num_decodes] - decode_query_lens).clamp_min_(0)
+        decode_stable_prefix_lens = torch.index_select(
+            stable_prefix_lens,
+            0,
+            row_to_req,
+        )
+        decode_topk = topk_indices[:num_decode_tokens]
+        seq_len_thresholds = decode_seq_lens.view(
+            decode_seq_lens.shape[0],
+            *([1] * (decode_topk.ndim - 1)),
+        )
+        valid_topk = build_valid_topk_mask(decode_topk, seq_len_thresholds)
+        decode_topk = torch.where(
+            valid_topk,
+            decode_topk,
+            torch.full_like(decode_topk, -1),
+        )
+        if decode_topk.ndim == 3 and decode_topk.shape[1] == 1:
+            decode_topk = decode_topk.squeeze(1)
+        if decode_topk.ndim != 2:
+            raise ValueError("Sparse KV offload top-k must have [tokens, topk] shape")
 
         decode_attn_output = self._execute_fused_overlap_offload_decode(
             ql_nope[:num_decode_tokens],
