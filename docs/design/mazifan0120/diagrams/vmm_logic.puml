@@ -1,0 +1,35 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam ArrowColor #37566F
+skinparam componentStyle rectangle
+skinparam defaultFontSize 14
+skinparam sequenceMessageAlign center
+title VMM 初始化与 LRU 计划发布
+participant "各 TP Manager" as M
+participant "shared_segment" as V
+participant "TP0 CPU planner" as C
+participant "设备组合 buffer" as B
+participant "TP group" as G
+participant "各 TP membership / 算子" as F
+== 初始化 ==
+M -> V : 检查 VMM 支持；创建 comm_group segment
+V --> M : 每 rank 的本地视图
+M -> M : reservation 按 1 GiB 对齐\n逻辑容量保持 S；Main 不做 TE 注册
+M -> F : 分配本地 swapped membership\n初始化控制区
+M -> B : capture 前分配 metadata + plan 存储
+M -> G : 初始化同步 / barrier
+== 每次计划发布 ==
+C -> C : 生成 encoded plan 与状态
+C -> B : CPU pinned plan → NPU staging\nmetadata 与 plan 共享广播存储
+B -> G : broadcast(int32 buffer, src=0)
+G --> M : 各 rank 收到相同 payload
+alt 同步路径
+ M -> M : 检查 status；错误则抛出
+else 异步 / 图路径
+ M -> M : plan stream 建立执行依赖
+end
+M -> F : staging → 本地 membership
+M -> F : 当前计算流等待计划发布后消费
+@enduml

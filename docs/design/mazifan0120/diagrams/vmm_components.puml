@@ -1,0 +1,34 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam ArrowColor #37566F
+skinparam componentStyle rectangle
+skinparam defaultFontSize 14
+skinparam sequenceMessageAlign center
+title Ascend VMM 组件与数据路径
+top to bottom direction
+component "allocate_mooncake_host_region\nVMM 能力检查 / reservation 对齐" as A
+component "Mooncake shared_segment\nmmap=false, host_register=false" as V
+database "共享 Main KV\nHost-backed VMM segment" as H
+component "各 TP 本地 NPU 视图" as L
+component "P/D Mooncake TE\n保留 P 源与 D Indexer 注册" as TE
+database "D Indexer HBM" as I
+component "TP0 CPU LRU planner" as CPU
+component "组合广播 buffer\nmetadata int32 + plan int16 view" as B
+database "每 rank 独立\nswapped membership" as M
+component "融合 attention" as F
+A --> V : comm_group / owner / device
+V --> H : 分配与映射
+H -- L : 同一物理池，本地地址
+TE --> H : Main 接收；不重复注册目标
+TE --> I : 已注册 HBM 目标
+L --> F : 读取 KV
+CPU --> B : staging
+B --> M : 单次 TP 广播后本地发布
+M --> F : 本 rank 计划
+note bottom of H
+VMM 提供使用 HCCS 的内存基础；
+实际链路取决于拓扑及底层传输实现。
+end note
+@enduml
