@@ -1,0 +1,33 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam ArrowColor #37566F
+skinparam componentStyle rectangle
+skinparam defaultFontSize 14
+skinparam sequenceMessageAlign center
+title DSA 多 TP 传输组件视图
+left to right direction
+component "Decode Scheduler\n请求分配与 rank 结果聚合" as S
+package "Decode TP 组" {
+ component "各 TP ConnectorWorker\n源端点规划" as W
+ component "各 TP 接收线程\nIndexer → Main" as R
+ component "传输计划构建器\n块归属 / 字节范围" as B
+ database "各 TP 本地 Indexer HBM" as I
+ database "共享 Main Host pool\n每 TP 不同 VA，同一物理池" as H
+}
+component "Mooncake Transfer Engine" as T
+package "Prefill" {
+ database "源 Main / Indexer\n包含适用的 MTP 层" as P
+ component "完成 tracker\nparticipant 去重" as C
+}
+S --> W : DsaStepRequest
+W --> R : 端点任务
+R --> B : 生成并校验计划
+R --> T : 批量同步 read
+P --> T : 源数据
+T --> I : 每 TP 本地副本
+T --> H : 逻辑块唯一写者
+R --> C : DONE / participant
+R --> S : request + rank + result
+@enduml

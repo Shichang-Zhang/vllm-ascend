@@ -1,0 +1,40 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam ArrowColor #37566F
+skinparam componentStyle rectangle
+skinparam defaultFontSize 14
+skinparam sequenceMessageAlign center
+title DSA 多 TP 接收逻辑视图
+participant "D Scheduler" as S
+participant "D 各 TP Worker" as W
+participant "传输计划构建器" as B
+participant "Mooncake TE" as T
+participant "P 端点 / tracker" as P
+S -> W : 同一请求的源信息、目标块、token 区间
+W -> W : 各 rank 规划端点与预期通知数
+W -> P : GET_META（未缓存时）
+P --> W : 地址、stride、dtype、容量
+W -> B : 构造 Indexer 与 Main 全部计划
+B -> B : Main: 逻辑块序号 % TP = 当前 rank\nIndexer: 不做 writer 过滤\n校验覆盖量并按注册边界切分
+B --> W : 两阶段 read 描述符
+alt 正常数据任务
+ W -> T : Indexer D2D read
+ T -> P : 读取源 Indexer
+ T --> W : 本地 HBM 完成
+ W -> T : Main D2RH read
+ T -> P : 读取本 rank 负责的 Main 区间
+ T --> W : 共享 Host 写入完成
+else notify_only / 零 reader / 已取消
+ W -> W : 跳过数据阶段，保留清理任务
+end
+W -> P : DONE(participant, expected)
+P -> P : 去重；达到端点预期计数后结束
+W -> S : 本 rank 所有端点结束后上报结果
+S -> S : 收齐全部 TP 终态\n失败沿 invalid-block 通路处理
+note over W,T
+不同 TP 并行；单端点内部先 Indexer 后 Main。
+异常仍进入通知与结果处理。
+end note
+@enduml
