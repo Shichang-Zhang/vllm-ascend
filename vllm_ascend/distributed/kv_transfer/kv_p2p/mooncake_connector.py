@@ -61,6 +61,7 @@ from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, Ascen
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import (
     SFAPDRD2HScheduler,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import mooncake_vmm_reverted
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     get_sparse_kv_offload_manager,
 )
@@ -3345,6 +3346,66 @@ class MooncakeConnectorWorker:
 
         return ptrs, lengths
 
+    def _dsa_consumer_register_regions(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        layouts: tuple[list[DsaCacheLayout], list[DsaCacheLayout]],
+    ) -> tuple[RegisterRegions, list[str]]:
+        """Collect Host Main and HBM Indexer atoms for one TE registration.
+
+        Legacy (pre-VMM) path: the decode Main KV lives in a host-registered
+        Mooncake shared segment, so both components must be registered.
+        """
+        indexer_layouts, main_layouts = layouts
+        manager = get_sparse_kv_offload_manager()
+        pool = manager.get_mooncake_host_pool()
+        pool_start = pool.data_ptr
+        pool_end = pool_start + pool.nbytes
+        host_location = f"npu:{pool.topology.device_id}"
+        atoms: list[DsaRegisterAtom] = []
+
+        for layout in main_layouts:
+            end = layout.base + layout_span_bytes(layout)
+            if layout.base < pool_start or end > pool_end:
+                raise ValueError(f"DSA Host component {layout.layer_name} is outside the Mooncake Host pool")
+            atoms.append(
+                DsaRegisterAtom(
+                    layout.base,
+                    end,
+                    host_location,
+                    ("host", pool_start),
+                )
+            )
+
+        for layout in indexer_layouts:
+            tensors = self._as_kv_cache_tuple(kv_caches[layout.layer_name])
+            if layout.position >= len(tensors):
+                raise ValueError(f"missing DSA Indexer tensor position {layout.position}")
+            tensor = tensors[layout.position]
+            storage = tensor.untyped_storage()
+            storage_start = tensor_storage_key(tensor)
+            storage_end = storage_start + storage.nbytes()
+            end = layout.base + layout_span_bytes(layout)
+            if layout.base < storage_start or end > storage_end:
+                raise ValueError(f"DSA Indexer component {layout.layer_name} is outside its storage")
+            atoms.append(
+                DsaRegisterAtom(
+                    layout.base,
+                    end,
+                    "*",
+                    ("hbm", storage_start),
+                )
+            )
+
+        bounded = collect_bounded_register_regions(atoms)
+        regions = RegisterRegions(
+            ptrs=bounded.ptrs,
+            lengths=bounded.lengths,
+            logical_tensor_count=len(atoms),
+            logical_total_bytes=sum(atom.end - atom.start for atom in atoms),
+        )
+        return regions, bounded.locations
+
     def _dsa_consumer_indexer_register_regions(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -3508,16 +3569,25 @@ class MooncakeConnectorWorker:
             dsa_local_layouts = self._build_dsa_local_layouts(kv_caches)
 
         register_locations = None
-        if self._dsa_decode:
-            # Shared VMM Main is directly addressable, while ordinary HBM
-            # Indexer destinations still require local transfer engine registration.
-            assert dsa_local_layouts is not None
-            register_regions, register_locations = self._dsa_consumer_indexer_register_regions(
-                kv_caches, dsa_local_layouts[0]
-            )
-        elif has_mamba_group:
+        if has_mamba_group:
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
+        elif self._dsa_decode:
+            assert dsa_local_layouts is not None
+            if mooncake_vmm_reverted():
+                # Legacy (pre-VMM) mode: the decode Main KV lives in a
+                # host-registered shared segment, so register Host Main and
+                # HBM Indexer together with the transfer engine.
+                register_regions, register_locations = self._dsa_consumer_register_regions(
+                    kv_caches,
+                    dsa_local_layouts,
+                )
+            else:
+                # Shared VMM Main is directly addressable, while ordinary HBM
+                # Indexer destinations still require local transfer engine registration.
+                register_regions, register_locations = self._dsa_consumer_indexer_register_regions(
+                    kv_caches, dsa_local_layouts[0]
+                )
         elif self._dsa_pd_offload:
             register_regions, register_locations = self._dsa_producer_register_regions(kv_caches)
         elif self.use_hybrid:

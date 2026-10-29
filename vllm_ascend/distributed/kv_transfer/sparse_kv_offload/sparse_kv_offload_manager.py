@@ -37,8 +37,11 @@ from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import (
+    HostMemoryRegion,
     HostPoolTopology,
     MooncakeHostPool,
+    allocate_mooncake_host_region,
+    mooncake_vmm_reverted,
 )
 
 # Main BF16 cache:
@@ -608,6 +611,7 @@ class SparseKVOffloadManager:
         self.max_d2h_index_copy_tokens = self.max_num_topk_rows
         self.fused_overlap_membership_map: torch.Tensor | None = None
         self.fused_overlap_membership_map_rows = 0
+        self.fused_overlap_membership_region: HostMemoryRegion | None = None
         self.fused_overlap_planner_membership_map: torch.Tensor | None = None
         self.fused_overlap_membership_plan_device_staging: torch.Tensor | None = None
         self.fused_plan_broadcast_buffer: torch.Tensor | None = None
@@ -806,6 +810,13 @@ class SparseKVOffloadManager:
 
     def close(self) -> None:
         """Release backend-owned Host KV resources."""
+        if mooncake_vmm_reverted():
+            # Legacy (pre-VMM) mode: the membership map is one shared region
+            # owned by the allocator; release it together with the allocator.
+            region = self.fused_overlap_membership_region
+            if region is not None:
+                region.release()
+                self.fused_overlap_membership_region = None
         self.fused_overlap_membership_map = None
         self.fused_overlap_planner_membership_map = None
         self.fused_overlap_membership_plan_device_staging = None
@@ -989,26 +1000,61 @@ class SparseKVOffloadManager:
 
         shape = [row_capacity, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT]
         if self._requires_fused_membership_staging():
-            membership_map = empty_aligned_swapped_tensor(
-                shape,
-                torch.int16,
-            )
-            plan_width = self.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
-            plan_shape = [row_capacity, plan_width]
-            self._allocate_fused_plan_staging(row_capacity, membership_map.device)
-            planner_map = None
-            if self.tp_rank == 0:
-                planner_map = torch.empty(
-                    plan_shape,
-                    dtype=torch.int16,
-                    device="cpu",
-                    pin_memory=True,
+            if mooncake_vmm_reverted():
+                # Legacy (pre-VMM) mode: one shared Mooncake region mapped by
+                # every TP rank. TP0 fills the control columns and publishes
+                # plans through the shared memory (no per-rank broadcast).
+                allocator = self._host_kv_allocator
+                assert isinstance(allocator, MooncakeHostPool)
+                region = allocate_mooncake_host_region(
+                    size_bytes=(row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT * torch.int16.itemsize),
+                    alignment=_CPU_CACHE_ALIGNMENT,
+                    topology=allocator.topology,
+                    name="sparse_kv_offload_fused_membership",
                 )
-                self._init_fused_overlap_plan_staging(planner_map)
-            self._init_fused_overlap_membership_control(membership_map)
-            torch_npu.npu.current_stream().synchronize()
-            self.tp_group.barrier()
-            self.fused_overlap_planner_membership_map = planner_map
+                membership_map = region.tensor.view(torch.int16).view(shape)
+                planner_map = None
+                if self.tp_rank == 0:
+                    plan_width = self.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
+                    plan_shape = [row_capacity, plan_width]
+                    planner_map = torch.empty(
+                        plan_shape,
+                        dtype=torch.int16,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    self.fused_overlap_membership_plan_device_staging = torch.empty(
+                        plan_shape,
+                        dtype=torch.int16,
+                        device=membership_map.device,
+                    )
+                    self._init_fused_overlap_plan_staging(planner_map)
+                    self._init_fused_overlap_membership_control(membership_map)
+                    torch_npu.npu.current_stream().synchronize()
+                self.tp_group.barrier()
+                self.fused_overlap_membership_region = region
+                self.fused_overlap_planner_membership_map = planner_map
+            else:
+                membership_map = empty_aligned_swapped_tensor(
+                    shape,
+                    torch.int16,
+                )
+                plan_width = self.topk + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT
+                plan_shape = [row_capacity, plan_width]
+                self._allocate_fused_plan_staging(row_capacity, membership_map.device)
+                planner_map = None
+                if self.tp_rank == 0:
+                    planner_map = torch.empty(
+                        plan_shape,
+                        dtype=torch.int16,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    self._init_fused_overlap_plan_staging(planner_map)
+                self._init_fused_overlap_membership_control(membership_map)
+                torch_npu.npu.current_stream().synchronize()
+                self.tp_group.barrier()
+                self.fused_overlap_planner_membership_map = planner_map
         else:
             owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
             membership_map = None
@@ -2210,38 +2256,63 @@ class SparseKVOffloadManager:
             planner_storage = plan_storage
             encoded_plan_stride = selection_membership_map.stride(0)
 
-        def stage_plan(non_blocking: bool) -> None:
-            if not self._requires_fused_membership_staging():
-                return
-            device_staging = self.fused_overlap_membership_plan_device_staging
-            if device_staging is None:
-                raise RuntimeError(
-                    "external FSA plan requires an NPU staging buffer when "
-                    "planner and operator membership storage are separate"
+        if mooncake_vmm_reverted():
+            # Legacy (pre-VMM) mode: the membership map is one shared Mooncake
+            # region, so TP0's staged plan becomes visible to every rank
+            # without a broadcast; other ranks publish nothing (their planner
+            # storage already is the shared plan storage).
+            def publish_plan(non_blocking: bool) -> None:
+                if planner_storage.data_ptr() == plan_storage.data_ptr():
+                    return
+                device_staging = self.fused_overlap_membership_plan_device_staging
+                if device_staging is None:
+                    raise RuntimeError(
+                        "external FSA plan requires an NPU staging buffer when "
+                        "planner and operator membership storage are separate"
+                    )
+                device_plan_storage = device_staging[:num_tokens, :plan_width]
+                device_plan_storage.copy_(
+                    planner_storage,
+                    non_blocking=non_blocking,
                 )
-            device_plan_storage = device_staging[:num_tokens, :plan_width]
-            device_plan_storage.copy_(
-                planner_storage,
-                non_blocking=non_blocking,
-            )
+                plan_storage.copy_(
+                    device_plan_storage,
+                    non_blocking=non_blocking,
+                )
+        else:
 
-        def publish_staged_plan(non_blocking: bool) -> None:
-            if not self._requires_fused_membership_staging():
-                return
-            device_staging = self.fused_overlap_membership_plan_device_staging
-            if device_staging is None:
-                raise RuntimeError(
-                    "external FSA plan requires an NPU staging buffer when "
-                    "planner and operator membership storage are separate"
+            def stage_plan(non_blocking: bool) -> None:
+                if not self._requires_fused_membership_staging():
+                    return
+                device_staging = self.fused_overlap_membership_plan_device_staging
+                if device_staging is None:
+                    raise RuntimeError(
+                        "external FSA plan requires an NPU staging buffer when "
+                        "planner and operator membership storage are separate"
+                    )
+                device_plan_storage = device_staging[:num_tokens, :plan_width]
+                device_plan_storage.copy_(
+                    planner_storage,
+                    non_blocking=non_blocking,
                 )
-            device_plan_storage = device_staging[:num_tokens, :plan_width]
-            plan_storage.copy_(
-                device_plan_storage,
-                non_blocking=non_blocking,
-            )
+
+            def publish_staged_plan(non_blocking: bool) -> None:
+                if not self._requires_fused_membership_staging():
+                    return
+                device_staging = self.fused_overlap_membership_plan_device_staging
+                if device_staging is None:
+                    raise RuntimeError(
+                        "external FSA plan requires an NPU staging buffer when "
+                        "planner and operator membership storage are separate"
+                    )
+                device_plan_storage = device_staging[:num_tokens, :plan_width]
+                plan_storage.copy_(
+                    device_plan_storage,
+                    non_blocking=non_blocking,
+                )
 
         broadcast_buffer = self.fused_plan_metadata_npu
-        if self._requires_fused_membership_staging():
+        if self._requires_fused_membership_staging() and not mooncake_vmm_reverted():
             broadcast_buffer = self.fused_plan_broadcast_buffer
             if broadcast_buffer is None:
                 raise RuntimeError("Mooncake external FSA plan requires a preallocated broadcast buffer")
@@ -2329,11 +2400,15 @@ class SparseKVOffloadManager:
                         ],
                         non_blocking=True,
                     )
-                    stage_plan(non_blocking=True)
+                    if mooncake_vmm_reverted():
+                        publish_plan(non_blocking=True)
+                    else:
+                        stage_plan(non_blocking=True)
                     if capturing and self.tp_size > 1:
                         self.fused_plan_stream.wait_stream(self.current_kv_save_stream)
                 self.tp_group.broadcast(broadcast_buffer, src=0)
-                publish_staged_plan(non_blocking=True)
+                if not mooncake_vmm_reverted():
+                    publish_staged_plan(non_blocking=True)
             torch_npu.npu.current_stream().wait_stream(self.fused_plan_stream)
             self.fused_overlap_plan_owner_layer_id = layer_id
             self.fused_overlap_plan_topk = self.topk
@@ -2352,7 +2427,10 @@ class SparseKVOffloadManager:
                         self.max_num_topk_rows * 2 : self.max_num_topk_rows * 2 + num_tokens
                     ]
                 )
-                stage_plan(non_blocking=False)
+                if mooncake_vmm_reverted():
+                    publish_plan(non_blocking=False)
+                else:
+                    stage_plan(non_blocking=False)
             except Exception as exc:
                 planner_error = exc
                 self.fused_plan_status_npu.fill_(1)
@@ -2366,7 +2444,8 @@ class SparseKVOffloadManager:
             raise RuntimeError(
                 f"SFA fused_overlap external planner failed: layer={layer_name}, tp_rank={self.tp_rank}, {detail}"
             ) from planner_error
-        publish_staged_plan(non_blocking=False)
+        if not mooncake_vmm_reverted():
+            publish_staged_plan(non_blocking=False)
         self.fused_overlap_plan_owner_layer_id = layer_id
         self.fused_overlap_plan_topk = self.topk
         self.fused_overlap_plan_num_tokens = num_tokens
