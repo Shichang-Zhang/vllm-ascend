@@ -11,6 +11,8 @@ from typing import Any
 import torch
 from vllm.logger import logger
 
+from vllm_ascend import envs
+
 # CANN VMM address reservations require a size that is a multiple of 1 GiB,
 # independently of the smaller physical allocation granularity.
 _ASCEND_VMM_RESERVATION_ALIGNMENT = 1 << 30
@@ -23,7 +25,7 @@ def mooncake_vmm_reverted() -> bool:
     shared segments, one shared LRU membership region mapped by every TP rank,
     and Host Main + Indexer registered together on the transfer engine.
     """
-    return mooncake_vmm_reverted()
+    return envs.VLLM_ASCEND_MOONCAKE_VMM_REVERT
 
 
 def _align_up(value: int, alignment: int) -> int:
