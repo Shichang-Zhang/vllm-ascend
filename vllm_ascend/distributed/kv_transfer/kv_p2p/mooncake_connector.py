@@ -61,7 +61,6 @@ from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, Ascen
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import (
     SFAPDRD2HScheduler,
 )
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import mooncake_vmm_reverted
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     get_sparse_kv_offload_manager,
 )
@@ -3573,21 +3572,14 @@ class MooncakeConnectorWorker:
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         elif self._dsa_decode:
+            # Legacy (pre-VMM) mode: the decode Main KV lives in a
+            # host-registered shared segment, so register Host Main and
+            # HBM Indexer together with the transfer engine.
             assert dsa_local_layouts is not None
-            if mooncake_vmm_reverted():
-                # Legacy (pre-VMM) mode: the decode Main KV lives in a
-                # host-registered shared segment, so register Host Main and
-                # HBM Indexer together with the transfer engine.
-                register_regions, register_locations = self._dsa_consumer_register_regions(
-                    kv_caches,
-                    dsa_local_layouts,
-                )
-            else:
-                # Shared VMM Main is directly addressable, while ordinary HBM
-                # Indexer destinations still require local transfer engine registration.
-                register_regions, register_locations = self._dsa_consumer_indexer_register_regions(
-                    kv_caches, dsa_local_layouts[0]
-                )
+            register_regions, register_locations = self._dsa_consumer_register_regions(
+                kv_caches,
+                dsa_local_layouts,
+            )
         elif self._dsa_pd_offload:
             register_regions, register_locations = self._dsa_producer_register_regions(kv_caches)
         elif self.use_hybrid:

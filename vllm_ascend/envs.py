@@ -108,15 +108,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FSA_VALIDATE_DEVICE_METADATA", "0"))
     ),
-    # Mooncake Host backend memory mode: 0 (default) runs the Ascend VMM fixes
-    # (mmap=False/host_register=False shared segments, per-rank swapped LRU
-    # membership tables, VMM Main left unregistered). 1 reverts to the legacy
-    # behavior (mmap+host_register shared segments, one shared LRU membership
-    # region, Host Main + Indexer registered together) for environments where
-    # Ascend VMM is unavailable.
-    "VLLM_ASCEND_MOONCAKE_VMM_REVERT": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_MOONCAKE_VMM_REVERT", "0"))
-    ),
 }
 
 # end-env-vars-definition
