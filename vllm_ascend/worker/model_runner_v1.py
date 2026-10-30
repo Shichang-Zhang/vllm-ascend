@@ -5398,7 +5398,11 @@ class NPUModelRunner(GPUModelRunner):
                             self._allocate_int8_cache_tensor,
                             self.sparse_kv_offload_manager.allocate_host_kv_tensors,
                         )
-                        assert len(kv_cache_tensor.shared_by) == 1, "Sparse KV offload do not support HMA."
+                        # vLLM #51718 packs every layer whose spec is identical
+                        # (e.g. GLM-5.2's MLA layers) into one KVCacheTensor
+                        # descriptor. Sparse KV offload still needs one private
+                        # host/device allocation per layer, so iterate every
+                        # shared layer here instead of asserting shared_by==1.
                         kv_cache_raw_tensors[layer_name] = raw_tensors
                         continue
                     # main: every layer owns its own region; give each layer a

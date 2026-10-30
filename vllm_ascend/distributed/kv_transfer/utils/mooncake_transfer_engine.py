@@ -1,5 +1,7 @@
 import threading
 
+from vllm.logger import logger
+
 _WILDCARD_LOCATION = "*"
 
 
@@ -72,8 +74,28 @@ class GlobalTE:
             try:
                 for ptr, size, location in regions:
                     ret_value = self.transfer_engine.register_memory(ptr, size, location)
+                    if ret_value != 0 and location != _WILDCARD_LOCATION:
+                        # Older mooncake wheels may not support every explicit
+                        # location kind (e.g. registering a host-registered
+                        # shared segment under an "npu:*" location). Retry once
+                        # with the wildcard location so the transfer engine
+                        # auto-detects the memory type.
+                        logger.warning(
+                            "Mooncake register_memory ret_value=%s for ptr=%#x size=%s location=%s; "
+                            "retrying with wildcard location",
+                            ret_value,
+                            ptr,
+                            size,
+                            location,
+                        )
+                        ret_value = self.transfer_engine.register_memory(ptr, size, _WILDCARD_LOCATION)
+                        if ret_value == 0:
+                            location = _WILDCARD_LOCATION
                     if ret_value != 0:
-                        raise RuntimeError("Mooncake memory registration failed.")
+                        raise RuntimeError(
+                            "Mooncake memory registration failed: "
+                            f"ptr={ptr:#x} size={size} location={location} ret_value={ret_value}"
+                        )
                     registered_regions.append((ptr, size, location))
             except Exception as exc:
                 failed_regions, failure_messages = self._unregister_regions(registered_regions)
