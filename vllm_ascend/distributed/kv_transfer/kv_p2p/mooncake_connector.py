@@ -2296,6 +2296,29 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
+        # DSA decode (blockwise Mooncake RD2H) must NOT run the base producer
+        # hook. Two reasons:
+        #
+        # 1. `_MooncakeDsaDecodeScheduler` (its scheduler-side handler, see
+        #    `connector_scheduler` wiring above) does not implement
+        #    `on_new_request` at all: its whole inheritance chain
+        #    (SFAPDRD2HScheduler) only admits requests through
+        #    `get_num_new_matched_tokens`, which registers them into
+        #    `_dsa_requests` and drives the P-side rendezvous. Forwarding
+        #    unconditionally raises AttributeError and kills the decode
+        #    engine on the very first request.
+        # 2. The base `on_new_request` is a Prefill-only optimization: for
+        #    `do_remote_decode` prompts it pops the last token and caps
+        #    `max_tokens=1` so the P engine pre-fills without decoding.
+        #    Decode requests arrive through the proxy carrying the same
+        #    `kv_transfer_params`, so applying that truncation here would
+        #    corrupt a decode request even if the method existed.
+        #
+        # DSA decode therefore treats new requests as no-ops at this hook;
+        # admission happens in `get_num_new_matched_tokens` /
+        # `update_state_after_alloc` instead.
+        if isinstance(self.connector_scheduler, _MooncakeDsaDecodeScheduler):
+            return
         self.connector_scheduler.on_new_request(request)
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
