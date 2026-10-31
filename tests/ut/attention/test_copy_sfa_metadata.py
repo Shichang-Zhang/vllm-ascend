@@ -230,7 +230,8 @@ def test_lim_consumes_shared_state_without_modifying_it(draft_index):
     assert builder.lim_last_generation[bank, 1].item() == 11
     if draft_index == 0:
         assert impl.lim_reuse_request_count == 3
-        assert impl.copy_sfa_reuse_logical_lens.cpu().tolist() == [8192, 500, 0]
+        # The saved selection includes the circular tail (10371 - 10240).
+        assert impl.copy_sfa_reuse_logical_lens.cpu().tolist() == [8192 + 131, 500, 0]
         assert impl.copy_sfa_reuse_cache_tokens.cpu().tolist() == [8192, 0, 2048]
     else:
         assert impl.lim_reuse_request_count == 0
@@ -248,7 +249,7 @@ def test_reuse_extent_is_prepared_once_per_draft_round():
     assert (storage == -999).all().item()
 
     first = populate(builder, cm, draft_index=0)
-    assert first.copy_sfa_reuse_logical_lens.cpu().tolist() == [500, 8192, 0]
+    assert first.copy_sfa_reuse_logical_lens.cpu().tolist() == [500, 8192 + 131, 0]
     address = first.copy_sfa_reuse_logical_lens.data_ptr()
     saved = storage.clone()
     for step in (1, 2):

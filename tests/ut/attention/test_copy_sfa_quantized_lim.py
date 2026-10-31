@@ -77,7 +77,8 @@ def test_split_cache_dispatch_passes_real_scales_and_preserves_mtp_reuse(draft_i
     assert result.data_ptr() == impl.lim_topk_src.data_ptr()
     if draft_index == 0:
         assert impl.copy_sfa_reuse_cache_tokens.tolist() == [8192, 0]
-        assert impl.copy_sfa_reuse_logical_lens.tolist() == [8192, 500]
+        # Quantized LIM must also preserve the 41-token circular tail.
+        assert impl.copy_sfa_reuse_logical_lens.tolist() == [8192 + 41, 500]
 
 
 @pytest.mark.parametrize(
