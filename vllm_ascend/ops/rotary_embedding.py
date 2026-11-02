@@ -97,10 +97,15 @@ def _gather_cos_sin_mla(positions):
     here), so gather on the row-contiguous packed tensor and split the halves
     afterwards instead.
     """
-    packed = _cos_sin_cache_mla if _cos_sin_cache_mla is not None else _cos_sin_cache
-    if packed is None:
+    # Only `_record_cos_and_sin_cache_interleaved` sets `_cos_sin_cache_mla`, and
+    # it is the very tensor `_cos_cache` / `_sin_cache` are derived from, so the
+    # split below is guaranteed to reproduce them. Other rope flavours (yarn /
+    # deepseek scaling) record a separate contiguous cos/sin pair instead, and
+    # `_cos_sin_cache` may then belong to a different instance: keep using the
+    # recorded pair for those.
+    if _cos_sin_cache_mla is None:
         return _cos_cache[positions], _sin_cache[positions]
-    cos_sin = packed[positions]
+    cos_sin = _cos_sin_cache_mla[positions]
     half = cos_sin.shape[-1] // 2
     cos = torch.cat((cos_sin[..., :half], cos_sin[..., :half]), dim=-1)
     sin = torch.cat((cos_sin[..., half:], cos_sin[..., half:]), dim=-1)
