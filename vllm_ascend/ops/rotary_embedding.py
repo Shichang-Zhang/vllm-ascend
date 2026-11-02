@@ -54,6 +54,7 @@ _sin_mla: torch.Tensor = None
 _cos_cache: torch.Tensor = None
 _sin_cache: torch.Tensor = None
 _cos_sin_cache: torch.Tensor = None
+_cos_sin_cache_mla: torch.Tensor = None
 _cos: torch.Tensor = None
 _sin: torch.Tensor = None
 _cos_slice: torch.Tensor = None
@@ -87,11 +88,29 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
         _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
 
 
+def _gather_cos_sin_mla(positions):
+    """Gather the packed (cos|sin) rows for ``positions``.
+
+    ``_cos_cache`` / ``_sin_cache`` are column views of the interleaved cache
+    with stride ``(2 * rope_dim, 1)``. Indexing such a view makes the NPU
+    kernel materialise the whole cache for a handful of rows (256 MB per call
+    here), so gather on the row-contiguous packed tensor and split the halves
+    afterwards instead.
+    """
+    packed = _cos_sin_cache_mla if _cos_sin_cache_mla is not None else _cos_sin_cache
+    if packed is None:
+        return _cos_cache[positions], _sin_cache[positions]
+    cos_sin = packed[positions]
+    half = cos_sin.shape[-1] // 2
+    cos = torch.cat((cos_sin[..., :half], cos_sin[..., :half]), dim=-1)
+    sin = torch.cat((cos_sin[..., half:], cos_sin[..., half:]), dim=-1)
+    return cos, sin
+
+
 def get_cos_and_sin_mla(positions, use_cache=False):
-    global _cos_cache
-    global _sin_cache
-    cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
-    sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
+    cos, sin = _gather_cos_sin_mla(positions)
+    cos = cos.unsqueeze(1).unsqueeze(2)
+    sin = sin.unsqueeze(1).unsqueeze(2)
     if not use_cache:
         return cos, sin
     global _cos_mla
@@ -135,6 +154,8 @@ def _record_cos_and_sin_cache_interleaved(cos_sin_cache):
     global _sin_cache
     if _cos_cache is not None or _sin_cache is not None:
         return
+    global _cos_sin_cache_mla
+    _cos_sin_cache_mla = cos_sin_cache
     hidden_dim = cos_sin_cache.shape[-1] // 2
     cos_cache, sin_cache = cos_sin_cache.view(-1, 2, hidden_dim).repeat(1, 1, 2).chunk(2, dim=1)
     _cos_cache = cos_cache.squeeze(1)
