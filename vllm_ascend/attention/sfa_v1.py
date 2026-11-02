@@ -1167,6 +1167,26 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             return None, None
 
+    def _can_use_fused_q_up_proj(self) -> bool:
+        """Whether the q_nope up-projection can use the fused transpose matmul."""
+        if not hasattr(torch_npu, "npu_transpose_batchmatmul"):
+            return False
+        # Same aclnn limit as in `_v_up_proj` for perm_x1=(1, 0, 2).
+        if self.local_num_heads * self.kv_lora_rank >= 65536:
+            return False
+        fused = getattr(self, "_q_up_proj_fused", None)
+        if fused is None:
+            # The fused operator cannot consume a FRACTAL_NZ weight, and
+            # `maybe_trans_nz` may have converted it in NATIVE preprocessing.
+            fused = torch_npu.get_npu_format(self.W_UK_T) != ACL_FORMAT_FRACTAL_NZ
+            self._q_up_proj_fused = fused
+            if not fused:
+                logger.warning_once(
+                    f"{self.layer_name}: W_UK_T is FRACTAL_NZ, the fused q_nope "
+                    "up-projection is disabled for this layer."
+                )
+        return fused
+
     # Return `ql_nope`, `q_pe`
     def _q_proj_and_k_up_proj(self, x):
         q_nope, q_pe = (
@@ -1175,12 +1195,23 @@ class AscendSFAImpl(MLAAttentionImpl):
             .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         )
 
-        # Convert from (B, N, P) to (N, B, P)
-        q_nope = q_nope.transpose(0, 1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        ql_nope = torch.bmm(q_nope, self.W_UK_T)
-        # Convert from (N, B, L) to (B, N, L)
-        return ql_nope.transpose(0, 1), q_pe
+        if self._can_use_fused_q_up_proj():
+            # out[B, N, L] = sum_P q_nope[B, N, P] * W_UK_T[N, P, L] in a single
+            # fused operator. Keeps the (B, N, L) write inside the matmul, so
+            # neither the (N, B, P) transpose view nor the transpose copy that
+            # the sparse flash attention op materializes for a non-contiguous
+            # query is needed.
+            ql_nope = torch_npu.npu_transpose_batchmatmul(
+                q_nope, self.W_UK_T, perm_x1=(1, 0, 2), perm_y=(1, 0, 2)
+            )
+        else:
+            # Convert from (B, N, P) to (N, B, P)
+            q_nope = q_nope.transpose(0, 1)
+            # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+            ql_nope = torch.bmm(q_nope, self.W_UK_T)
+            # Convert from (N, B, L) to (B, N, L)
+            ql_nope = ql_nope.transpose(0, 1)
+        return ql_nope, q_pe
 
     def _v_up_proj(self, x):
         if hasattr(torch_npu, "npu_transpose_batchmatmul"):
