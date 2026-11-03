@@ -26,6 +26,8 @@ class DsaCacheLayout:
     block_tokens: int
     dtype: str
     capacity: int = 0
+    group_id: int | None = None
+    host_backed: bool = True
 
 
 @dataclass(frozen=True)

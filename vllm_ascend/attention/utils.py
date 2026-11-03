@@ -330,6 +330,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             req_topk_buffer_slots=_slice_reqs(self.req_topk_buffer_slots),
             req_topk_buffer_generations=_slice_reqs(self.req_topk_buffer_generations),
             req_topk_buffer_stable_prefixes=_slice_reqs(self.req_topk_buffer_stable_prefixes),
+            sfa_cache_group_tables=(
+                tuple(_slice_reqs(table) for table in self.sfa_cache_group_tables)
+                if self.sfa_cache_group_tables is not None
+                else None
+            ),
+            sfa_host_group_id=self.sfa_host_group_id,
             offload_dummy=self.offload_dummy,
             copy_sfa_restore_tails=self.copy_sfa_restore_tails,
             copy_sfa_draft_index=self.copy_sfa_draft_index,
@@ -342,6 +348,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # CPU-owned, block-aligned Host completion frontier, in request order.
     # Target and all draft steps share one snapshot for the current forward.
     req_topk_buffer_stable_prefixes: torch.Tensor | None = None
+    # Actual group-indexed tables for shared-only main/indexer addressing.
+    # Request rows remain aligned through target and all draft iterations.
+    sfa_cache_group_tables: tuple[torch.Tensor, ...] | None = None
+    sfa_host_group_id: int | None = None
     offload_dummy: bool = False
     copy_sfa_restore_tails: bool = False
     copy_sfa_draft_index: int | None = None

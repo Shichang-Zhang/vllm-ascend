@@ -41,6 +41,7 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.core.mooncake_decode_cache_guard import install_mooncake_decode_cache_guard
+from vllm_ascend.core.mooncake_group_failure import install_mooncake_group_failure_handler
 
 
 def _requires_kv_delivery(connector: KVConnectorBase_V1) -> bool:
@@ -81,6 +82,7 @@ class KVDeliveryScheduler(Scheduler):
         )
         self.requires_kv_delivery = bool(self.connector is not None and self.connector.requires_kv_delivery)
         install_mooncake_decode_cache_guard(self)
+        install_mooncake_group_failure_handler(self)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1

@@ -17,6 +17,8 @@
     "host_backend": "mooncake",
     "keep_device_kv_cache": false,
     "lru_max_threads": 16,
-    "delayed_d2h": true
+    "delayed_d2h": true,
+    "offload_shared_indexer_only": false,
+    "miss_onboard_mode": "inline"
   }
 }

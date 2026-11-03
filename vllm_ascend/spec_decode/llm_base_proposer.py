@@ -887,6 +887,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         if getattr(self.runner, "_offload_stable_prefixes", None) is not None
                         else None
                     ),
+                    sfa_cache_group_tables=(
+                        tuple(table.get_device_tensor()[:num_reqs] for table in self.runner.input_batch.block_table)
+                        if getattr(self.runner.sparse_kv_offload_config, "offload_shared_indexer_only", False) is True
+                        else None
+                    ),
+                    sfa_host_group_id=(
+                        self.runner.sparse_kv_offload_manager.sfa_cache_layout.host_group_id
+                        if getattr(self.runner.sparse_kv_offload_config, "offload_shared_indexer_only", False) is True
+                        else None
+                    ),
                     offload_dummy=True,
                     req_ids_tensor=req_ids_tensor,
                     token_to_req=token_to_req,
@@ -1238,6 +1248,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
+        if getattr(common_attn_metadata, "sfa_cache_group_tables", None) is not None:
+            common_attn_metadata.sfa_cache_group_tables = tuple(
+                self._adjust_tensor(table, common_attn_metadata.num_reqs)
+                for table in common_attn_metadata.sfa_cache_group_tables
+            )
 
         self._pad_draft_buffers(num_tokens, num_input_tokens)
         multi_steps_attn_metadata, attn_metadata_i = self.build_draft_attn_metadata(
@@ -2377,6 +2392,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
             req_topk_buffer_generations=common_attn_metadata.req_topk_buffer_generations,
             req_topk_buffer_stable_prefixes=common_attn_metadata.req_topk_buffer_stable_prefixes,
+            sfa_cache_group_tables=common_attn_metadata.sfa_cache_group_tables,
+            sfa_host_group_id=common_attn_metadata.sfa_host_group_id,
             offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=token_to_req,
@@ -2478,6 +2495,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
             req_topk_buffer_generations=common_attn_metadata.req_topk_buffer_generations,
             req_topk_buffer_stable_prefixes=common_attn_metadata.req_topk_buffer_stable_prefixes,
+            sfa_cache_group_tables=common_attn_metadata.sfa_cache_group_tables,
+            sfa_host_group_id=common_attn_metadata.sfa_host_group_id,
             offload_dummy=common_attn_metadata.offload_dummy,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,

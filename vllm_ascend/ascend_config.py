@@ -1054,6 +1054,8 @@ class SparseKVOffloadConfig:
         "host_backend",
         "lru_max_threads",
         "delayed_d2h",
+        "offload_shared_indexer_only",
+        "miss_onboard_mode",
     }
 
     @staticmethod
@@ -1073,6 +1075,10 @@ class SparseKVOffloadConfig:
     @property
     def use_fused_copy_sfa(self) -> bool:
         return self.fused_op_type == "fused_copy_sfa"
+
+    @property
+    def use_side_stream_onboard(self) -> bool:
+        return self.miss_onboard_mode == "side_stream"
 
     @classmethod
     def from_additional_config(cls, vllm_config: "VllmConfig", user_config: Any) -> "SparseKVOffloadConfig":
@@ -1101,18 +1107,32 @@ class SparseKVOffloadConfig:
         # Batch full-block writes across decode iterations. Completion, rather
         # than the computed-token count alone, publishes the Host KV frontier.
         self.delayed_d2h = self._parse_bool(user_config.get("delayed_d2h", False), "delayed_d2h")
+        # Keep non-MTP indexer owners in private paged HBM caches. Shared
+        # members continue to use the Host pool and resident working rows.
+        self.offload_shared_indexer_only = self._parse_bool(
+            user_config.get("offload_shared_indexer_only", False), "offload_shared_indexer_only"
+        )
+        self.miss_onboard_mode = user_config.get("miss_onboard_mode", "inline")
+        if self.miss_onboard_mode not in ("inline", "side_stream"):
+            raise ValueError("sparse_kv_offload_config.miss_onboard_mode must be inline or side_stream")
         self.fused_op_type = user_config.get("fused_op_type", "none")
         if self.fused_op_type not in ("none", "fused_copy_sfa"):
             raise ValueError("sparse_kv_offload_config.fused_op_type must be none or fused_copy_sfa")
         if self.use_fused_copy_sfa and self.use_fused_overlap:
             raise ValueError("fused_copy_sfa and use_fused_overlap are mutually exclusive")
-        if self.delayed_d2h:
+        if self.use_side_stream_onboard and not self.offload_shared_indexer_only:
+            raise ValueError("miss_onboard_mode=side_stream requires offload_shared_indexer_only=true")
+        if self.delayed_d2h or self.offload_shared_indexer_only:
             if not self.enabled or not self.use_fused_copy_sfa:
                 raise ValueError(
-                    "delayed D2H modes require sparse KV offload enabled=true and fused_op_type='fused_copy_sfa'"
+                    "delayed_d2h and offload_shared_indexer_only require sparse KV offload "
+                    "enabled=true and fused_op_type='fused_copy_sfa'"
                 )
             if self.keep_device_kv_cache:
-                raise ValueError("delayed D2H modes require PD-disaggregated decode with keep_device_kv_cache=false")
+                raise ValueError(
+                    "delayed_d2h and offload_shared_indexer_only require PD-disaggregated decode "
+                    "with keep_device_kv_cache=false"
+                )
         self.lru_max_threads = user_config.get("lru_max_threads", 8)
         if type(self.lru_max_threads) is not int or self.lru_max_threads <= 0:
             raise ValueError("sparse_kv_offload_config.lru_max_threads must be a positive integer")
@@ -1165,7 +1185,7 @@ class SparseKVOffloadConfig:
         if vllm_config.use_v2_model_runner:
             raise ValueError("Sparse KV offload doesn't support model_runner_v2 now.")
 
-        if self.delayed_d2h:
+        if self.delayed_d2h or self.offload_shared_indexer_only:
             transfer = vllm_config.kv_transfer_config
             extra = getattr(transfer, "kv_connector_extra_config", {})
             if (
@@ -1174,7 +1194,8 @@ class SparseKVOffloadConfig:
                 or extra.get("dsa_pd_offload") is not True
             ):
                 raise ValueError(
-                    "delayed D2H modes require host_backend='mooncake' and MooncakeConnectorV1 with dsa_pd_offload=true"
+                    "delayed_d2h and offload_shared_indexer_only require host_backend='mooncake' "
+                    "and MooncakeConnectorV1 with dsa_pd_offload=true"
                 )
 
         self.topk = vllm_config.model_config.hf_text_config.index_topk

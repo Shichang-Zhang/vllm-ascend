@@ -24,7 +24,7 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NamedTuple, TypeVar, cast
 
 import numpy as np
@@ -43,6 +43,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.sfa_cache_mapping import map_sfa_indexer_slots
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
@@ -96,6 +97,7 @@ class AscendSFAOffloadMetadata(AscendSFAMetadata):
     # not re-issue that H2D. Eager restore on prefix rollback uses the same
     # copy descriptors outside the captured path.
     copy_sfa_skip_tail_restore: bool = False
+    sfa_cache_group_tables: tuple[torch.Tensor, ...] | None = None
 
 
 M = TypeVar("M", bound=AscendSFAOffloadMetadata)
@@ -174,6 +176,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         cfg = get_ascend_config().sparse_kv_offload_config
         self.use_fused_copy_sfa = getattr(cfg, "use_fused_copy_sfa", False) is True
         self.delayed_d2h = getattr(cfg, "delayed_d2h", False) is True
+        self.offload_shared_indexer_only = getattr(cfg, "offload_shared_indexer_only", False) is True
         if self.use_fused_copy_sfa:
             self._init_copy_sfa_metadata_buffers(vllm_config, device)
         kv_transfer_config = vllm_config.kv_transfer_config
@@ -265,6 +268,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         common_attn_metadata: AscendCommonAttentionMetadata,
         draft_index: int | None = None,
     ) -> AscendSFAOffloadMetadata:
+        metadata.sfa_cache_group_tables = getattr(common_attn_metadata, "sfa_cache_group_tables", None)
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
@@ -318,7 +322,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         widths = upload("widths", widths_np)
         active = upload("active", active_np)
         pools = upload("pool_entries", pools_np)
-        guard_device_slots = getattr(self, "delayed_d2h", False)
+        guard_device_slots = getattr(self, "delayed_d2h", False) or getattr(self, "offload_shared_indexer_only", False)
         if guard_device_slots:
             # The proposer disables drafts beyond max_model_len on device.
             # Respect that mask without reading device lengths on the CPU.
@@ -407,7 +411,13 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.copy_sfa_hbm_block_table = self.copy_sfa_hbm_block_table[step, :count]
         # The block table already has persistent CpuGpuBuffer storage owned by
         # InputBatch. Reuse this group's device view instead of copying it again.
-        source = common_attn_metadata.block_table_tensor[:count]
+        if metadata.sfa_cache_group_tables is not None:
+            host_group = common_attn_metadata.sfa_host_group_id
+            if host_group is None or not 0 <= host_group < len(metadata.sfa_cache_group_tables):
+                raise ValueError("shared-only Copy-SFA requires the actual Host group table")
+            source = metadata.sfa_cache_group_tables[host_group][:count]
+        else:
+            source = common_attn_metadata.block_table_tensor[:count]
         metadata.copy_sfa_source_block_table = source
         if getattr(common_attn_metadata, "copy_sfa_restore_tails", False):
             # Ordinary decode keeps its tail resident. Build H2D descriptors
@@ -551,6 +561,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self.use_fused_overlap = offload_cfg.use_fused_overlap
         self.use_fused_copy_sfa = getattr(offload_cfg, "use_fused_copy_sfa", False) is True
         self.delayed_d2h = getattr(offload_cfg, "delayed_d2h", False) is True
+        self.offload_shared_indexer_only = getattr(offload_cfg, "offload_shared_indexer_only", False) is True
+        self.use_side_stream_onboard = getattr(offload_cfg, "use_side_stream_onboard", False) is True
+        self.lim_full_resident = False
+        self.lim_share_members = ()
         self.lim_indexer_owner = self
         self._copy_sfa_metadata: AscendSFAOffloadMetadata | None = None
         if self.use_fused_copy_sfa:
@@ -717,9 +731,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
     def _select_indexer_topk(
         self, q_li, q_li_scale, q_li_shape, weights, kv_cache, attn_metadata, actual_query_lengths, actual_key_lengths
     ):
-        if getattr(attn_metadata, "fused_copy_sfa_enabled", False):
+        if getattr(attn_metadata, "fused_copy_sfa_enabled", False) and (
+            not getattr(self, "lim_full_resident", False) or self.lim_share_members
+        ):
             key_scale = kv_cache[self.kv_cache_indexer_scale_idx] if self.enable_sparse_li_c8 else None
-            return self._lim_select(
+            selected = self._lim_select(
                 q_li,
                 weights,
                 kv_cache[self.kv_cache_indexer_k_idx],
@@ -727,9 +743,39 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 query_scale=q_li_scale,
                 key_scale=key_scale,
             )
+            if not getattr(self, "lim_full_resident", False):
+                return selected
+            # LIM selects only the committed prefix; Copy-SFA separately
+            # attends the visible tail (or the entire short dense row).
+            # Standard paged SFA does not append that tail. Keep the LIM
+            # buffers for members, but run full-context LI for the resident
+            # owner's own attention. This deliberately costs a second LI.
         return super()._select_indexer_topk(
             q_li, q_li_scale, q_li_shape, weights, kv_cache, attn_metadata, actual_query_lengths, actual_key_lengths
         )
+
+    def _get_sfa_indexer_metadata(self, attn_metadata: M) -> M:
+        if not getattr(self, "offload_shared_indexer_only", False):
+            return attn_metadata
+        tables = attn_metadata.sfa_cache_group_tables
+        group_id = getattr(self, "sfa_indexer_group_id", None)
+        if tables is None or group_id is None or group_id >= len(tables):
+            raise RuntimeError("shared-only SFA requires the actual indexer group table")
+        table = tables[group_id][: attn_metadata.cum_query_lens.numel()]
+        slots = map_sfa_indexer_slots(
+            table,
+            attn_metadata.cum_query_lens,
+            attn_metadata.seq_lens,
+            attn_metadata.slot_mapping,
+            self.block_size,
+        )
+        return replace(attn_metadata, block_table=table, slot_mapping=slots)
+
+    def _use_li_c8_reshape_optim(self) -> bool:
+        # The legacy block-store descriptors are shared across main groups.
+        # Independent indexer groups use their own slots through the regular
+        # scatter kernel, including for C8 keys and FP16 scales.
+        return not getattr(self, "offload_shared_indexer_only", False) and super()._use_li_c8_reshape_optim()
 
     def _lim_select(self, query, weights, index_cache, block_table, *, query_scale=None, key_scale=None):
         metadata = self._copy_sfa_metadata
@@ -792,6 +838,12 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             # Dense short rows retain seq with C == 0; long rows retain C.
             self.copy_sfa_reuse_logical_lens[:count].copy_(metadata.copy_sfa_reuse_logical_lens)
             self.copy_sfa_reuse_cache_tokens[:count].copy_(cache)
+        if getattr(self, "use_side_stream_onboard", False):
+            onboarder = get_sparse_kv_offload_manager().lim_group_onboarder
+            if onboarder is not None:
+                # Target owners launch before their second full-context LI,
+                # allowing member copies to overlap that LI and owner SFA.
+                onboarder.launch(self, metadata, get_forward_context(), capturing=self._in_graph_runtime())
         return self.lim_topk_src[:tokens]
 
     def bind_copy_sfa_kv_cache(self, manager, layer_name) -> None:
@@ -841,7 +893,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             # saved C budget.
             cache_tokens = self.copy_sfa_reuse_cache_tokens[:count]
             logical_lens = self.copy_sfa_reuse_logical_lens[:count]  # exact saved selection; no extra tail
-            if getattr(self, "delayed_d2h", False):
+            if getattr(self, "delayed_d2h", False) or getattr(self, "offload_shared_indexer_only", False):
                 # An ignored max-length draft keeps the saved selection for
                 # later valid steps but does no attention on its dummy row.
                 logical_lens = torch.where(metadata.copy_sfa_logical_lens > 0, logical_lens, 0)
@@ -852,6 +904,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             logical_lens = metadata.copy_sfa_logical_lens
             topk_misses = owner.lim_topk_misses[:tokens]
             misses = owner.lim_misses[:count]
+            onboarder = getattr(manager, "lim_group_onboarder", None)
+            if onboarder is not None and layer_name in onboarder.member_owners:
+                zero_topk, zero_miss = onboarder.wait(owner, layer_name, get_forward_context())
+                topk_misses, misses = zero_topk[:tokens], zero_miss[:count]
         heads = query.shape[1]
         q, qr = prepare_copy_sfa_queries(query[:tokens], query_rope[:tokens])
         out = torch.empty_like(q)
@@ -960,6 +1016,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         slots: torch.Tensor,
         attn_metadata: M,
     ):
+        if getattr(self, "lim_full_resident", False):
+            return super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
         if self._is_decode_only(attn_metadata):
             k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
             manager = get_sparse_kv_offload_manager()
@@ -1649,6 +1707,24 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         actual_seq_lengths_key,
         block_table=None,
     ):
+        if getattr(self, "lim_full_resident", False):
+            if topk_indices.dim() == 2:
+                topk_indices = topk_indices.unsqueeze(1)
+            pad_rows = ql_nope.shape[0] - topk_indices.shape[0]
+            if pad_rows > 0:
+                topk_indices = torch.cat(
+                    (topk_indices, topk_indices.new_zeros((pad_rows, *topk_indices.shape[1:]))), dim=0
+                )
+            return super()._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+                block_table=block_table,
+            )
         num_decodes = int(getattr(attn_metadata, "num_decodes", 0) or 0)
         num_decode_tokens = int(getattr(attn_metadata, "num_decode_tokens", 0) or 0)
         num_prefills = int(getattr(attn_metadata, "num_prefills", 0) or 0)

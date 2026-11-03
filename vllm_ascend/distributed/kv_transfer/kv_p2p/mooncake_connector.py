@@ -83,8 +83,11 @@ from vllm_ascend.utils import (
 )
 
 from .mooncake_dsa_decode_worker import DsaDecodeWorkerState
+from .mooncake_dsa_groups import find_dsa_host_group, make_dsa_cache_groups, parse_dsa_source_groups
 from .mooncake_dsa_lifecycle import DsaDecodeLedger
 from .mooncake_dsa_metadata import (
+    DSA_GROUPED_TRANSFER_VERSION,
+    DsaCacheGroupBlocks,
     DsaConnectorMetadata,
     DsaLocalResult,
     DsaLocalResultKind,
@@ -198,6 +201,7 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     local_ip: str = ""
     handshake_port: int = 0
     cache_dtypes: list[list[str]] = []
+    dsa_protocol_version: int = 1
 
 
 @dataclass
@@ -602,6 +606,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_block_len_per_addr: dict[str, dict[int, list[list[int]]]] = SizedDict()
         self.remote_metadata_hosts: dict[str, dict[int, str]] = SizedDict()
         self.remote_cache_dtypes = SizedDict()
+        self.remote_dsa_protocol_versions = SizedDict()
         self.remote_num_blocks = SizedDict()
         self.remote_kv_group2layeridx: dict[str, dict[int, dict[int, tuple[dict[str, Any], list[int]]]]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
@@ -812,6 +817,16 @@ class KVCacheRecvingThread(threading.Thread):
                 for group_id, (spec, _) in groups.items()
                 for name in spec.get("layer_names", ())
             }
+            remote_group_sizes = {
+                name: spec.get("kv_cache_spec", {}).get("block_size")
+                for spec, _ in groups.values()
+                for name in spec.get("layer_names", ())
+            }
+            grouped = command.source.protocol_version == DSA_GROUPED_TRANSFER_VERSION
+            if grouped and (
+                self.remote_dsa_protocol_versions.get(engine_id, {}).get(port) != DSA_GROUPED_TRANSFER_VERSION
+            ):
+                raise ValueError("DSA grouped receive requires protocol v2 in Prefill GET_META")
             bases = self.kv_caches_base_addr[engine_id][port]
             strides = self.remote_block_stride_per_addr[engine_id][port]
             scales = self.remote_block_size_scale[engine_id][port]
@@ -827,10 +842,16 @@ class KVCacheRecvingThread(threading.Thread):
         first, last = self.pp_layer_indices[task["pp_rank"]]
         if task["pp_rank"] == self._prefill_pp_size - 1:
             last += self.num_draft_layers
-        # Assemble both phases before Transfer Engine submission so missing components cannot
+        # Assemble all phases before Transfer Engine submission so missing components cannot
         # silently yield a partial successful transfer. No device reformat for Host.
         plans = []
-        for indexer, layout in ((True, self._dsa_indexer_local_layout), (False, self._dsa_main_local_layout)):
+        phases = (
+            (DsaTransferPhase.INDEXER_D2D, self._dsa_indexer_local_layout),
+            (DsaTransferPhase.MAIN_D2RH, [layout for layout in self._dsa_main_local_layout if layout.host_backed]),
+            (DsaTransferPhase.MAIN_D2D, [layout for layout in self._dsa_main_local_layout if not layout.host_backed]),
+        )
+        for phase, layout in phases:
+            indexer = phase is DsaTransferPhase.INDEXER_D2D
             if indexer and not task["include_indexer"]:
                 continue
             combined = ([], [], [])
@@ -844,9 +865,33 @@ class KVCacheRecvingThread(threading.Thread):
                     continue
                 if local.layer_name not in layers:
                     raise ValueError(f"missing DSA remote component {local.layer_name}")
-                expected_group = source.remote_indexer_group_id if indexer else source.remote_main_group_id
-                if expected_group is not None and remote_groups[local.layer_name] != expected_group:
-                    raise ValueError(f"DSA remote cache-group identity mismatch: {local.layer_name}")
+                if grouped:
+                    remote_gid = remote_groups[local.layer_name]
+                    local_gid = local.group_id
+                    for gid, records in ((remote_gid, source.cache_groups), (local_gid, command.destination_groups)):
+                        if isinstance(gid, bool) or not isinstance(gid, int) or not 0 <= gid < len(records):
+                            raise ValueError(f"DSA component has invalid cache-group identity: {local.layer_name}")
+                    source_group = source.cache_groups[remote_gid]
+                    destination_group = command.destination_groups[local_gid]
+                    remote_block_tokens = source_group.block_size
+                    reported_size = remote_group_sizes[local.layer_name]
+                    if (
+                        isinstance(reported_size, bool)
+                        or not isinstance(reported_size, int)
+                        or reported_size != remote_block_tokens
+                        or local.block_tokens != destination_group.block_size
+                    ):
+                        raise ValueError(f"DSA component group block-size mismatch: {local.layer_name}")
+                    source_ids, destination_ids = source_group.block_ids, destination_group.block_ids
+                else:
+                    expected_group = source.remote_indexer_group_id if indexer else source.remote_main_group_id
+                    if expected_group is not None and remote_groups[local.layer_name] != expected_group:
+                        raise ValueError(f"DSA remote cache-group identity mismatch: {local.layer_name}")
+                    source_ids = source.indexer_block_ids if indexer else source.main_block_ids
+                    destination_ids = command.indexer_hbm_block_ids if indexer else command.main_host_block_ids
+                    remote_block_tokens = (
+                        source.remote_indexer_block_size if indexer else source.remote_main_block_size
+                    ) or source.remote_block_size
                 remote_layer = layers[local.layer_name]
                 position = local.position
                 remote = DsaCacheLayout(
@@ -856,41 +901,42 @@ class KVCacheRecvingThread(threading.Thread):
                     lengths[remote_layer][position],
                     strides[remote_layer][position],
                     scales[remote_layer][position],
-                    (source.remote_indexer_block_size if indexer else source.remote_main_block_size)
-                    or source.remote_block_size,
+                    remote_block_tokens,
                     dtypes[remote_layer][position],
                     remote_capacity,
                 )
                 part = build_component_read(
                     local,
                     remote,
-                    source.indexer_block_ids if indexer else source.main_block_ids,
-                    command.indexer_hbm_block_ids if indexer else command.main_host_block_ids,
+                    source_ids,
+                    destination_ids,
                     start,
                     end,
                     cp_size=source.remote_pcp_size * source.remote_dcp_size,
                     cp_rank=task["cp_rank"],
-                    writer_rank=self.tp_rank,
-                    writer_size=self.vllm_config.parallel_config.tensor_parallel_size,
+                    # Host pool is shared across D TP, but every resident owner
+                    # has private HBM and must read every CP source shard.
+                    writer_rank=self.tp_rank if local.host_backed else 0,
+                    writer_size=self.vllm_config.parallel_config.tensor_parallel_size if local.host_backed else 1,
                     indexer=indexer,
                     statistics=statistics,
                     mapping_cache=mapping_cache,
                 )
                 for output, values in zip(combined, part):
                     output.extend(values)
-            plans.append((indexer, combined, statistics))
+            plans.append((phase, combined, statistics))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "DSA built transfer plans request=%s decode_rank=%s phases=%s token_range=[%s,%s) pp_layers=[%s,%s)",
                 command.request_id,
                 self.tp_rank,
-                [("indexer" if indexer else "main", len(plan[0]), sum(plan[2])) for indexer, plan, _ in plans],
+                [(phase.value, len(plan[0]), sum(plan[2])) for phase, plan, _ in plans],
                 start,
                 end,
                 first,
                 last,
             )
-        for indexer, plan, statistics in plans:
+        for phase, plan, statistics in plans:
             if task["cancelled"].is_set():
                 logger.debug(
                     "DSA stop remaining phases request=%s decode_rank=%s reason=cancelled",
@@ -898,15 +944,15 @@ class KVCacheRecvingThread(threading.Thread):
                     self.tp_rank,
                 )
                 break
-            task["failure_phase"] = DsaTransferPhase.INDEXER_D2D if indexer else DsaTransferPhase.MAIN_D2RH
+            task["failure_phase"] = phase
             if plan[0]:
                 started = time.perf_counter()
                 result = self.engine.batch_transfer_sync_read(session, *plan)
                 logger.debug(
-                    "DSA receive request=%s rank=%s indexer=%s bytes=%s entries=%s seconds=%s coalescing=%s",
+                    "DSA receive request=%s rank=%s phase=%s bytes=%s entries=%s seconds=%s coalescing=%s",
                     command.request_id,
                     self.tp_rank,
-                    indexer,
+                    phase.value,
                     sum(plan[2]),
                     len(plan[0]),
                     time.perf_counter() - started,
@@ -923,8 +969,8 @@ class KVCacheRecvingThread(threading.Thread):
             if not self._is_failed_recv_request(command.request_id):
                 self._execute_dsa_receive(task)
         except Exception:
-            # The upstream invalid-block interface uses cache group 0's ID
-            # space (R1). Preserve that space; never report Host IDs as group 0.
+            # v1 carries group 0 IDs; v2 carries all unhashed group IDs from
+            # the common block pool for the grouped scheduler failure adapter.
             self._mark_failed_recv_request(command.request_id, (list(command.invalid_block_ids),))
             with self.failed_recv_requests_lock:
                 self.dsa_failure_phases.setdefault(command.request_id, task["failure_phase"])
@@ -1801,6 +1847,9 @@ class KVCacheRecvingThread(threading.Thread):
             with self.remote_metadata_lock:
                 self.remote_num_blocks.setdefault(engine_id, {})[remote_handshake_port] = agent_meta.num_blocks
                 self.remote_cache_dtypes.setdefault(engine_id, {})[remote_handshake_port] = agent_meta.cache_dtypes
+                self.remote_dsa_protocol_versions.setdefault(engine_id, {})[remote_handshake_port] = (
+                    agent_meta.dsa_protocol_version
+                )
                 self.remote_kv_group2layeridx[engine_id][remote_handshake_port] = agent_meta.kv_group2layeridx
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
@@ -1941,6 +1990,7 @@ class _DsaSchedulerRequest:
     allocated: bool = False
     notify_only: bool = False
     invalid_block_ids: tuple[int, ...] = ()
+    destination_groups: tuple[DsaCacheGroupBlocks, ...] = ()
     results_by_rank: dict[int, DsaLocalResult] = field(default_factory=dict)
 
 
@@ -1955,6 +2005,13 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
         kv_cache_config: KVCacheConfig | None,
     ) -> None:
         super().__init__(vllm_config, True, kv_cache_config)
+        self._dsa_shared_residency = (
+            getattr(get_ascend_config().sparse_kv_offload_config, "offload_shared_indexer_only", False) is True
+        )
+        if self._dsa_shared_residency:
+            if kv_cache_config is None:
+                raise ValueError("shared-only Mooncake requires cache-group configuration")
+            self.main_group_idx = find_dsa_host_group(kv_cache_config)
         self._main_block_size = self.block_size[self.main_group_idx]
         self._dsa_requests: dict[str, _DsaSchedulerRequest] = {}
         self._dsa_cancelled: set[str] = set()
@@ -1987,12 +2044,25 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
         remote_groups = tuple(tuple(group) for group in params["remote_block_ids"])
         if not remote_groups:
             raise ValueError("remote_block_ids must contain at least one group")
+        grouped = getattr(self, "_dsa_shared_residency", False)
+        source_groups = parse_dsa_source_groups(params, remote_groups) if grouped else ()
         remote_main = params.get("dsa_main_group_id")
         remote_indexer = params.get("dsa_indexer_group_id")
         if len(remote_groups) == 1:
             remote_main = remote_indexer = 0
         if remote_main is None or remote_indexer is None:
             raise ValueError("DSA remote multi-group metadata requires explicit Main/Indexer group IDs")
+        for group_id in (remote_main, remote_indexer):
+            if isinstance(group_id, bool) or not isinstance(group_id, int) or not 0 <= group_id < len(remote_groups):
+                raise ValueError("DSA remote component group ID is outside the source groups")
+        if grouped:
+            for alias, group_id in (("dsa_main_block_size", remote_main), ("dsa_indexer_block_size", remote_indexer)):
+                if alias in params and (
+                    isinstance(params[alias], bool)
+                    or not isinstance(params[alias], int)
+                    or params[alias] != source_groups[group_id].block_size
+                ):
+                    raise ValueError(f"DSA {alias} conflicts with source group block size")
         remote_tp = int(params.get("remote_ptp_size", self._dsa_prefill_tp_size))
         remote_pcp = int(params.get("remote_pcp_size", 1))
         remote_pp = int(params.get("remote_pp_size", 1))
@@ -2015,10 +2085,16 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
             num_prompt_blocks=int(params.get("num_prompt_blocks", 0)),
             remote_main_group_id=remote_main,
             remote_indexer_group_id=remote_indexer,
-            remote_main_block_size=int(params.get("dsa_main_block_size", 0)),
-            remote_indexer_block_size=int(params.get("dsa_indexer_block_size", 0)),
+            remote_main_block_size=source_groups[remote_main].block_size
+            if grouped
+            else int(params.get("dsa_main_block_size", 0)),
+            remote_indexer_block_size=source_groups[remote_indexer].block_size
+            if grouped
+            else int(params.get("dsa_indexer_block_size", 0)),
             num_computed_tokens=num_computed_tokens,
             num_external_tokens=external_tokens,
+            protocol_version=DSA_GROUPED_TRANSFER_VERSION if grouped else 1,
+            cache_groups=source_groups,
         )
         self._dsa_requests[request.request_id] = _DsaSchedulerRequest(
             request=request,
@@ -2076,6 +2152,17 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
             raise ValueError("vLLM has not allocated enough Main Host blocks")
         unhashed_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else ()
         invalid_block_ids = tuple(unhashed_block_ids[0]) if unhashed_block_ids else ()
+        if getattr(self, "_dsa_shared_residency", False):
+            destination_groups = make_dsa_cache_groups(groups, self.block_size)
+            if num_external_tokens > 0:
+                if any(len(group.block_ids) < cdiv(bound_tokens, group.block_size) for group in destination_groups):
+                    raise ValueError("vLLM has not allocated enough blocks in every DSA destination group")
+                if len(unhashed_block_ids) != len(groups):
+                    raise ValueError("DSA failure reporting requires unhashed IDs for every destination group")
+            # IDs belong to the common block pool. Preserve each group's
+            # actual IDs; never substitute the Host IDs for group 0 IDs.
+            invalid_block_ids = tuple(sorted({block for group in unhashed_block_ids for block in group}))
+            tracker.destination_groups = destination_groups
         tracker.source = replace(tracker.source, num_external_tokens=num_external_tokens)
         tracker.allocated = True
         tracker.notify_only = num_external_tokens == 0
@@ -2114,6 +2201,7 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
                     invalid_block_ids=tracker.invalid_block_ids,
                     notify_only=tracker.notify_only,
                     generation=tracker.generation,
+                    destination_groups=tracker.destination_groups,
                 )
             )
             tracker.command_emitted = True
@@ -2329,6 +2417,13 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         return (
             isinstance(self.connector_scheduler, _MooncakeDsaDecodeScheduler)
             and self.connector_scheduler.delayed_d2h_enabled
+        )
+
+    @property
+    def dsa_grouped_transfer_enabled(self) -> bool:
+        return (
+            isinstance(self.connector_scheduler, _MooncakeDsaDecodeScheduler)
+            and self.connector_scheduler._dsa_shared_residency
         )
 
     def get_completed_host_prefix(self, request_id: str) -> int | None:
@@ -2768,15 +2863,19 @@ class MooncakeConnectorScheduler:
             for group_id, group in enumerate(self.kv_cache_groups):
                 for name in group.layer_names:
                     key = "dsa_indexer_group_id" if "indexer" in name.lower() else "dsa_main_group_id"
-                    if key in component_groups and component_groups[key] != group_id:
-                        raise ValueError("DSA component spans multiple manager groups")
-                    component_groups[key] = group_id
+                    # Legacy aliases remain for old D with a uniform group.
+                    # v2 readers resolve each layer's actual group in GET_META.
+                    component_groups.setdefault(key, group_id)
             component_groups["dsa_main_block_size"] = self.kv_cache_groups[
                 component_groups["dsa_main_group_id"]
             ].kv_cache_spec.block_size
             component_groups["dsa_indexer_block_size"] = self.kv_cache_groups[
                 component_groups["dsa_indexer_group_id"]
             ].kv_cache_spec.block_size
+            component_groups["dsa_protocol_version"] = DSA_GROUPED_TRANSFER_VERSION
+            component_groups["dsa_group_block_sizes"] = [
+                group.kv_cache_spec.block_size for group in self.kv_cache_groups
+            ]
         return delay_free_blocks, dict(
             **component_groups,
             remote_pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
@@ -2943,6 +3042,9 @@ class MooncakeConnectorWorker:
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
         self._dsa_pd_offload = vllm_config.kv_transfer_config.get_from_extra_config("dsa_pd_offload", False)
         self._dsa_decode = self._dsa_pd_offload and self.kv_role == "kv_consumer"
+        self._dsa_shared_residency = self._dsa_decode and (
+            getattr(get_ascend_config().sparse_kv_offload_config, "offload_shared_indexer_only", False) is True
+        )
         self._dsa_decode_state: DsaDecodeWorkerState | None = None
         if self._dsa_decode:
             self._dsa_active_commands: dict[str, DsaStepRequest] = {}
@@ -3297,19 +3399,19 @@ class MooncakeConnectorWorker:
         kv_caches: dict[str, torch.Tensor],
         layouts: list[DsaCacheLayout],
     ) -> tuple[RegisterRegions, list[str]]:
-        """Collect HBM Indexer atoms; shared VMM Main needs no registration."""
+        """Collect private HBM atoms; shared VMM Main needs no registration."""
         atoms: list[DsaRegisterAtom] = []
         for layout in layouts:
             tensors = self._as_kv_cache_tuple(kv_caches[layout.layer_name])
             if layout.position >= len(tensors):
-                raise ValueError(f"missing DSA Indexer tensor position {layout.position}")
+                raise ValueError(f"missing DSA HBM tensor position {layout.position}")
             tensor = tensors[layout.position]
             storage = tensor.untyped_storage()
             storage_start = tensor_storage_key(tensor)
             storage_end = storage_start + storage.nbytes()
             end = layout.base + layout_span_bytes(layout)
             if layout.base < storage_start or end > storage_end:
-                raise ValueError(f"DSA Indexer component {layout.layer_name} is outside its storage")
+                raise ValueError(f"DSA HBM component {layout.layer_name} is outside its storage")
             atoms.append(DsaRegisterAtom(layout.base, end, "*", ("hbm", storage_start)))
 
         bounded = collect_bounded_register_regions(atoms)
@@ -3372,16 +3474,24 @@ class MooncakeConnectorWorker:
             for name in kv_caches
         }
         manager = get_sparse_kv_offload_manager()
+        grouped = getattr(self, "_dsa_shared_residency", False)
+        group_ids = (
+            {name: gid for gid, group in enumerate(self.kv_cache_config.kv_cache_groups) for name in group.layer_names}
+            if grouped
+            else {}
+        )
         indexer, main = [], []
         for name, caches in kv_caches.items():
-            is_indexer = "indexer" in name.lower()
-            tensors = self._as_kv_cache_tuple(caches) if is_indexer else manager.get_local_host_kv_views(name)
+            spec = self._get_layer_spec(name)
+            is_indexer = isinstance(spec, AscendSFAIndexerCacheSpec) if grouped else "indexer" in name.lower()
+            host_backed = not is_indexer and (not grouped or spec.store_on_host)
+            tensors = manager.get_local_host_kv_views(name) if host_backed else self._as_kv_cache_tuple(caches)
             for position, tensor in enumerate(tensors):
                 if tensor.shape[0] % self.num_blocks:
                     raise ValueError("DSA tensor pages must divide manager blocks")
                 scale = tensor.shape[0] // self.num_blocks
                 if not is_indexer and scale != 1:
-                    raise ValueError("Host Main requires one view block per manager block")
+                    raise ValueError("DSA Main requires one view block per manager block")
                 entry = DsaCacheLayout(
                     name,
                     position,
@@ -3389,14 +3499,23 @@ class MooncakeConnectorWorker:
                     tensor.element_size() * math.prod(tensor.shape[1:]),
                     tensor.stride(0) * tensor.element_size(),
                     scale,
-                    self._get_layer_spec(name).block_size,
+                    spec.block_size,
                     str(tensor.dtype),
                     self.num_blocks,
+                    group_ids.get(name),
+                    host_backed,
                 )
                 (indexer if is_indexer else main).append(entry)
         if not indexer or not main:
             raise ValueError("DSA requires Main and Indexer component layouts")
         return indexer, main
+
+    def _dsa_uses_private_cache(self, layer_name: str) -> bool:
+        if not self._dsa_decode:
+            return True
+        if getattr(self, "_dsa_shared_residency", False):
+            return not getattr(self._get_layer_spec(layer_name), "store_on_host", False)
+        return "indexer" in layer_name.lower()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
@@ -3437,7 +3556,7 @@ class MooncakeConnectorWorker:
         # TODO: For DSV4 use_compress, metadata/transfer can be optimized by
         # aggregating layer views that share the same raw KVCacheTensor.
         for layer_name, kv_cache_tuple in kv_caches.items():
-            if self._dsa_decode and "indexer" not in layer_name.lower():
+            if not self._dsa_uses_private_cache(layer_name):
                 continue
             layer_idx = layer_name_to_idx[layer_name]
             for single_kv_cache in self._as_kv_cache_tuple(kv_cache_tuple):
@@ -3457,10 +3576,10 @@ class MooncakeConnectorWorker:
         register_locations = None
         if self._dsa_decode:
             # Shared VMM Main is directly addressable, while ordinary HBM
-            # Indexer destinations still require local transfer engine registration.
+            # Indexer and resident owner destinations require rank-local registration.
             assert dsa_local_layouts is not None
             register_regions, register_locations = self._dsa_consumer_indexer_register_regions(
-                kv_caches, dsa_local_layouts[0]
+                kv_caches, dsa_local_layouts[0] + [layout for layout in dsa_local_layouts[1] if not layout.host_backed]
             )
         elif has_mamba_group:
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
@@ -3502,10 +3621,11 @@ class MooncakeConnectorWorker:
         # After KV Caches registered, start the sending or receiving thread.
         cache_dtypes = [[] for _ in self.kv_caches_base_addr]
         for name, caches in kv_caches.items():
-            if not self._dsa_decode or "indexer" in name.lower():
+            if self._dsa_uses_private_cache(name):
                 cache_dtypes[layer_name_to_idx[name]] = [str(t.dtype) for t in self._as_kv_cache_tuple(caches)]
         metadata = MooncakeAgentMetadata(
             cache_dtypes=cache_dtypes,
+            dsa_protocol_version=DSA_GROUPED_TRANSFER_VERSION if self._dsa_pd_offload else 1,
             engine_id=self.engine_id,
             te_rpc_port=self.te_rpc_port,
             kv_group2layeridx=self.kv_group2layeridx,

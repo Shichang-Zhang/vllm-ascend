@@ -38,9 +38,17 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.delayed_d2h_executor 
     MooncakeDelayedD2HExecutor,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.delayed_d2h_runtime import DelayedD2HRuntime
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.lim_group_onboard import (
+    LimGroupOnboarder,
+    resolve_lim_copy_operator,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import (
     HostPoolTopology,
     MooncakeHostPool,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sfa_layer_residency import (
+    SfaResidencyPlan,
+    build_sfa_cache_layout,
 )
 from vllm_ascend.ops.triton.batch_memcpy import batch_memcpy_kernel
 
@@ -551,10 +559,13 @@ class SparseKVOffloadManager:
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
         sparse_kv_offload_config: SparseKVOffloadConfig,
+        residency_plan: SfaResidencyPlan | None = None,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.sparse_kv_offload_config = sparse_kv_offload_config
+        self.residency_plan = residency_plan
+        self.sfa_cache_layout = None
 
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -571,6 +582,7 @@ class SparseKVOffloadManager:
         self.delayed_d2h = getattr(sparse_kv_offload_config, "delayed_d2h", False) is True
         self.delayed_d2h_executor: MooncakeDelayedD2HExecutor | None = None
         self.delayed_d2h_runtime: DelayedD2HRuntime | None = None
+        self.lim_group_onboarder: LimGroupOnboarder | None = None
         self.host_backend = sparse_kv_offload_config.host_backend
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -784,6 +796,9 @@ class SparseKVOffloadManager:
 
     def close(self) -> None:
         """Release backend-owned Host KV resources."""
+        onboarder = getattr(self, "lim_group_onboarder", None)
+        if onboarder is not None:
+            onboarder.close()
         runtime = getattr(self, "delayed_d2h_runtime", None)
         if runtime is not None:
             runtime.close()
@@ -860,6 +875,11 @@ class SparseKVOffloadManager:
         self,
         kv_cache_config: KVCacheConfig,
     ) -> int:
+        if getattr(self.sparse_kv_offload_config, "offload_shared_indexer_only", False) is True:
+            if self.residency_plan is None:
+                raise ValueError("shared-only cache allocation requires a bound layer residency plan")
+            self.sfa_cache_layout = build_sfa_cache_layout(kv_cache_config, self.residency_plan)
+            return self.sfa_cache_layout.block_size
         assert len(kv_cache_config.kv_cache_groups) == 1, "Hybrid KV is not supported."
         kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -873,7 +893,16 @@ class SparseKVOffloadManager:
         return tuple(cache_or_caches)
 
     def _register_offload_layers(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        self.offload_layer_names = [layer_name for layer_name in kv_caches if "indexer" not in layer_name]
+        layout = getattr(self, "sfa_cache_layout", None)
+        if layout is not None:
+            if set(kv_caches) != {layer.name for layer in layout.layers}:
+                raise ValueError("registered SFA caches differ from the validated cache layout")
+            assert self.residency_plan is not None
+            self.offload_layer_names = list(self.residency_plan.offloaded_names)
+            self.resident_layer_names = self.residency_plan.resident_names
+        else:
+            self.offload_layer_names = [layer_name for layer_name in kv_caches if "indexer" not in layer_name]
+            self.resident_layer_names = ()
         if not self.offload_layer_names:
             raise ValueError("Sparse KV offload did not find SFA KV cache layers.")
 
@@ -887,7 +916,11 @@ class SparseKVOffloadManager:
             self.num_layers,
             self.num_target_layers,
         )
-        self.mtp_layer_id = self.num_layers - 1 if self.num_layers != self.num_target_layers else -1
+        if getattr(self, "residency_plan", None) is not None:
+            self.mtp_layer_ids = tuple(self.layer_name_to_offload_id[name] for name in self.residency_plan.draft_names)
+        else:
+            self.mtp_layer_ids = (self.num_layers - 1,) if self.num_layers != self.num_target_layers else ()
+        self.mtp_layer_id = self.mtp_layer_ids[0] if self.mtp_layer_ids else -1
         if self.tp_rank == 0:
             preview_layer_names = self.offload_layer_names[:4]
             if len(self.offload_layer_names) > 4:
@@ -1132,6 +1165,10 @@ class SparseKVOffloadManager:
         self,
         kv_caches: dict[str, torch.Tensor],
     ):
+        previous = getattr(self, "lim_group_onboarder", None)
+        if previous is not None:
+            previous.close()
+            self.lim_group_onboarder = None
         self._register_offload_layers(kv_caches)
         self._copy_sfa_writeback_context = None
         self._copy_sfa_writeback_key = None
@@ -1705,6 +1742,18 @@ class SparseKVOffloadManager:
         warmup_index_copy_destinations(self)
         self.fused_index_copy_descriptor_builder = build_index_copy_destinations
 
+    def configure_lim_group_onboarding(self, implementations) -> None:
+        """Bind fixed copy buffers/streams before model warmup or capture."""
+        previous = getattr(self, "lim_group_onboarder", None)
+        if previous is not None:
+            previous.close()
+        self.lim_group_onboarder = None
+        if not self.sparse_kv_offload_config.use_side_stream_onboard:
+            return
+        operation = resolve_lim_copy_operator()
+        if operation is not None:
+            self.lim_group_onboarder = LimGroupOnboarder(self, implementations, operation)
+
     def _bind_copy_sfa_bases(self) -> None:
         """Pin host/device row bases used by eager prefix-rollback tail restore."""
         if not self.k_caches_cpu or not self.topk_buffers_k:
@@ -2232,7 +2281,7 @@ class SparseKVOffloadManager:
                 "Sparse KV offload topk rows exceed configured workspace, "
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
             )
-        if layer_id in [0, self.mtp_layer_id]:
+        if layer_id == 0 or layer_id in getattr(self, "mtp_layer_ids", (self.mtp_layer_id,)):
             # metadata which are same across all layers, only compute/copy once in first layer.
             # last layer (mtp layer) may have different metadata, do not skip.
             if token_to_req_npu is not None:
@@ -2740,6 +2789,7 @@ def init_sparse_kv_offload_manager(
     vllm_config: VllmConfig,
     kv_cache_config: KVCacheConfig,
     sparse_kv_offload_config: SparseKVOffloadConfig,
+    residency_plan: SfaResidencyPlan | None = None,
 ):
     global _SPARSE_KV_OFFLOAD_MANAGER
     if _SPARSE_KV_OFFLOAD_MANAGER is None:
@@ -2747,6 +2797,7 @@ def init_sparse_kv_offload_manager(
             vllm_config,
             kv_cache_config,
             sparse_kv_offload_config,
+            residency_plan,
         )
     return _SPARSE_KV_OFFLOAD_MANAGER
 

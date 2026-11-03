@@ -137,6 +137,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
     prepare_copy_sfa_request_slots,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sfa_layer_residency import (
+    bind_sfa_cache_groups,
+    bind_sfa_layer_residency,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     allocate_kv_offload_topk_profile_buffers,
@@ -3131,7 +3135,11 @@ class NPUModelRunner(GPUModelRunner):
                 self.sparse_kv_offload_manager.dense_fill_copy_sfa_rows(
                     dense_fills,
                     block_size=self.cache_config.block_size,
-                    block_table=self.input_batch.block_table[0].get_numpy_array(),
+                    block_table=self.input_batch.block_table[
+                        self.sparse_kv_offload_manager.sfa_cache_layout.host_group_id
+                        if getattr(self.sparse_kv_offload_config, "offload_shared_indexer_only", False) is True
+                        else 0
+                    ].get_numpy_array(),
                 )
         attn_metadata: PerLayerAttnMetadata = {}
         device_metadata_tasks: list[DeviceMetadataTask] | None = (
@@ -3262,6 +3270,16 @@ class NPUModelRunner(GPUModelRunner):
             req_topk_buffer_stable_prefixes=(
                 self._offload_stable_prefixes.cpu[:num_reqs_padded]
                 if getattr(self, "_offload_stable_prefixes", None) is not None else None
+            ),
+            sfa_cache_group_tables=(
+                tuple(_get_block_table_and_slot_mapping(gid)[0] for gid in range(len(kv_cache_groups)))
+                if getattr(self.sparse_kv_offload_config, "offload_shared_indexer_only", False) is True
+                else None
+            ),
+            sfa_host_group_id=(
+                self.sparse_kv_offload_manager.sfa_cache_layout.host_group_id
+                if getattr(self.sparse_kv_offload_config, "offload_shared_indexer_only", False) is True
+                else None
             ),
             offload_dummy=offload_dummy,
             copy_sfa_restore_tails=self._copy_sfa_need_eager_tail_restore,
@@ -3972,24 +3990,7 @@ class NPUModelRunner(GPUModelRunner):
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
         get_offloader().post_init()
-        if self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_fused_copy_sfa:
-            from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
-
-            owners: dict[int, AscendSFAKVOffloadImpl] = {}
-            for layer in self.compilation_config.static_forward_context.values():
-                impl = getattr(layer, "impl", None)
-                if not isinstance(impl, AscendSFAKVOffloadImpl):
-                    continue
-                shared = impl.topk_indices_buffer
-                if shared is None:
-                    continue
-                key = shared.data_ptr()
-                if impl.skip_topk:
-                    if key not in owners:
-                        raise RuntimeError("fused_copy_sfa shared attention precedes its indexer owner")
-                    impl.lim_indexer_owner = owners[key]
-                else:
-                    owners[key] = impl
+        self._configure_sparse_layer_residency()
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
@@ -4067,8 +4068,17 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 kv_cache_config,
                 self.sparse_kv_offload_config,
+                residency_plan=getattr(self, "_sfa_layer_residency_plan", None),
             )
             assert self.sparse_kv_offload_manager is not None
+            layout = self.sparse_kv_offload_manager.sfa_cache_layout
+            if layout is not None:
+                bind_sfa_cache_groups(
+                    {name: self.compilation_config.static_forward_context[name].impl
+                     for name in (*self._sfa_layer_residency_plan.resident_names,
+                                  *self._sfa_layer_residency_plan.offloaded_names)},
+                    layout,
+                )
             self.sparse_kv_offload_manager.prepare_host_kv_allocation(
                 device_id=torch.npu.current_device(),
                 dp_rank=int(self.dp_rank),
@@ -4114,6 +4124,13 @@ class NPUModelRunner(GPUModelRunner):
                 for layer_name in self.sparse_kv_offload_manager.offload_layer_names:
                     layer = self.compilation_config.static_forward_context[layer_name]
                     layer.impl.bind_copy_sfa_kv_cache(self.sparse_kv_offload_manager, layer_name)
+                if self.sparse_kv_offload_config.use_side_stream_onboard:
+                    plan = self.sparse_kv_offload_manager.residency_plan
+                    assert plan is not None
+                    self.sparse_kv_offload_manager.configure_lim_group_onboarding({
+                        layer.name: self.compilation_config.static_forward_context[layer.name].impl
+                        for layer in plan.layers
+                    })
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
@@ -4477,7 +4494,7 @@ class NPUModelRunner(GPUModelRunner):
                             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
                         k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
                         v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
-                    if self.sparse_kv_offload_enabled:
+                    if self.sparse_kv_offload_enabled and getattr(current_kv_cache_spec, "store_on_host", False):
                         assert self.sparse_kv_offload_manager is not None
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
@@ -4688,7 +4705,7 @@ class NPUModelRunner(GPUModelRunner):
                     current_sparse_sfa_c8 = self.use_sparse and kv_cache_spec_uses_sparse_sfa_c8(
                         current_kv_cache_spec
                     )
-                    if self.sparse_kv_offload_enabled:
+                    if self.sparse_kv_offload_enabled and getattr(current_kv_cache_spec, "store_on_host", False):
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
                         reshaped_tensors = reshape_kv_cache_tensors_for_sparse_kv_offload(
@@ -5114,6 +5131,37 @@ class NPUModelRunner(GPUModelRunner):
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()
 
+    def _configure_sparse_layer_residency(self) -> None:
+        if not (self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_fused_copy_sfa):
+            return
+        from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
+
+        layers = {
+            name: layer
+            for name, layer in self.compilation_config.static_forward_context.items()
+            if isinstance(getattr(layer, "impl", None), AscendSFAKVOffloadImpl)
+        }
+        draft_model = getattr(getattr(self, "drafter", None), "model", None)
+        draft_modules = set() if draft_model is None else {id(module) for module in draft_model.modules()}
+        draft_names = frozenset(name for name, layer in layers.items() if id(layer) in draft_modules)
+        self._sfa_layer_residency_plan = bind_sfa_layer_residency(
+            {name: layer.impl for name, layer in layers.items()},
+            draft_layer_names=draft_names,
+            shared_only=getattr(self.sparse_kv_offload_config, "offload_shared_indexer_only", False) is True,
+        )
+
+    def _sfa_store_on_host(self, layer_name: str) -> bool:
+        if not self.sparse_kv_offload_enabled:
+            return False
+        if getattr(self.sparse_kv_offload_config, "offload_shared_indexer_only", False) is not True:
+            return True
+        plan = getattr(self, "_sfa_layer_residency_plan", None)
+        if plan is not None:
+            for layer in plan.layers:
+                if layer.name == layer_name:
+                    return layer.offloaded
+        raise ValueError(f"shared-only KV planning requires a classified SFA layer: {layer_name}")
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
         Generates the KVCacheSpec by parsing the kv cache format from each
@@ -5180,7 +5228,7 @@ class NPUModelRunner(GPUModelRunner):
                         dtype=dtype,
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         cache_sparse_sfa_c8=cache_sparse_sfa_c8,
-                        store_on_host=self.sparse_kv_offload_enabled,
+                        store_on_host=self._sfa_store_on_host(layer_name),
                     )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):

@@ -12,6 +12,7 @@ from vllm.config import CUDAGraphMode
 
 from tests.ut.attention.test_copy_sfa_fallback import make_manager
 from tests.ut.attention.test_copy_sfa_metadata import common, make_builder, populate
+from vllm_ascend.attention.sfa_cache_mapping import map_sfa_indexer_slots
 from vllm_ascend.attention.sfa_kv_offload import AscendAttentionState, AscendSFAKVOffloadImpl
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
@@ -141,6 +142,8 @@ def make_real_common():
         max_query_len=4,
         max_seq_len=10372,
         block_table_tensor=main_table,
+        sfa_cache_group_tables=(main_table + 512, main_table, main_table + 1024),
+        sfa_host_group_id=1,
         slot_mapping=torch.arange(8),
         positions=torch.arange(8),
         req_topk_buffer_slots=torch.tensor([1, 0], dtype=torch.int32),
@@ -157,6 +160,10 @@ def test_unpadded_slices_frontiers_with_request_ownership():
     assert sliced.req_topk_buffer_slots.tolist() == [1]
     assert sliced.req_topk_buffer_generations.tolist() == [11]
     assert cm.req_topk_buffer_stable_prefixes.tolist() == [8064, 10240]
+    assert len(sliced.sfa_cache_group_tables) == 3
+    assert all(table.shape == (1, 128) for table in sliced.sfa_cache_group_tables)
+    assert sliced.sfa_cache_group_tables[0].data_ptr() == cm.sfa_cache_group_tables[0].data_ptr()
+    assert sliced.sfa_host_group_id == 1
 
 
 @pytest.mark.parametrize("padded", [False, True])
@@ -181,6 +188,8 @@ def test_proposer_rebuild_preserves_frontier_while_rejecting_tokens(padded):
         assert rebuilt.query_start_loc_cpu.tolist() == [0, 1, 3]
     assert rebuilt.req_topk_buffer_stable_prefixes is cm.req_topk_buffer_stable_prefixes
     assert rebuilt.req_topk_buffer_slots is cm.req_topk_buffer_slots
+    assert rebuilt.sfa_cache_group_tables is cm.sfa_cache_group_tables
+    assert rebuilt.sfa_host_group_id == 1
     for step in range(3):
         draft = proposer.shallow_copy_metadata(rebuilt)
         draft.copy_sfa_draft_index = step
@@ -189,10 +198,11 @@ def test_proposer_rebuild_preserves_frontier_while_rejecting_tokens(padded):
 
 @pytest.mark.parametrize("graph", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
 @pytest.mark.parametrize("reuse_topk", [False, True])
-@pytest.mark.parametrize("delayed", [True])
+@pytest.mark.parametrize("delayed", [False, True])
 def test_real_proposer_max_length_mask_uses_private_rows_without_negative_lengths(graph, reuse_topk, delayed):
     builder = make_builder()
     builder.delayed_d2h = delayed
+    builder.offload_shared_indexer_only = True
     builder.lim_reuse_topk = reuse_topk
     cm = make_real_common()
     cm.seq_lens[:] = torch.tensor([10496, 10490])
@@ -229,6 +239,11 @@ def test_real_proposer_max_length_mask_uses_private_rows_without_negative_length
     assert md.copy_sfa_device_slots[1] < builder.copy_sfa_pool_capacity * 8448
     assert torch.all(md.copy_sfa_device_slots[2:] >= builder.copy_sfa_pool_capacity * 8448)
     assert md.copy_sfa_hbm_block_table[0].min() >= builder.copy_sfa_pool_capacity * 66
+    assert md.sfa_cache_group_tables is cm.sfa_cache_group_tables
+    indexer_slots = map_sfa_indexer_slots(
+        md.sfa_cache_group_tables[0], updated.query_start_loc[1:], updated.seq_lens, updated.slot_mapping, 128
+    )
+    assert indexer_slots.tolist() == [-1, 10490 + 16384 + 512 * 128, *([-1] * 6)]
     if not reuse_topk:
         # A later valid pass must not inherit a false "ready" history from
         # the ignored draft, including when the generation is unchanged.

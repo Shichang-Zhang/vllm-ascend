@@ -80,6 +80,9 @@ def test_offload_migration_defaults_preserve_existing_modes():
     for kernel_options in ({"fused_op_type": "fused_copy_sfa"}, {"use_fused_overlap": True}):
         config = SparseKVOffloadConfig(make_config(), dict(enabled=True, host_backend="mooncake", **kernel_options))
         assert not config.delayed_d2h
+        assert not config.offload_shared_indexer_only
+        assert config.miss_onboard_mode == "inline"
+        assert not config.use_side_stream_onboard
 
 
 @pytest.mark.parametrize("connector", ["SfaRemoteD2HConnector", "MultiConnector"])
@@ -87,26 +90,49 @@ def test_disabled_migration_preserves_existing_non_mooncake_connectors(connector
     vllm_config = make_config()
     vllm_config.kv_transfer_config.kv_connector = connector
     vllm_config.kv_transfer_config.kv_connector_extra_config = {}
-    user_options = options(delayed_d2h=False)
+    user_options = options(delayed_d2h=False, offload_shared_indexer_only=False)
     user_options["host_backend"] = "memfabric"
     config = SparseKVOffloadConfig(vllm_config, user_options)
     assert config.use_fused_copy_sfa
     assert config.host_backend == "memfabric"
 
 
-@pytest.mark.parametrize("flag", ["delayed_d2h"])
+@pytest.mark.parametrize("delayed", [False, True])
+@pytest.mark.parametrize("shared,onboard", [(False, "inline"), (True, "inline"), (True, "side_stream")])
+def test_mtp3_migration_mode_combinations(delayed, shared, onboard):
+    config = SparseKVOffloadConfig(
+        make_config(drafts=3),
+        options(delayed_d2h=delayed, offload_shared_indexer_only=shared, miss_onboard_mode=onboard),
+    )
+    assert config.delayed_d2h == delayed
+    assert config.offload_shared_indexer_only == shared
+    assert config.use_side_stream_onboard == (onboard == "side_stream")
+
+
+@pytest.mark.parametrize("flag", ["delayed_d2h", "offload_shared_indexer_only"])
 @pytest.mark.parametrize("value,expected", [("false", False), ("true", True), (0, False), (1, True)])
 def test_migration_flags_use_central_boolean_parser(flag, value, expected):
     assert getattr(SparseKVOffloadConfig(make_config(), options(**{flag: value})), flag) is expected
 
 
-@pytest.mark.parametrize("flag", ["delayed_d2h"])
+@pytest.mark.parametrize("flag", ["delayed_d2h", "offload_shared_indexer_only"])
 def test_migration_rejects_unparsed_boolean_values(flag):
     with pytest.raises(ValueError, match=f"{flag} must be a boolean"):
         SparseKVOffloadConfig(make_config(), options(**{flag: "sometimes"}))
 
 
-@pytest.mark.parametrize("flag", ["delayed_d2h"])
+@pytest.mark.parametrize("onboard", [None, True, "async", "SIDE_STREAM"])
+def test_migration_rejects_unknown_onboard_mode(onboard):
+    with pytest.raises(ValueError, match="miss_onboard_mode must be"):
+        SparseKVOffloadConfig(make_config(), options(miss_onboard_mode=onboard))
+
+
+def test_side_stream_requires_shared_indexer_layers():
+    with pytest.raises(ValueError, match="requires offload_shared_indexer_only"):
+        SparseKVOffloadConfig(make_config(), options(miss_onboard_mode="side_stream"))
+
+
+@pytest.mark.parametrize("flag", ["delayed_d2h", "offload_shared_indexer_only"])
 @pytest.mark.parametrize("overrides", [{"enabled": False}, {"fused_op_type": "none"}])
 def test_migration_requires_enabled_copy_sfa(flag, overrides):
     user_options = options(**{flag: True})
@@ -115,13 +141,13 @@ def test_migration_requires_enabled_copy_sfa(flag, overrides):
         SparseKVOffloadConfig(make_config(), user_options)
 
 
-@pytest.mark.parametrize("flag", ["delayed_d2h"])
+@pytest.mark.parametrize("flag", ["delayed_d2h", "offload_shared_indexer_only"])
 def test_migration_requires_pd_decode(flag):
     with pytest.raises(ValueError, match="keep_device_kv_cache=false"):
         SparseKVOffloadConfig(make_config(), options(**{flag: True}, keep_device_kv_cache=True))
 
 
-@pytest.mark.parametrize("flag", ["delayed_d2h"])
+@pytest.mark.parametrize("flag", ["delayed_d2h", "offload_shared_indexer_only"])
 @pytest.mark.parametrize(
     "connector,dsa,backend",
     [

@@ -100,7 +100,11 @@ class DsaDecodeWorkerState:
             if receive.generation == 0 and receive.notify_only:
                 # The scheduler can cancel before allocating any destination
                 # blocks. This only tells P to release its send reservation.
-                if receive.main_host_block_ids or receive.indexer_hbm_block_ids:
+                if (
+                    receive.main_host_block_ids
+                    or receive.indexer_hbm_block_ids
+                    or any(group.block_ids for group in receive.destination_groups)
+                ):
                     raise RuntimeError("unallocated notification must not reference destination blocks")
                 continue
             lease = leases.get(receive.request_id)

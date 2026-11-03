@@ -1773,6 +1773,9 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         return attn_metadata.slot_mapping
 
+    def _get_sfa_indexer_metadata(self, attn_metadata: M) -> M:
+        return attn_metadata
+
     def _compose_sfa_kv_cache(self, kv_cache) -> tuple[torch.Tensor, ...] | None:
         """Compose split cache handles into the tuple expected by SFA kernels.
 
@@ -1862,6 +1865,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
         slot_mapping_sfa = self._get_sfa_kv_slot_mapping(attn_metadata)
+        indexer_metadata = self._get_sfa_indexer_metadata(attn_metadata) if self.has_indexer else attn_metadata
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
@@ -2011,7 +2015,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    slot_mapping.view(-1, 1),
+                    indexer_metadata.slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
             if self.enable_sparse_li_c8:
@@ -2029,7 +2033,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            slot_mapping.view(-1, 1),
+                            indexer_metadata.slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
         # Notify for every layer that wrote the cache, not just indexer layers:
@@ -2058,7 +2062,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 x=hidden_states,
                 q_c=q_c,
                 kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
+                attn_metadata=indexer_metadata,
                 cos=cos,
                 sin=sin,
                 actual_seq_lengths_query=actual_seq_lengths_query,

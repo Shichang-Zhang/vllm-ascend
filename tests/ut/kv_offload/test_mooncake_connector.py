@@ -1517,6 +1517,7 @@ class TestMetadataHandling(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
     def test_get_remote_metadata_success(self, mock_recv, mock_send):
+        self.test_metadata.dsa_protocol_version = 2
         mock_recv.return_value = msgspec.msgpack.encode(self.test_metadata)
 
         with (
@@ -1534,6 +1535,7 @@ class TestMetadataHandling(unittest.TestCase):
             mock_recv.assert_called_once_with(mock_socket, "host1:5555")
             self.assertEqual(self.thread.kv_caches_base_addr["remote_engine"][5555], [[0x3000], [0x4000]])
             self.assertEqual(self.thread.remote_block_stride_per_addr["remote_engine"][5555], [[1024]])
+            self.assertEqual(self.thread.remote_dsa_protocol_versions["remote_engine"][5555], 2)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
     @patch(
