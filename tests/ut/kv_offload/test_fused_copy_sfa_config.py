@@ -18,7 +18,11 @@ def make_config(*, topk=2048, drafts=0, block_size=128, max_model_len=32768, met
         ),
         cache_config=SimpleNamespace(block_size=block_size),
         speculative_config=SimpleNamespace(num_speculative_tokens=drafts, method=method) if drafts else None,
-        kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+        kv_transfer_config=SimpleNamespace(
+            is_kv_consumer=True,
+            kv_connector="MooncakeConnectorV1",
+            kv_connector_extra_config={"dsa_pd_offload": True},
+        ),
         use_v2_model_runner=False,
     )
 
@@ -70,3 +74,78 @@ def test_hot_budget_boundaries(hot):
     user_config = options()
     user_config["topk_buffer_size"] = hot
     assert SparseKVOffloadConfig.from_additional_config(make_config(), user_config).use_fused_copy_sfa
+
+
+def test_offload_migration_defaults_preserve_existing_modes():
+    for kernel_options in ({"fused_op_type": "fused_copy_sfa"}, {"use_fused_overlap": True}):
+        config = SparseKVOffloadConfig(make_config(), dict(enabled=True, host_backend="mooncake", **kernel_options))
+        assert not config.delayed_d2h
+
+
+@pytest.mark.parametrize("connector", ["SfaRemoteD2HConnector", "MultiConnector"])
+def test_disabled_migration_preserves_existing_non_mooncake_connectors(connector):
+    vllm_config = make_config()
+    vllm_config.kv_transfer_config.kv_connector = connector
+    vllm_config.kv_transfer_config.kv_connector_extra_config = {}
+    user_options = options(delayed_d2h=False)
+    user_options["host_backend"] = "memfabric"
+    config = SparseKVOffloadConfig(vllm_config, user_options)
+    assert config.use_fused_copy_sfa
+    assert config.host_backend == "memfabric"
+
+
+@pytest.mark.parametrize("flag", ["delayed_d2h"])
+@pytest.mark.parametrize("value,expected", [("false", False), ("true", True), (0, False), (1, True)])
+def test_migration_flags_use_central_boolean_parser(flag, value, expected):
+    assert getattr(SparseKVOffloadConfig(make_config(), options(**{flag: value})), flag) is expected
+
+
+@pytest.mark.parametrize("flag", ["delayed_d2h"])
+def test_migration_rejects_unparsed_boolean_values(flag):
+    with pytest.raises(ValueError, match=f"{flag} must be a boolean"):
+        SparseKVOffloadConfig(make_config(), options(**{flag: "sometimes"}))
+
+
+@pytest.mark.parametrize("flag", ["delayed_d2h"])
+@pytest.mark.parametrize("overrides", [{"enabled": False}, {"fused_op_type": "none"}])
+def test_migration_requires_enabled_copy_sfa(flag, overrides):
+    user_options = options(**{flag: True})
+    user_options.update(overrides)
+    with pytest.raises(ValueError, match="require sparse KV offload"):
+        SparseKVOffloadConfig(make_config(), user_options)
+
+
+@pytest.mark.parametrize("flag", ["delayed_d2h"])
+def test_migration_requires_pd_decode(flag):
+    with pytest.raises(ValueError, match="keep_device_kv_cache=false"):
+        SparseKVOffloadConfig(make_config(), options(**{flag: True}, keep_device_kv_cache=True))
+
+
+@pytest.mark.parametrize("flag", ["delayed_d2h"])
+@pytest.mark.parametrize(
+    "connector,dsa,backend",
+    [
+        ("SfaRemoteD2HConnector", True, "memfabric"),
+        ("MultiConnector", True, "mooncake"),
+        ("MooncakeConnectorV1", False, "mooncake"),
+        ("MooncakeConnectorV1", "true", "mooncake"),
+    ],
+)
+def test_migration_rejects_connectors_without_migrated_protocol(flag, connector, dsa, backend):
+    vllm_config = make_config()
+    vllm_config.kv_transfer_config.kv_connector = connector
+    vllm_config.kv_transfer_config.kv_connector_extra_config = {"dsa_pd_offload": dsa}
+    user_options = options(**{flag: True})
+    user_options["host_backend"] = backend
+    with pytest.raises(ValueError, match="require host_backend='mooncake'"):
+        SparseKVOffloadConfig(vllm_config, user_options)
+
+
+def test_actual_overlap_config_requires_larger_budget_for_copy_sfa_mtp3():
+    config = make_config(drafts=3)
+    existing = dict(enabled=True, use_fused_overlap=True, host_backend="mooncake", topk_buffer_size=4096)
+    assert SparseKVOffloadConfig(config, existing).topk_buffer_size == 4096
+    copy_sfa = dict(existing, use_fused_overlap=False, fused_op_type="fused_copy_sfa", delayed_d2h=True)
+    with pytest.raises(ValueError, match="hot budget"):
+        SparseKVOffloadConfig(config, copy_sfa)
+    assert SparseKVOffloadConfig(config, dict(copy_sfa, topk_buffer_size=8192)).topk_buffer_size == 8192

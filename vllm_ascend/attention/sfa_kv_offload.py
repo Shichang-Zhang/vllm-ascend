@@ -173,6 +173,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         )
         cfg = get_ascend_config().sparse_kv_offload_config
         self.use_fused_copy_sfa = getattr(cfg, "use_fused_copy_sfa", False) is True
+        self.delayed_d2h = getattr(cfg, "delayed_d2h", False) is True
         if self.use_fused_copy_sfa:
             self._init_copy_sfa_metadata_buffers(vllm_config, device)
         kv_transfer_config = vllm_config.kv_transfer_config
@@ -198,16 +199,19 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         self.copy_sfa_stride_blocks = cfg.topk_buffer_size // 128 + 2
         self.copy_sfa_blocks = torch.arange(self.copy_sfa_stride_blocks, dtype=torch.int32, device=device)
         self.copy_sfa_parts = torch.arange(2, dtype=torch.int64, device=device)
+        self.copy_sfa_dummy_pools = torch.arange(requests, dtype=torch.int32, device=device) + requests
         # CPU-owned layout uses persistent pinned storage. Each target/draft
         # step has distinct storage: later metadata builds precede execution.
         host_fields = {
             "query_ends": (requests, torch.int32),
+            "query_starts": (requests, torch.int64),
             "widths": (requests, torch.int32),
             "pool_entries": (requests, torch.int32),
             "pool_indices": (requests, torch.int64),
             "block_bases": (requests, torch.int32),
             "active": (requests, torch.bool),
             "generation_match": (requests, torch.bool),
+            "stable_prefixes": (requests, torch.int32),
             "token_rows": (tokens, torch.int64),
             "token_offsets": (tokens, torch.int64),
             "token_active": (tokens, torch.bool),
@@ -314,13 +318,43 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         widths = upload("widths", widths_np)
         active = upload("active", active_np)
         pools = upload("pool_entries", pools_np)
+        guard_device_slots = getattr(self, "delayed_d2h", False)
+        if guard_device_slots:
+            # The proposer disables drafts beyond max_model_len on device.
+            # Respect that mask without reading device lengths on the CPU.
+            # Such rows must neither consume a long Host prefix nor write
+            # their clamped position zero into a real resident request row.
+            if metadata.slot_mapping.numel():
+                starts = upload("query_starts", starts_np.clip(max=metadata.slot_mapping.numel() - 1))
+                active.logical_and_(metadata.slot_mapping[starts] >= 0)
+            else:
+                active.zero_()
+            pools.copy_(torch.where(active, pools, self.copy_sfa_dummy_pools[:count]))
         metadata.copy_sfa_query_ends = ends
         metadata.copy_sfa_pool_entries = pools
         metadata.copy_sfa_prefill_pool_slots = pools
         # Compute row geometry once; LIM state and attention consume the same
         # values. CPU seq_lens may still be optimistic after MTP rejection.
         seq_lens = torch.where(active, common_attn_metadata.seq_lens[:count], widths)
-        prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
+        if getattr(self, "delayed_d2h", False):
+            stable = common_attn_metadata.req_topk_buffer_stable_prefixes
+            if stable is None:
+                if not common_attn_metadata.offload_dummy:
+                    raise RuntimeError("delayed D2H requires a completed Host prefix for every request")
+                stable_np = np.zeros(count, dtype=np.int32)
+            else:
+                if stable.device.type != "cpu" or stable.dtype not in (torch.int32, torch.int64):
+                    raise ValueError("delayed D2H stable prefixes must be CPU integer tensors")
+                if stable.ndim != 1 or stable.numel() < count:
+                    raise ValueError("delayed D2H stable prefixes must match the request count")
+                stable_np = stable[:count].numpy()
+                if np.any(
+                    active_np & ((stable_np < 0) | (stable_np % 128 != 0) | (stable_np > np.iinfo(np.int32).max))
+                ):
+                    raise ValueError("delayed D2H active prefixes must be nonnegative aligned int32 values")
+            prefix = torch.where(active, upload("stable_prefixes", np.where(active_np, stable_np, 0)), 0)
+        else:
+            prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
         is_short = prefix < self.copy_sfa_hot_tokens
         cache = torch.where(active, torch.where(is_short, 0, prefix.clamp_max(self.copy_sfa_hot_tokens)), 2048)
         logical = torch.where(active, torch.where(is_short, seq_lens, cache + seq_lens - prefix), 0)
@@ -348,7 +382,11 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             state.copy_(torch.where(active, torch.where(is_short, -3, torch.where(ready, -1, -2)), -3))
             self.lim_last_generation[bank, pools_np] = generations_np
             self.lim_last_prefix[bank].scatter_(0, pool_indices, prefix)
-            self.lim_last_cache[bank].scatter_(0, pool_indices, cache)
+            # CPU generation history cannot observe device-only ignored
+            # drafts. Invalidate their device history so a later valid pass
+            # performs a cold fill instead of trusting unwritten residency.
+            history_cache = torch.where(active, cache, -1) if guard_device_slots else cache
+            self.lim_last_cache[bank].scatter_(0, pool_indices, history_cache)
         metadata.lim_request_state = state
         if draft_index == 0:
             buffer = self.copy_sfa_vectors["reuse_logical_lens"][step, :count]
@@ -357,7 +395,11 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
 
         cache_blocks = cache[:, None] // 128
         blocks = self.copy_sfa_blocks[None, :]
-        physical = upload("block_bases", pools_np * self.copy_sfa_stride_blocks)[:, None]
+        physical = (
+            pools * self.copy_sfa_stride_blocks
+            if guard_device_slots
+            else upload("block_bases", pools_np * self.copy_sfa_stride_blocks)
+        )[:, None]
         ring_blocks = self.copy_sfa_stride_blocks - 2 + (prefix[:, None] // 128 + blocks - cache_blocks) % 2
         self.copy_sfa_hbm_block_table[step, :count].copy_(
             physical + torch.where(is_short[:, None] | (blocks < cache_blocks), blocks, ring_blocks)
@@ -405,10 +447,19 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         token_active_np = active_np[rows_np] & (positions_np < ends_np[-1])
         token_active = upload("token_active", token_active_np)
         token_invalid = upload("token_invalid", ~token_active_np)
+        if guard_device_slots:
+            token_active.logical_and_(active[token_rows])
+            token_invalid.copy_(~token_active)
         metadata.slot_mapping.masked_fill_(token_invalid[: metadata.slot_mapping.numel()], -1)
         logical_positions = seq_lens[token_rows] - widths[token_rows] + token_offsets
         token_pools_np = np.where(token_active_np, pools_np[rows_np], self.copy_sfa_pool_capacity + rows_np)
-        row_base = upload("token_bases", token_pools_np * self.copy_sfa_stride_blocks * 128)
+        row_base = (
+            torch.where(token_active, pools[token_rows], self.copy_sfa_dummy_pools[token_rows]).to(torch.int64)
+            * self.copy_sfa_stride_blocks
+            * 128
+            if guard_device_slots
+            else upload("token_bases", token_pools_np * self.copy_sfa_stride_blocks * 128)
+        )
         self.copy_sfa_device_slots[step, :tokens].copy_(
             row_base
             + torch.where(
@@ -499,6 +550,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         offload_cfg = get_ascend_config().sparse_kv_offload_config
         self.use_fused_overlap = offload_cfg.use_fused_overlap
         self.use_fused_copy_sfa = getattr(offload_cfg, "use_fused_copy_sfa", False) is True
+        self.delayed_d2h = getattr(offload_cfg, "delayed_d2h", False) is True
         self.lim_indexer_owner = self
         self._copy_sfa_metadata: AscendSFAOffloadMetadata | None = None
         if self.use_fused_copy_sfa:
@@ -789,6 +841,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             # saved C budget.
             cache_tokens = self.copy_sfa_reuse_cache_tokens[:count]
             logical_lens = self.copy_sfa_reuse_logical_lens[:count]  # exact saved selection; no extra tail
+            if getattr(self, "delayed_d2h", False):
+                # An ignored max-length draft keeps the saved selection for
+                # later valid steps but does no attention on its dummy row.
+                logical_lens = torch.where(metadata.copy_sfa_logical_lens > 0, logical_lens, 0)
             topk_misses = self.lim_reuse_topk_misses[:tokens]
             misses = self.lim_reuse_misses[:count]
         else:
@@ -919,6 +975,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 ):
                     rows = cache_tensor.view(-1, cache_tensor.shape[-1])
                     rows.index_copy_(0, device_slots[: value.shape[0]], value.reshape(value.shape[0], -1))
+                if getattr(self, "delayed_d2h", False):
+                    # Keep both target and draft writes in their resident
+                    # dense/tail rows. The executor copies completed blocks
+                    # once, outside graph capture, after the final writer.
+                    return k_pe, k_nope
             if self.use_fused_copy_sfa and manager.sparse_kv_offload_config.keep_device_kv_cache:
                 # Mixed fallback recovers tails from this paged cache. Keep
                 # pure-decode writes there too, so it never reads stale KV.

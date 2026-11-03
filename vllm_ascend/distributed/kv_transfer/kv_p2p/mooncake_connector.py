@@ -82,6 +82,8 @@ from vllm_ascend.utils import (
     model_uses_sfa_sparse,
 )
 
+from .mooncake_dsa_decode_worker import DsaDecodeWorkerState
+from .mooncake_dsa_lifecycle import DsaDecodeLedger
 from .mooncake_dsa_metadata import (
     DsaConnectorMetadata,
     DsaLocalResult,
@@ -956,6 +958,7 @@ class KVCacheRecvingThread(threading.Thread):
                         self.tp_rank,
                         DsaLocalResultKind.TRANSFER_FAILED if failed else DsaLocalResultKind.RECEIVE_COMPLETE,
                         phase if failed else None,
+                        generation=command.generation,
                     )
                 )
             self.request_queue.task_done()
@@ -1931,6 +1934,7 @@ class _DsaSchedulerRequest:
     source: RemoteSource
     num_computed_tokens: int
     num_external_tokens: int
+    generation: int = 0
     main_block_ids: tuple[int, ...] = ()
     indexer_hbm_block_ids: tuple[int, ...] = ()
     command_emitted: bool = False
@@ -1942,6 +1946,8 @@ class _DsaSchedulerRequest:
 
 class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
     """Build one-shot blockwise Mooncake receives for Decode workers."""
+
+    _decode_ledger: DsaDecodeLedger | None = None
 
     def __init__(
         self,
@@ -1957,12 +1963,19 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
         if self._dsa_prefill_tp_size <= 0:
             raise ValueError("Blockwise DSA requires kv_connector_extra_config.prefill.tp_size")
         self._expected_tp_ranks = frozenset(range(vllm_config.parallel_config.tensor_parallel_size))
+        self._dsa_cached_prefixes: dict[str, int] = {}
+        if getattr(get_ascend_config().sparse_kv_offload_config, "delayed_d2h", False) is True:
+            self._decode_ledger = DsaDecodeLedger(
+                tp_size=vllm_config.parallel_config.tensor_parallel_size, block_size=self._main_block_size
+            )
 
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
+        if self._decode_ledger is not None and self._decode_ledger.generation(request.request_id) is None:
+            self._dsa_cached_prefixes[request.request_id] = num_computed_tokens
         existing = self._dsa_requests.get(request.request_id)
         if existing is not None:
             return existing.num_external_tokens, existing.num_external_tokens > 0
@@ -2036,6 +2049,14 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
         num_external_tokens: int,
     ) -> None:
         tracker = self._dsa_requests.get(request.request_id)
+        if self._decode_ledger is not None:
+            generation = self._decode_ledger.allocate(
+                request.request_id,
+                host_ready_tokens=self._dsa_cached_prefixes.pop(request.request_id, request.num_computed_tokens),
+                receive_pending=tracker is not None and num_external_tokens > 0,
+            )
+            if tracker is not None:
+                tracker.generation = generation
         if tracker is None:
             return
         groups = tuple(tuple(group) for group in blocks.get_block_ids())
@@ -2092,6 +2113,7 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
                     indexer_hbm_block_ids=tracker.indexer_hbm_block_ids,
                     invalid_block_ids=tracker.invalid_block_ids,
                     notify_only=tracker.notify_only,
+                    generation=tracker.generation,
                 )
             )
             tracker.command_emitted = True
@@ -2100,10 +2122,17 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
                 self._dsa_requests.pop(command.request_id, None)
         cancelled = tuple(getattr(self, "_dsa_cancelled", ()))
         self._dsa_cancelled = set()
-        return DsaConnectorMetadata(tuple(requests), cancelled)
+        decode_commands = self._decode_ledger.build_commands() if self._decode_ledger is not None else ()
+        return DsaConnectorMetadata(tuple(requests), cancelled, decode_commands)
 
     def update_connector_output(self, connector_output: Any) -> None:
         metadata = connector_output.kv_connector_worker_meta
+        if self._decode_ledger is not None:
+            # Raw receive/send notifications carry no generation and cannot
+            # release a delayed-D2H lifetime. Rebuild them from typed TP
+            # acknowledgements below; receive and decode terminal differ.
+            connector_output.finished_recving = set()
+            connector_output.finished_sending = set()
         if metadata is None:
             return
         if not isinstance(metadata, DsaWorkerResultMetadata):
@@ -2116,6 +2145,10 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
                     "Ignoring DSA result for released request %r",
                     result.request_id,
                 )
+                continue
+            if result.generation != tracker.generation:
+                if result.generation > tracker.generation:
+                    raise ValueError("DSA receive result generation is ahead of the current owner")
                 continue
             if result.tp_rank not in self._expected_tp_ranks:
                 raise ValueError(f"illegal Decode TP rank {result.tp_rank}")
@@ -2143,10 +2176,38 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
             completed.append(result.request_id)
         if completed:
             finished = set(connector_output.finished_recving or ())
-            finished.update(completed)
+            if self._decode_ledger is None:
+                finished.update(completed)
+            else:
+                for request_id in completed:
+                    tracker = self._dsa_requests[request_id]
+                    self._decode_ledger.receive_finished(
+                        request_id,
+                        tracker.generation,
+                        host_ready_tokens=tracker.num_computed_tokens + tracker.source.num_external_tokens,
+                        success=all(
+                            result.kind is DsaLocalResultKind.RECEIVE_COMPLETE
+                            for result in tracker.results_by_rank.values()
+                        ),
+                    )
+                    if not self._decode_ledger.is_terminal(request_id):
+                        finished.add(request_id)
             connector_output.finished_recving = finished
             for request_id in completed:
                 self._dsa_requests.pop(request_id, None)
+        if self._decode_ledger is not None:
+            self._decode_ledger.apply_results(metadata.decode_results)
+            connector_output.finished_sending = self._decode_ledger.take_released()
+
+    @property
+    def delayed_d2h_enabled(self) -> bool:
+        return self._decode_ledger is not None
+
+    def get_completed_host_prefix(self, request_id: str) -> int | None:
+        return self._decode_ledger.completed_prefix(request_id) if self._decode_ledger is not None else None
+
+    def owns_decode_blocks(self, request_id: str) -> bool:
+        return self._decode_ledger is not None and self._decode_ledger.generation(request_id) is not None
 
     def set_xfer_handshake_metadata(
         self,
@@ -2166,18 +2227,24 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
         block_ids: Any,
     ) -> tuple[bool, dict[str, Any] | None]:
         del block_ids
+        hold_decode = False
+        if self._decode_ledger is not None:
+            self._dsa_cached_prefixes.pop(request.request_id, None)
+            hold_decode = self._decode_ledger.request_release(request.request_id)
         tracker = self._dsa_requests.get(request.request_id)
         if tracker is None and (request.kv_transfer_params or {}).get("do_remote_prefill"):
             self.get_num_new_matched_tokens(request, len(request.prompt_token_ids or ()))
             tracker = self._dsa_requests[request.request_id]
+            if self._decode_ledger is not None:
+                self._dsa_cached_prefixes.pop(request.request_id, None)
         if tracker is None:
-            return False, None
+            return hold_decode, None
         if not tracker.allocated:
             tracker.allocated = True
             tracker.notify_only = True
             request.kv_transfer_params["do_remote_prefill"] = False
             logger.debug("DSA scheduler marked request=%s notify_only before allocation", request.request_id)
-            return False, None
+            return hold_decode, None
         if not hasattr(self, "_dsa_cancelled"):
             self._dsa_cancelled = set()
         self._dsa_cancelled.add(request.request_id)
@@ -2186,7 +2253,7 @@ class _MooncakeDsaDecodeScheduler(SFAPDRD2HScheduler):
             request.request_id,
             tracker.notify_only,
         )
-        return not tracker.notify_only, None
+        return hold_decode or not tracker.notify_only, None
 
 
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
@@ -2257,6 +2324,23 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         if isinstance(self.connector_scheduler, _MooncakeDsaDecodeScheduler):
             self.connector_scheduler.update_connector_output(connector_output)
 
+    @property
+    def delayed_d2h_enabled(self) -> bool:
+        return (
+            isinstance(self.connector_scheduler, _MooncakeDsaDecodeScheduler)
+            and self.connector_scheduler.delayed_d2h_enabled
+        )
+
+    def get_completed_host_prefix(self, request_id: str) -> int | None:
+        if isinstance(self.connector_scheduler, _MooncakeDsaDecodeScheduler):
+            return self.connector_scheduler.get_completed_host_prefix(request_id)
+        return None
+
+    def owns_decode_blocks(self, request_id: str) -> bool:
+        return isinstance(
+            self.connector_scheduler, _MooncakeDsaDecodeScheduler
+        ) and self.connector_scheduler.owns_decode_blocks(request_id)
+
     def request_finished(
         self,
         request: "Request",
@@ -2297,6 +2381,14 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
+
+    def prepare_delayed_decode_step(self, metadata: DsaConnectorMetadata) -> DsaDecodeWorkerState:
+        if not self._dsa_decode or self.connector_worker is None or not isinstance(metadata, DsaConnectorMetadata):
+            raise RuntimeError("delayed D2H requires a Mooncake DSA Decode worker")
+        state = self.connector_worker.prepare_decode_step(metadata)
+        if state is None:
+            raise RuntimeError("Mooncake worker has no delayed D2H ownership state")
+        return state
 
     def build_connector_worker_meta(
         self,
@@ -2851,12 +2943,18 @@ class MooncakeConnectorWorker:
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
         self._dsa_pd_offload = vllm_config.kv_transfer_config.get_from_extra_config("dsa_pd_offload", False)
         self._dsa_decode = self._dsa_pd_offload and self.kv_role == "kv_consumer"
+        self._dsa_decode_state: DsaDecodeWorkerState | None = None
         if self._dsa_decode:
             self._dsa_active_commands: dict[str, DsaStepRequest] = {}
             self._dsa_cancel_events: dict[str, threading.Event] = {}
             self._dsa_results: queue.SimpleQueue[DsaLocalResult] = queue.SimpleQueue()
             self._dsa_dispatch_lock = threading.Lock()
             self._closing = False
+            if getattr(get_ascend_config().sparse_kv_offload_config, "delayed_d2h", False) is True:
+                self._dsa_decode_state = DsaDecodeWorkerState(tp_rank=self.tp_rank, block_size=self.block_size)
+                self._dsa_decode_receives: queue.SimpleQueue[tuple[DsaStepRequest, DsaLocalResult]] = (
+                    queue.SimpleQueue()
+                )
             logger.debug(
                 "DSA worker enabled engine=%s decode_rank=%s/%s prefill_topology=(tp=%s,pp=%s) "
                 "local_context_parallel=(pcp=%s,dcp=%s)",
@@ -4465,8 +4563,11 @@ class MooncakeConnectorWorker:
     ):
         """Start loading KV blocks from remote engine."""
         if isinstance(metadata, DsaConnectorMetadata):
+            decode_state = self.prepare_decode_step(metadata)
             scheduled_ids = {command.request_id for command in metadata.requests}
             for request_id in metadata.cancelled_requests:
+                if decode_state is not None and not decode_state.is_terminal(request_id):
+                    continue
                 if request_id in self._dsa_active_commands or request_id in scheduled_ids:
                     self._dsa_cancel_events.setdefault(request_id, threading.Event()).set()
             self._dispatch_dsa_commands(metadata.requests)
@@ -4576,6 +4677,8 @@ class MooncakeConnectorWorker:
         if self._dsa_decode:
             with self._dsa_dispatch_lock:
                 self._closing = True
+        decode_state = getattr(self, "_dsa_decode_state", None)
+        drained = False
         try:
             if self.kv_send_thread is not None:
                 self.kv_send_thread.stop()
@@ -4585,8 +4688,17 @@ class MooncakeConnectorWorker:
                 self.kv_recv_thread.request_queue.put(None)
                 self.kv_recv_thread.join()
                 self.kv_recv_thread.executor.shutdown(wait=True)
+            if decode_state is not None:
+                manager = get_sparse_kv_offload_manager()
+                runtime = manager.delayed_d2h_runtime
+                if runtime is not None:
+                    runtime.close()
+            drained = True
         finally:
-            global_te.unregister_buffer()
+            # A failed drain cannot invalidate registered memory that a
+            # transfer, D2H or model stream may still access.
+            if decode_state is None or drained:
+                global_te.unregister_buffer()
 
     def _plan_dsa_endpoints(self, command: DsaStepRequest):
         """Adapt ordinary source participants; writer filtering cannot remove tasks."""
@@ -4657,6 +4769,9 @@ class MooncakeConnectorWorker:
 
     def _enqueue_dsa_commands(self, commands: tuple[DsaStepRequest, ...]) -> None:
         for command in commands:
+            state = getattr(self, "_dsa_decode_state", None)
+            if state is not None and not state.should_dispatch_receive(command):
+                continue
             existing = self._dsa_active_commands.get(command.request_id)
             if existing is not None:
                 if existing != command:
@@ -4671,6 +4786,8 @@ class MooncakeConnectorWorker:
                     command.notify_only,
                     len(plan),
                 )
+            if state is not None:
+                state.claim_receive(command)
             self._dsa_active_commands[command.request_id] = command
             cancelled = self._dsa_cancel_events.setdefault(command.request_id, threading.Event())
             for index, (rank, cp_rank, pp_rank, indexer, expected, task_index) in enumerate(plan):
@@ -4696,21 +4813,49 @@ class MooncakeConnectorWorker:
             return
         self._dsa_active_commands.pop(command.request_id, None)
         self._dsa_cancel_events.pop(command.request_id, None)
+        if getattr(self, "_dsa_decode_state", None) is not None:
+            # Only queue from the receive thread. The execution thread owns
+            # residency, completion publication and decode release state.
+            self._dsa_decode_receives.put((command, result))
         if not command.notify_only:
             self._dsa_results.put(result)
+
+    def _drain_decode_receives(self) -> None:
+        state = getattr(self, "_dsa_decode_state", None)
+        if state is None:
+            return
+        while True:
+            try:
+                command, result = self._dsa_decode_receives.get_nowait()
+            except queue.Empty:
+                break
+            state.receive_finished(command, result)
+
+    def prepare_decode_step(self, metadata: DsaConnectorMetadata) -> DsaDecodeWorkerState | None:
+        """Register ownership before runner metadata construction or receive dispatch."""
+        state = getattr(self, "_dsa_decode_state", None)
+        if state is not None:
+            state.apply_metadata(metadata)
+            self._drain_decode_receives()
+        elif metadata.decode_commands:
+            raise RuntimeError("decode lifecycle commands require delayed D2H on every worker")
+        return state
 
     def build_connector_worker_meta(
         self,
     ) -> DsaWorkerResultMetadata | None:
+        self._drain_decode_receives()
+        state = getattr(self, "_dsa_decode_state", None)
+        decode_results = state.take_results() if state is not None else ()
         results: list[DsaLocalResult] = []
         while True:
             try:
                 results.append(self._dsa_results.get_nowait())
             except queue.Empty:
                 break
-        if not results:
+        if not results and not decode_results:
             return None
-        return DsaWorkerResultMetadata(tuple(results))
+        return DsaWorkerResultMetadata(tuple(results), decode_results)
 
     def _get_tp_num_need_pulls(self, prefill_tp_size: int | None) -> int:
         if prefill_tp_size is None:

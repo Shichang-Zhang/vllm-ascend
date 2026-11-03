@@ -26,6 +26,12 @@ class DsaTransferPhase(str, Enum):
     MAIN_D2RH = "main_d2rh"
 
 
+class DsaDecodeResultKind(str, Enum):
+    PREFIX_READY = "prefix_ready"
+    RELEASE_COMPLETE = "release_complete"
+    FAILED = "failed"
+
+
 def _require_nonempty_string(name: str, value: object) -> None:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a string")
@@ -135,9 +141,11 @@ class DsaStepRequest:
     indexer_hbm_block_ids: tuple[int, ...]
     invalid_block_ids: tuple[int, ...] = ()
     notify_only: bool = False
+    generation: int = 0
 
     def __post_init__(self) -> None:
         _require_nonempty_string("request_id", self.request_id)
+        _require_nonnegative_integer("generation", self.generation)
         if not isinstance(self.source, RemoteSource):
             raise TypeError("source must be RemoteSource")
         if not isinstance(self.notify_only, bool):
@@ -162,11 +170,31 @@ class DsaStepRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class DsaDecodeCommand:
+    """Register or release one decode lifetime, independently of PD receive."""
+
+    request_id: str
+    generation: int
+    host_ready_tokens: int = 0
+    release: bool = False
+
+    def __post_init__(self) -> None:
+        _require_nonempty_string("request_id", self.request_id)
+        _require_nonnegative_integer("generation", self.generation)
+        _require_nonnegative_integer("host_ready_tokens", self.host_ready_tokens)
+        if self.generation == 0:
+            raise ValueError("decode lifetime generation must be positive")
+        if not isinstance(self.release, bool):
+            raise TypeError("release must be bool")
+
+
+@dataclass(frozen=True, slots=True)
 class DsaConnectorMetadata(KVConnectorMetadata):
     """One-shot receive requests issued to Decode workers."""
 
     requests: tuple[DsaStepRequest, ...] = ()
     cancelled_requests: tuple[str, ...] = ()
+    decode_commands: tuple[DsaDecodeCommand, ...] = ()
 
     def __post_init__(self) -> None:
         requests_by_id: dict[str, DsaStepRequest] = {}
@@ -182,6 +210,15 @@ class DsaConnectorMetadata(KVConnectorMetadata):
             "requests",
             tuple(requests_by_id[key] for key in sorted(requests_by_id)),
         )
+        commands = {}
+        for command in self.decode_commands:
+            if not isinstance(command, DsaDecodeCommand):
+                raise TypeError("decode_commands must contain DsaDecodeCommand values")
+            key = (command.request_id, command.generation, command.release)
+            if key in commands and commands[key] != command:
+                raise ValueError(f"conflicting decode command for {key}")
+            commands[key] = command
+        object.__setattr__(self, "decode_commands", tuple(commands[key] for key in sorted(commands)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,10 +227,12 @@ class DsaLocalResult:
     tp_rank: int
     kind: DsaLocalResultKind
     failure_phase: DsaTransferPhase | None = None
+    generation: int = 0
 
     def __post_init__(self) -> None:
         _require_nonempty_string("request_id", self.request_id)
         _require_nonnegative_integer("tp_rank", self.tp_rank)
+        _require_nonnegative_integer("generation", self.generation)
         if not isinstance(self.kind, DsaLocalResultKind):
             raise TypeError("kind must be DsaLocalResultKind")
         if self.failure_phase is not None and not isinstance(
@@ -207,14 +246,14 @@ class DsaLocalResult:
             raise ValueError("RECEIVE_COMPLETE must not carry a failure phase")
 
     @property
-    def identity(self) -> tuple[str, int]:
-        return self.request_id, self.tp_rank
+    def identity(self) -> tuple[str, int, int]:
+        return self.request_id, self.generation, self.tp_rank
 
 
 def _merge_results(
     groups: Iterable[Iterable[DsaLocalResult]],
 ) -> tuple[DsaLocalResult, ...]:
-    merged: dict[tuple[str, int], DsaLocalResult] = {}
+    merged: dict[tuple[str, int, int], DsaLocalResult] = {}
     for results in groups:
         for result in results:
             if not isinstance(result, DsaLocalResult):
@@ -227,10 +266,53 @@ def _merge_results(
 
 
 @dataclass(frozen=True, slots=True)
+class DsaDecodeResult:
+    """A TP rank's Host frontier or drained decode release acknowledgement."""
+
+    request_id: str
+    generation: int
+    tp_rank: int
+    kind: DsaDecodeResultKind
+    stable_prefix: int
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_nonempty_string("request_id", self.request_id)
+        for name in ("generation", "tp_rank", "stable_prefix"):
+            _require_nonnegative_integer(name, getattr(self, name))
+        if self.generation == 0:
+            raise ValueError("decode lifetime generation must be positive")
+        if not isinstance(self.kind, DsaDecodeResultKind):
+            raise TypeError("kind must be DsaDecodeResultKind")
+        if self.kind is DsaDecodeResultKind.FAILED:
+            _require_nonempty_string("error", self.error)
+        elif self.error is not None:
+            raise ValueError("successful decode results must not carry an error")
+
+    @property
+    def identity(self) -> tuple[str, int, int, DsaDecodeResultKind]:
+        return self.request_id, self.generation, self.tp_rank, self.kind
+
+
+def _merge_decode_results(groups: Iterable[Iterable[DsaDecodeResult]]) -> tuple[DsaDecodeResult, ...]:
+    merged = {}
+    for results in groups:
+        for result in results:
+            if not isinstance(result, DsaDecodeResult):
+                raise TypeError("decode_results must contain DsaDecodeResult values")
+            previous = merged.get(result.identity)
+            if previous is not None and previous != result:
+                raise ValueError(f"conflicting decode result for {result.identity}")
+            merged[result.identity] = result
+    return tuple(merged[key] for key in sorted(merged))
+
+
+@dataclass(frozen=True, slots=True)
 class DsaWorkerResultMetadata(KVConnectorWorkerMetadata):
     """Rank-aware completion results for one-shot PD receives."""
 
     results: tuple[DsaLocalResult, ...] = ()
+    decode_results: tuple[DsaDecodeResult, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -238,6 +320,7 @@ class DsaWorkerResultMetadata(KVConnectorWorkerMetadata):
             "results",
             _merge_results((self.results,)),
         )
+        object.__setattr__(self, "decode_results", _merge_decode_results((self.decode_results,)))
 
     def aggregate(
         self,
@@ -245,4 +328,7 @@ class DsaWorkerResultMetadata(KVConnectorWorkerMetadata):
     ) -> DsaWorkerResultMetadata:
         if not isinstance(other, DsaWorkerResultMetadata):
             raise TypeError("aggregate expects DsaWorkerResultMetadata")
-        return DsaWorkerResultMetadata(_merge_results((self.results, other.results)))
+        return DsaWorkerResultMetadata(
+            _merge_results((self.results, other.results)),
+            _merge_decode_results((self.decode_results, other.decode_results)),
+        )

@@ -40,6 +40,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_ascend.core.mooncake_decode_cache_guard import install_mooncake_decode_cache_guard
+
 
 def _requires_kv_delivery(connector: KVConnectorBase_V1) -> bool:
     """Match the producer-role default introduced by vLLM #50297."""
@@ -78,6 +80,7 @@ class KVDeliveryScheduler(Scheduler):
             log_stats,
         )
         self.requires_kv_delivery = bool(self.connector is not None and self.connector.requires_kv_delivery)
+        install_mooncake_decode_cache_guard(self)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1

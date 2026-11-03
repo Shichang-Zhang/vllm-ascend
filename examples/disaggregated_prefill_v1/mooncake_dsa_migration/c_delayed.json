@@ -1,0 +1,22 @@
+{
+  "enable_fused_mc2": 1,
+  "recompute_scheduler_enable": true,
+  "enable_mlapo": false,
+  "enable_sparse_li_c8": true,
+  "ascend_compilation_config": {
+    "enable_npugraph_ex": true,
+    "fuse_muls_add": true
+  },
+  "mega_moe_max_tokens": 131072,
+  "sparse_kv_offload_config": {
+    "enabled": true,
+    "use_fused_overlap": false,
+    "fused_op_type": "fused_copy_sfa",
+    "topk_buffer_size": 8192,
+    "dram_size_per_dp_GB": 100,
+    "host_backend": "mooncake",
+    "keep_device_kv_cache": false,
+    "lru_max_threads": 16,
+    "delayed_d2h": true
+  }
+}

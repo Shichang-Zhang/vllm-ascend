@@ -11,6 +11,7 @@ from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import msgspec
+import pytest
 import torch
 import zmq
 from vllm.utils.network_utils import make_zmq_path
@@ -80,8 +81,19 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     zmq_ctx,
 )
 
+# Retain the module instances used by the classes above. When other tests
+# imported Mooncake first, restoring their modules changes string-based mock
+# targets; bind this file's isolated modules only while its tests execute.
+_TEST_MODULE_BINDINGS = tuple((name, sys.modules[name]) for name in _saved_modules if name in sys.modules)
 for _k, _v in _saved_modules.items():
     sys.modules[_k] = _v
+
+
+@pytest.fixture(autouse=True)
+def _bind_isolated_test_modules(monkeypatch):
+    for name, module in _TEST_MODULE_BINDINGS:
+        monkeypatch.setitem(sys.modules, name, module)
+
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"

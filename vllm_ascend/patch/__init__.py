@@ -82,6 +82,21 @@
 #    Future Plan:
 #       Remove this patch when the supported vLLM version includes both PRs.
 #
+#   4. `KVDeliveryScheduler.__init__` and its sync/async recompute subclasses
+#    Why:
+#       Mooncake delayed D2H can complete after tokens become computed. APC
+#       must not publish unwritten Host blocks, and preemption must not free
+#       blocks still owned by the decode lifetime.
+#    How:
+#       Install an instance-level MooncakeDecodeCacheGuard on the coordinator
+#       only when delayed D2H is enabled. Bound cache_blocks by the completed
+#       Host prefix; require decode release acknowledgement before free/pop.
+#    Related PR (if no, explain why):
+#       Ascend PR #20289 adapted to this branch's MooncakeConnectorV1 lifetime.
+#    Future Plan:
+#       Replace this hook when upstream KVCacheManager supports connector-owned
+#       publication and release fences, including allocate_slots and preemption.
+#
 # ** 2. File: platform/patch_camem_allocator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.model.is_cumem_allocator_available`

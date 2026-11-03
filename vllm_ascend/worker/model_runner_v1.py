@@ -603,6 +603,7 @@ class NPUModelRunner(GPUModelRunner):
         self.sparse_kv_offload_config = self.ascend_config.sparse_kv_offload_config
         self.sparse_kv_offload_enabled = self.sparse_kv_offload_config.enabled
         self.sparse_kv_offload_manager = None
+        self._delayed_d2h_runtime = None
         self.tp_rank = get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
 
         # Per-request metadata consumed by the Sparse KV offload resident LRU.
@@ -610,6 +611,7 @@ class NPUModelRunner(GPUModelRunner):
         self._offload_token_to_req = None
         self._offload_pool_slots = None
         self._offload_pool_generations = None
+        self._offload_stable_prefixes = None
         self._offload_request_slots: dict[str, int] = {}
         self._offload_slot_generation = 0
         self._offload_slot_generations: dict[int, int] = {}
@@ -621,6 +623,9 @@ class NPUModelRunner(GPUModelRunner):
             if self.sparse_kv_offload_config.use_fused_copy_sfa:
                 self._offload_pool_slots = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int32)
                 self._offload_pool_generations = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int64)
+                if getattr(self.sparse_kv_offload_config, "delayed_d2h", False) is True:
+                    self._offload_stable_prefixes = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int32)
+                    self._offload_stable_prefixes.np.fill(-1)
 
     @property
     def use_dcp(self) -> bool:
@@ -1177,6 +1182,20 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+
+        delayed_runtime = getattr(self, "_delayed_d2h_runtime", None)
+        if delayed_runtime is not None:
+            frontier_kwargs = {}
+            if self.use_async_spec_decode and valid_sampled_token_count_gpu is not None and prev_req_id_to_index:
+                assert self.valid_sampled_token_count_event is not None
+                assert self.valid_sampled_token_count_cpu is not None
+                self.valid_sampled_token_count_event.synchronize()
+                frontier_kwargs = dict(
+                    previous_positions=self.prev_positions.np[:num_reqs],
+                    previous_drafts=self.prev_num_draft_tokens.np,
+                    valid_sampled_counts=self.valid_sampled_token_count_cpu.numpy(),
+                )
+            delayed_runtime.prepare_frontier(self.input_batch.num_computed_tokens_cpu[:num_reqs], **frontier_kwargs)
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -1875,6 +1894,10 @@ class NPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
+            delayed_runtime = getattr(self, "_delayed_d2h_runtime", None)
+            if delayed_runtime is not None:
+                decode_state = get_kv_transfer_group().prepare_delayed_decode_step(kv_connector_metadata)
+                delayed_runtime.begin_step(decode_state)
             # Preemption stores must run before _update_states() zeroes newly
             # allocated blocks that may reuse the same physical KV cache IDs.
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
@@ -2462,6 +2485,10 @@ class NPUModelRunner(GPUModelRunner):
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
+
+            delayed_runtime = getattr(self, "_delayed_d2h_runtime", None)
+            if delayed_runtime is not None:
+                delayed_runtime.finish_forward()
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
@@ -3052,7 +3079,29 @@ class NPUModelRunner(GPUModelRunner):
                 self._offload_req_ids_tensor,
                 self._offload_token_to_req,
             )
-        if self.sparse_kv_offload_config.use_fused_copy_sfa and self.sparse_kv_offload_enabled:
+        delayed_runtime = getattr(self, "_delayed_d2h_runtime", None)
+        if delayed_runtime is not None and not offload_dummy:
+            assert self._offload_stable_prefixes is not None
+            assert self._offload_pool_slots is not None
+            assert self._offload_pool_generations is not None
+            assert num_scheduled_tokens_np is not None
+            delayed_runtime.prepare_batch(
+                self.input_batch.req_ids[:num_reqs],
+                block_table=self.input_batch.block_table[
+                    self.sparse_kv_offload_manager.d2h_host_group_id
+                ].get_numpy_array(),
+                max_write_tokens=num_scheduled_tokens_np[:num_reqs] + self.num_spec_tokens,
+                slots=self._offload_pool_slots.np,
+                generations=self._offload_pool_generations.np,
+                stable_prefixes=self._offload_stable_prefixes.np,
+                padded_requests=num_reqs_padded,
+            )
+            self._copy_sfa_need_eager_tail_restore = False
+        if (
+            self.sparse_kv_offload_config.use_fused_copy_sfa
+            and self.sparse_kv_offload_enabled
+            and (delayed_runtime is None or offload_dummy)
+        ):
             assert self._offload_pool_slots is not None
             assert self._offload_pool_generations is not None
             (
@@ -3210,6 +3259,10 @@ class NPUModelRunner(GPUModelRunner):
                                    if self._offload_pool_slots is not None else None),
             req_topk_buffer_generations=(self._offload_pool_generations.cpu[:num_reqs_padded]
                                          if self._offload_pool_generations is not None else None),
+            req_topk_buffer_stable_prefixes=(
+                self._offload_stable_prefixes.cpu[:num_reqs_padded]
+                if getattr(self, "_offload_stable_prefixes", None) is not None else None
+            ),
             offload_dummy=offload_dummy,
             copy_sfa_restore_tails=self._copy_sfa_need_eager_tail_restore,
             req_ids_tensor=(
@@ -4056,6 +4109,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.sparse_kv_offload_enabled:
             assert self.sparse_kv_offload_manager is not None
             self.sparse_kv_offload_manager.register_kv_caches(kv_caches)
+            self._delayed_d2h_runtime = self.sparse_kv_offload_manager.delayed_d2h_runtime
             if self.sparse_kv_offload_config.use_fused_copy_sfa:
                 for layer_name in self.sparse_kv_offload_manager.offload_layer_names:
                     layer = self.compilation_config.static_forward_context[layer_name]

@@ -1053,6 +1053,7 @@ class SparseKVOffloadConfig:
         "fused_op_type",
         "host_backend",
         "lru_max_threads",
+        "delayed_d2h",
     }
 
     @staticmethod
@@ -1097,11 +1098,21 @@ class SparseKVOffloadConfig:
             user_config.get("use_fused_overlap", False),
             "use_fused_overlap",
         )
+        # Batch full-block writes across decode iterations. Completion, rather
+        # than the computed-token count alone, publishes the Host KV frontier.
+        self.delayed_d2h = self._parse_bool(user_config.get("delayed_d2h", False), "delayed_d2h")
         self.fused_op_type = user_config.get("fused_op_type", "none")
         if self.fused_op_type not in ("none", "fused_copy_sfa"):
             raise ValueError("sparse_kv_offload_config.fused_op_type must be none or fused_copy_sfa")
         if self.use_fused_copy_sfa and self.use_fused_overlap:
             raise ValueError("fused_copy_sfa and use_fused_overlap are mutually exclusive")
+        if self.delayed_d2h:
+            if not self.enabled or not self.use_fused_copy_sfa:
+                raise ValueError(
+                    "delayed D2H modes require sparse KV offload enabled=true and fused_op_type='fused_copy_sfa'"
+                )
+            if self.keep_device_kv_cache:
+                raise ValueError("delayed D2H modes require PD-disaggregated decode with keep_device_kv_cache=false")
         self.lru_max_threads = user_config.get("lru_max_threads", 8)
         if type(self.lru_max_threads) is not int or self.lru_max_threads <= 0:
             raise ValueError("sparse_kv_offload_config.lru_max_threads must be a positive integer")
@@ -1153,6 +1164,18 @@ class SparseKVOffloadConfig:
                 )
         if vllm_config.use_v2_model_runner:
             raise ValueError("Sparse KV offload doesn't support model_runner_v2 now.")
+
+        if self.delayed_d2h:
+            transfer = vllm_config.kv_transfer_config
+            extra = getattr(transfer, "kv_connector_extra_config", {})
+            if (
+                self.host_backend != "mooncake"
+                or getattr(transfer, "kv_connector", None) != "MooncakeConnectorV1"
+                or extra.get("dsa_pd_offload") is not True
+            ):
+                raise ValueError(
+                    "delayed D2H modes require host_backend='mooncake' and MooncakeConnectorV1 with dsa_pd_offload=true"
+                )
 
         self.topk = vllm_config.model_config.hf_text_config.index_topk
         if self.use_fused_copy_sfa:

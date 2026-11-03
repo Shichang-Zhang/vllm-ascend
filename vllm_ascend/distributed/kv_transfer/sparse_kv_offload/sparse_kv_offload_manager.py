@@ -32,6 +32,12 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.delayed_d2h import DelayedD2HPlanner
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.delayed_d2h_executor import (
+    D2HCopyComponent,
+    MooncakeDelayedD2HExecutor,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.delayed_d2h_runtime import DelayedD2HRuntime
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_host_pool import (
     HostPoolTopology,
     MooncakeHostPool,
@@ -538,6 +544,7 @@ class SparseKVOffloadManager:
     """
 
     use_fused_copy_sfa: bool = False
+    delayed_d2h: bool = False
 
     def __init__(
         self,
@@ -561,6 +568,9 @@ class SparseKVOffloadManager:
         self.topk = sparse_kv_offload_config.topk
         self.use_fused_overlap = sparse_kv_offload_config.use_fused_overlap
         self.use_fused_copy_sfa = getattr(sparse_kv_offload_config, "use_fused_copy_sfa", False) is True
+        self.delayed_d2h = getattr(sparse_kv_offload_config, "delayed_d2h", False) is True
+        self.delayed_d2h_executor: MooncakeDelayedD2HExecutor | None = None
+        self.delayed_d2h_runtime: DelayedD2HRuntime | None = None
         self.host_backend = sparse_kv_offload_config.host_backend
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -774,6 +784,12 @@ class SparseKVOffloadManager:
 
     def close(self) -> None:
         """Release backend-owned Host KV resources."""
+        runtime = getattr(self, "delayed_d2h_runtime", None)
+        if runtime is not None:
+            runtime.close()
+        executor = getattr(self, "delayed_d2h_executor", None)
+        if executor is not None:
+            executor.close()
         self.fused_overlap_membership_map = None
         self.fused_overlap_planner_membership_map = None
         self.fused_overlap_membership_plan_device_staging = None
@@ -1296,6 +1312,8 @@ class SparseKVOffloadManager:
                     torch.zeros(1, dtype=torch.int64, device=device),
                     BLOCK_SIZE=COPY_SFA_MEMCPY_BLOCK_BYTES,
                 )
+            if self.delayed_d2h:
+                self._initialize_delayed_d2h()
             if not self.sparse_kv_offload_config.keep_device_kv_cache:
                 # LIM owns residency on NPU; no CPU LRU planner or workspace is used.
                 return
@@ -1525,6 +1543,93 @@ class SparseKVOffloadManager:
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
         self.lru_physical_row_workspace_ptr = self.lru_physical_row_workspace.data_ptr()
+
+    def _initialize_delayed_d2h(self) -> None:
+        """Bind one Host group and the actual offloaded layer views."""
+        if not self._uses_mooncake_host_pool() or not self.use_fused_copy_sfa:
+            raise ValueError("delayed D2H requires Mooncake Host memory and fused Copy-SFA")
+        if self.sparse_kv_offload_config.keep_device_kv_cache:
+            raise ValueError("delayed D2H requires keep_device_kv_cache=false")
+        host_groups: dict[int, set[str]] = {}
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            specs = (
+                spec.kv_cache_specs
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else dict.fromkeys(group.layer_names, spec)
+            )
+            host_layers = {name for name in group.layer_names if getattr(specs[name], "store_on_host", False)}
+            if host_layers:
+                host_groups[group_id] = host_layers
+        if len(host_groups) != 1:
+            raise ValueError(f"delayed D2H requires exactly one Host KV group, got {list(host_groups)}")
+        self.d2h_host_group_id = next(iter(host_groups))
+        if host_groups[self.d2h_host_group_id] != set(self.offload_layer_names):
+            raise ValueError("delayed D2H Host specs must match the registered offloaded layers")
+        planner = DelayedD2HPlanner(
+            capacity=copy_sfa_pool_capacity(self.max_num_reqs),
+            block_size=self.block_size,
+            hot_tokens=self.topk_buffer_size,
+            host_num_blocks=self.kv_cache_config.num_blocks,
+        )
+        components = []
+        for name, resident_k, resident_v, host_k, host_v in zip(
+            self.offload_layer_names,
+            self.topk_buffers_k,
+            self.topk_buffers_v,
+            self.k_caches_cpu,
+            self.v_caches_cpu,
+            strict=True,
+        ):
+            components.extend(
+                (D2HCopyComponent(f"{name}.k", resident_k, host_k), D2HCopyComponent(f"{name}.v", resident_v, host_v))
+            )
+        self.delayed_d2h_executor = MooncakeDelayedD2HExecutor(
+            planner,
+            components,
+            runtime=self._npu_runtime,
+            tp_group=self.tp_group,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            copy_blocks=self._copy_delayed_mooncake_blocks,
+        )
+        self.delayed_d2h_runtime = DelayedD2HRuntime(
+            self.delayed_d2h_executor,
+            restore_rows=self.restore_delayed_d2h_rows,
+            synchronize_compute=lambda: self._npu_runtime.current_stream().synchronize(),
+        )
+
+    def restore_delayed_d2h_rows(self, rows: dict[int, tuple[int, int]], block_table: np.ndarray) -> None:
+        """Restore dense prompts or only the uncompleted circular tail.
+
+        Called once per new owner, outside graph capture. The CPU table is
+        specifically the offloaded Host group, never an implicit group zero.
+        """
+        sources, destinations, lengths = [], [], []
+        row_tokens = self.topk_buffer_size + 2 * self.block_size
+        for slot, (row, computed) in rows.items():
+            start = 0 if computed <= self.topk_buffer_size else computed // self.block_size * self.block_size
+            for token in range(start, computed, self.block_size):
+                block = int(block_table[row, token // self.block_size])
+                if not 0 <= block < self.kv_cache_config.num_blocks:
+                    raise ValueError("resident restore references a block outside the Host pool")
+                offset = (
+                    token
+                    if computed <= self.topk_buffer_size
+                    else self.topk_buffer_size + token % (2 * self.block_size)
+                )
+                sources.append(block * self.block_size)
+                destinations.append(slot * row_tokens + offset)
+                lengths.append(min(self.block_size, computed - token))
+        if sources:
+            descriptors = torch.tensor(
+                [sources, destinations, lengths], dtype=torch.int64, device=self.topk_buffers_k[0].device
+            )
+            self._copy_sfa_local_ranges(*descriptors.unbind(0))
+
+    @staticmethod
+    def _copy_delayed_mooncake_blocks(sources: torch.Tensor, destinations: torch.Tensor, lengths: torch.Tensor) -> None:
+        batch_memcpy_kernel[(sources.numel(),)](sources, destinations, lengths, BLOCK_SIZE=COPY_SFA_MEMCPY_BLOCK_BYTES)
 
     def _bind_resident_fallback_buffers(self) -> None:
         """Give the CPU planner packed rows separate from Copy-SFA residency."""
