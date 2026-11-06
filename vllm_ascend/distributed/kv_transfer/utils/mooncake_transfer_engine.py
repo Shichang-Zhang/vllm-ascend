@@ -107,16 +107,47 @@ class GlobalTE:
     def unregister_buffer(self) -> None:
         """Unregister all buffers owned by this wrapper, if any."""
         with self.register_buffer_lock:
-            if not self._registered_regions:
-                self.is_register_buffer = False
+            if not self.is_register_buffer or not self._registered_regions:
                 return
             assert self.transfer_engine is not None, "Transfer engine must be initialized"
 
             failed_regions, failure_messages = self._unregister_regions(self._registered_regions)
-            self._registered_regions = failed_regions
-            self.is_register_buffer = bool(failed_regions)
             if failure_messages:
+                self._registered_regions = failed_regions
+                self.is_register_buffer = bool(failed_regions)
                 raise RuntimeError("Mooncake memory unregistration failed for regions: " + "; ".join(failure_messages))
+            # Regions stay recorded so `reregister_buffer` can restore the
+            # registration after wake-up; `is_register_buffer` gates retries.
+            self.is_register_buffer = False
+
+    def reregister_buffer(self) -> None:
+        """Re-register all previously registered regions, e.g. after wake-up."""
+        with self.register_buffer_lock:
+            if self.is_register_buffer or not self._registered_regions:
+                return
+            assert self.transfer_engine is not None, "Transfer engine must be initialized"
+
+            registered_regions: list[tuple[int, int, str]] = []
+            try:
+                for ptr, size, location in self._registered_regions:
+                    ret_value = self.transfer_engine.register_memory(ptr, size, location)
+                    if ret_value != 0:
+                        raise RuntimeError(
+                            f"Mooncake memory re-registration failed for ptr={ptr:#x}, ret_value={ret_value}"
+                        )
+                    registered_regions.append((ptr, size, location))
+            except Exception as exc:
+                failed_regions, failure_messages = self._unregister_regions(registered_regions)
+                self._registered_regions = failed_regions
+                self.is_register_buffer = bool(failed_regions)
+                if failure_messages:
+                    raise RuntimeError(
+                        "Mooncake memory re-registration failed and rollback failed "
+                        "for regions: " + "; ".join(failure_messages)
+                    ) from exc
+                raise
+            self._registered_regions = registered_regions
+            self.is_register_buffer = True
 
 
 global_te = GlobalTE()

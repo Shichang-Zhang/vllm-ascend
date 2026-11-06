@@ -296,11 +296,30 @@ def test_unregister_buffer_reverses_registration_and_allows_reregistration():
     manager.unregister_buffer()
 
     assert engine.unregister_memory.call_args_list == [call(200), call(100)]
-    assert manager._registered_regions == []
+    assert manager._registered_regions == [(100, 10, "*"), (200, 20, "*")]
     assert not manager.is_register_buffer
 
     manager.register_buffer([300], [30])
     assert engine.register_memory.call_args_list[-1] == call(300, 30, "*")
+
+
+def test_reregister_buffer_restores_regions_after_wake_up():
+    engine = MagicMock()
+    engine.register_memory.return_value = 0
+    engine.unregister_memory.return_value = 0
+    manager = _manager_with_engine(engine)
+
+    manager.register_buffer([100, 200], [10, 20], ["npu:0", "npu:1"])
+    manager.unregister_buffer()
+
+    engine.register_memory.reset_mock()
+    manager.reregister_buffer()
+
+    assert engine.register_memory.call_args_list == [call(100, 10, "npu:0"), call(200, 20, "npu:1")]
+    assert manager.is_register_buffer
+
+    manager.reregister_buffer()
+    assert engine.register_memory.call_args_list == [call(100, 10, "npu:0"), call(200, 20, "npu:1")]
 
 
 def test_unregister_buffer_retains_failed_regions_for_retry():
