@@ -311,3 +311,20 @@ def test_dsa_scheduler_keeps_endpoint_coverage_check_for_configured_pp():
     }
     with pytest.raises(ValueError, match="remote endpoint mapping must cover Prefill TP ranks"):
         scheduler.get_num_new_matched_tokens(request, 0)
+
+
+def test_on_new_request_is_a_noop_hook():
+    """D-side requests must not be touched before they are scheduled.
+
+    vLLM calls ``on_new_request`` on the connector for every new request, so
+    the DSA decode scheduler has to expose it; the P-side prompt truncation it
+    enables elsewhere does not apply here.
+    """
+    scheduler = _scheduler()
+    request = _request()
+    params_before = dict(request.kv_transfer_params)
+
+    scheduler.on_new_request(request)
+
+    assert scheduler._dsa_requests == {}
+    assert request.kv_transfer_params == params_before
