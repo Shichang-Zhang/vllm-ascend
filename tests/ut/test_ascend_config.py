@@ -2372,3 +2372,43 @@ class TestEngramSharedMemoryDefaults(TestBase):
         config.engram_config = None
         AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()).derive_and_validate(config)
         self.assertIsNone(config.engram_config)
+
+
+class TestFusedMc2WithContextParallel(TestBase):
+    """enable_fused_mc2 assumes the query sequence is replicated across TP ranks.
+
+    Prefill context parallelism shards that sequence along a separate axis and the
+    MC2 dispatch/combine kernel then faults with an aicore exception, so the flag has
+    to be downgraded. Decode context parallelism only shards the decode KV cache and
+    stays compatible, so it must not trigger the downgrade.
+    """
+
+    def _init_with_cp(self, pcp: int, dcp: int) -> AscendConfig:
+        clear_ascend_config()
+        clear_enable_sp()
+        config = VllmConfig()
+        config.additional_config = {"enable_fused_mc2": 1}
+        config.parallel_config.prefill_context_parallel_size = pcp
+        config.parallel_config.decode_context_parallel_size = dcp
+        try:
+            with (
+                patch("vllm_ascend.ascend_config.is_mega_moe_supported", return_value=False),
+                patch("vllm_ascend.platform.NPUPlatform.check_and_update_config"),
+            ):
+                return init_ascend_config(config)
+        finally:
+            clear_ascend_config()
+            clear_enable_sp()
+
+    def test_prefill_context_parallel_downgrades_fused_mc2(self):
+        for pcp in (2, 4, 8):
+            with self.subTest(pcp=pcp):
+                self.assertEqual(self._init_with_cp(pcp, 1).enable_fused_mc2, 0)
+
+    def test_decode_context_parallel_keeps_fused_mc2(self):
+        for dcp in (2, 4, 8):
+            with self.subTest(dcp=dcp):
+                self.assertEqual(self._init_with_cp(1, dcp).enable_fused_mc2, 1)
+
+    def test_no_context_parallel_keeps_fused_mc2(self):
+        self.assertEqual(self._init_with_cp(1, 1).enable_fused_mc2, 1)

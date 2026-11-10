@@ -813,6 +813,22 @@ class AscendConfig:
                 "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
             )
 
+        # dispatch_ffn_combine (enable_fused_mc2=1) issues an MC2 dispatch/combine
+        # pair whose token layout assumes the query sequence is replicated across
+        # every TP rank. Prefill context parallelism shards that sequence along a
+        # separate axis, and the MC2 kernel then faults with an aicore exception
+        # (retCode=0x26) during the profile run on A3. Decode context parallelism
+        # only shards the decode KV cache and is compatible with MC2, so it is
+        # deliberately not part of this check.
+        _pc = vc.parallel_config
+        if self.enable_fused_mc2 == 1 and _pc.prefill_context_parallel_size > 1:
+            self.enable_fused_mc2 = 0
+            logger.warning_once(
+                "enable_fused_mc2 is not supported when prefill_context_parallel_size > 1; "
+                "additional_config.enable_fused_mc2 will be set to 0. Set "
+                "prefill_context_parallel_size to 1 to use the fused MC2 dispatch/combine path."
+            )
+
         # mlapo_keep_prefill_weights preconditions: the prefill weights are only
         # freed by MLAPO in the MLA attention path, so the keep switch is only
         # meaningful under those same conditions. Fail fast on a no-op / mistaken
