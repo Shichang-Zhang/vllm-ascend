@@ -901,10 +901,11 @@ class AscendConfig:
         if self.enable_sparse_li_c8 and self.enable_sparse_li_c4:
             raise ValueError("enable_sparse_li_c8 and enable_sparse_li_c4 are mutually exclusive.")
         quant_config = getattr(vc, "quant_config", None)
+        # W8A8_DYNAMIC: msmodelslim tag of the DSA indexer wq_b projection; omitting it empties the whitelist.
         (
             self._sparse_li_c8_layer_ids,
             self._sparse_li_c8_layer_names,
-        ) = self._parse_sparse_li_layers_from_quant_config(quant_config, ("INT8_DYNAMIC", "W8A8_MXFP8"))
+        ) = self._parse_sparse_li_layers_from_quant_config(quant_config, ("INT8_DYNAMIC", "W8A8_MXFP8", "W8A8_DYNAMIC"))
         (
             self._sparse_li_c4_layer_ids,
             self._sparse_li_c4_layer_names,
