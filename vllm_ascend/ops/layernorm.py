@@ -18,6 +18,7 @@
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
 
 from vllm_ascend.device.device_op import DeviceOperator
@@ -30,6 +31,27 @@ from vllm_ascend.utils import enable_custom_op
 # id cannot be recycled by a later allocation, and the identity check makes a
 # stale entry harmless either way.
 _NORM_BIAS_IN_QUANT_DESCRIPTION: dict[int, tuple[dict, bool]] = {}
+
+logger = init_logger(__name__)
+
+# The compiled extension registers npu_add_rms_norm_bias unconditionally, but
+# a libopapi.so from an older CANN release has no aclnnAddRmsNormBias to
+# dispatch to. Detect that on the first failing call instead of aborting the
+# engine, and degrade to torch_npu's fused add + rms_norm with an explicit
+# bias add.
+_ADD_RMS_NORM_BIAS_AVAILABLE = True
+
+
+def _disable_add_rms_norm_bias(reason: str) -> None:
+    global _ADD_RMS_NORM_BIAS_AVAILABLE
+
+    if _ADD_RMS_NORM_BIAS_AVAILABLE:
+        _ADD_RMS_NORM_BIAS_AVAILABLE = False
+        logger.warning(
+            "npu_add_rms_norm_bias is unavailable in this CANN install (%s); "
+            "falling back to torch_npu.npu_add_rms_norm.",
+            reason.splitlines()[0] if reason else "unknown reason",
+        )
 
 
 def _quant_description_has_norm_bias(quant_description: dict) -> bool:
@@ -89,9 +111,21 @@ class AscendRMSNorm(RMSNorm):
             import vllm_ascend.vllm_ascend_C  # type: ignore[import-untyped]  # noqa: F401, PLC0415
 
             enable_custom_op()
-            x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                x, residual, self.weight, self.bias, self.variance_epsilon
+            if _ADD_RMS_NORM_BIAS_AVAILABLE:
+                try:
+                    x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
+                        x, residual, self.weight, self.bias, self.variance_epsilon
+                    )
+                    return x, residual
+                except RuntimeError as exc:
+                    if "AddRmsNormBias" not in str(exc):
+                        raise
+                    _disable_add_rms_norm_bias(str(exc))
+            x, _, residual = torch_npu.npu_add_rms_norm(
+                x, residual, self.weight, self.variance_epsilon
             )
+            if self.bias is not None:
+                x = x + self.bias
             return x, residual
 
         x, residual = torch_npu.npu_rms_norm(x, self.weight, self.variance_epsilon)
