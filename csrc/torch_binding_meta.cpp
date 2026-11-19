@@ -1747,30 +1747,6 @@ std::tuple<at::Tensor, at::Tensor> grouped_matmul_situ_quant_list_meta(
     return make_grouped_matmul_situ_quant_meta_output(x, n);
 }
 
-void npu_fused_quant_lightning_indexer_manage_meta(
-    const at::Tensor &index_weights,
-    const at::Tensor &query_dequant_scale,
-    const at::Tensor &query,
-    const at::Tensor &index_key_dequant_scale,
-    const at::Tensor &index_key_cache,
-    const at::Tensor &index_block_table,
-    const at::Tensor &actual_seq_lengths_query,
-    const at::Tensor &actual_seq_lengths_key,
-    const at::Tensor &offload_seq_lengths_key,
-    const at::Tensor &num_cache_tokens,
-    const at::Tensor &request_state,
-    const at::Tensor &req_pool_entries,
-    at::Tensor cache_slots_pool,
-    at::Tensor topk_src_ids,
-    at::Tensor topk_dst_slots,
-    at::Tensor topk_miss_counts,
-    at::Tensor miss_src_ids,
-    at::Tensor miss_dst_slots,
-    at::Tensor miss_counts)
-{
-    return;
-}
-
 // hisparse_resolve_residency: fully in-place (all outputs are caller-owned
 // buffers annotated (a!) in the schema and the op returns nothing), so there
 // are no shapes or dtypes to infer and the meta kernel is a no-op.
@@ -1889,8 +1865,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // Fused lightning indexer manage
     ops.impl("npu_fused_lightning_indexer_manage",
              &vllm_ascend::meta::npu_fused_lightning_indexer_manage_meta);
-    ops.impl("npu_fused_quant_lightning_indexer_manage",
-             &vllm_ascend::meta::npu_fused_quant_lightning_indexer_manage_meta);
     // Fused copy and sparse flash attention for MTP
     ops.impl("npu_fused_scatter_copy_sparse_flash_attention",
              &vllm_ascend::meta::npu_fused_scatter_copy_sparse_flash_attention_meta);
