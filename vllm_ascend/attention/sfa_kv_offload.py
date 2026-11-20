@@ -249,7 +249,6 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             "pool_indices": (requests, torch.int64),
             "block_bases": (requests, torch.int32),
             "active": (requests, torch.bool),
-            "generation_match": (requests, torch.bool),
             "token_rows": (tokens, torch.int64),
             "token_offsets": (tokens, torch.int64),
             "token_active": (tokens, torch.bool),
@@ -276,10 +275,10 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 "request_state",
             )
         }
-        # Target and physical MTP-layer histories are independent. Request
-        # generations are host-owned; prefix/cache history follows device S.
+        # Target and physical MTP-layer histories are independent. New bindings
+        # invalidate LIM history at bind time (CopySfaRequestStates); prefix and
+        # cache history follow device S.
         banks = 1 + self.lim_mtp_layers
-        self.lim_last_generation = np.full((banks, 2 * requests), -1, dtype=np.int64)
         self.lim_last_prefix = torch.zeros((banks, 2 * requests), dtype=torch.int32, device=device)
         self.lim_last_cache = torch.zeros_like(self.lim_last_prefix)
         self.copy_sfa_hbm_block_table = torch.empty(
@@ -328,14 +327,14 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         bank = 0 if draft_index is None else 1 + draft_index % self.lim_mtp_layers
         count = common_attn_metadata.num_reqs
         pools_cpu = common_attn_metadata.req_topk_buffer_slots
-        generations_cpu = common_attn_metadata.req_topk_buffer_generations
-        if pools_cpu is None or generations_cpu is None:
-            raise RuntimeError("fused_copy_sfa offload requires host request slots and generations")
+        active_cpu = common_attn_metadata.req_topk_buffer_active
+        if pools_cpu is None or active_cpu is None:
+            raise RuntimeError("fused_copy_sfa offload requires host request slots and active masks")
         # Reject missing host mirrors rather than introducing a hidden D2H.
-        if pools_cpu.device.type != "cpu" or generations_cpu.device.type != "cpu":
-            raise RuntimeError("fused_copy_sfa request slots and generations must be CPU tensors")
+        if pools_cpu.device.type != "cpu" or active_cpu.device.type != "cpu":
+            raise RuntimeError("fused_copy_sfa request slots and active masks must be CPU tensors")
         pools_np = pools_cpu[:count].numpy()
-        generations_np = generations_cpu[:count].numpy()
+        active_flag_np = active_cpu[:count].numpy()
 
         def upload(name, values):
             buffer = self.copy_sfa_host[name][step]
@@ -345,12 +344,11 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
 
         if not metadata.fused_copy_sfa_enabled:
             metadata.copy_sfa_prefill_pool_slots = upload("pool_entries", pools_np)
-            self.lim_last_generation[bank].fill(-1)
             return metadata
         query_loc = common_attn_metadata.query_start_loc_cpu[: count + 1].numpy()
         ends_np, starts_np = query_loc[1:], query_loc[:-1]
         widths_np = ends_np - starts_np
-        active_np = (generations_np >= 0) & (widths_np > 0)
+        active_np = active_flag_np & (widths_np > 0)
         pools_np = np.where(active_np, pools_np, np.arange(count) + self.copy_sfa_pool_capacity)
         ends = upload("query_ends", ends_np)
         widths = upload("widths", widths_np)
@@ -380,15 +378,14 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             # Reusing draft steps never run LIM or advance its history.
             state.fill_(-3)
         else:
-            same_generation = upload("generation_match", self.lim_last_generation[bank, pools_np] == generations_np)
+            # Rebinds already reset lim_last_cache at bind time
+            # (CopySfaRequestStates.prepare), so history is stale only on
+            # prefix rollback, which the prefix check below catches.
             pool_indices = upload("pool_indices", pools_np)
-            ready = (
-                same_generation
-                & (self.lim_last_cache[bank, pool_indices] == cache)
-                & (self.lim_last_prefix[bank, pool_indices] <= prefix)
+            ready = (self.lim_last_cache[bank, pool_indices] == cache) & (
+                self.lim_last_prefix[bank, pool_indices] <= prefix
             )
             state.copy_(torch.where(active, torch.where(is_short, -3, torch.where(ready, -1, -2)), -3))
-            self.lim_last_generation[bank, pools_np] = generations_np
             self.lim_last_prefix[bank].scatter_(0, pool_indices, prefix)
             self.lim_last_cache[bank].scatter_(0, pool_indices, cache)
         metadata.lim_request_state = state
@@ -664,7 +661,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: AscendSFAMetadata,
-        need_gather_q_kv: bool = False,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_metadata = cast(AscendSFAOffloadMetadata, attn_metadata)
@@ -679,6 +675,24 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         finally:
             self._current_layer_name = None
             self._copy_sfa_metadata = None
+
+    def _prepare_indexer_metadata(self, indexer_metadata, attn_metadata) -> None:
+        indexer_metadata.topk_selector = (
+            self._lim_select_from_indexer if attn_metadata.fused_copy_sfa_enabled and not self.skip_topk else None
+        )
+
+    def _lim_select_from_indexer(self, query, weights, indexer, indexer_metadata, query_scale=None):
+        key_scale = (
+            indexer.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT] if self.enable_sparse_li_c8 else None
+        )
+        return self._lim_select(
+            query,
+            weights,
+            indexer.k_cache.kv_cache[INDEXER_K_CACHE_SLOT],
+            indexer_metadata.block_table,
+            query_scale=query_scale,
+            key_scale=key_scale,
+        )
 
     def _select_indexer_topk(
         self, q_li, q_li_scale, q_li_shape, weights, kv_cache, attn_metadata, actual_query_lengths, actual_key_lengths

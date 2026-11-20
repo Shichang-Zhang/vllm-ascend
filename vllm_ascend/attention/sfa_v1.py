@@ -50,7 +50,9 @@ from vllm_ascend.attention.utils import (
     uses_pcp_sharded_layout,
     wait_for_kv_layer_from_connector,
 )
+from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     attention_transfer_window,
@@ -910,6 +912,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.kv_cache_dtype = self.vllm_config.cache_config.cache_dtype
         self.enable_sparse_sfa_turboquant = ascend_config.enable_sparse_sfa_turboquant
         self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
+        self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.indexer.k_cache.prefix)
+        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+            if get_ascend_device_type() == AscendDeviceType.A5:
+                self.c8_k_cache_dtype = torch.float8_e4m3fn
+                self.c8_k_scale_cache_dtype = torch.float32
+            else:
+                self.c8_k_cache_dtype = torch.int8
+                self.c8_k_scale_cache_dtype = torch.float16
         if self.enable_sparse_sfa_c8:
             self.c8_cache_dtype = kv_cache_dtype_str_to_dtype(
                 self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
@@ -957,6 +967,27 @@ class AscendSFAImpl(MLAAttentionImpl):
                     exc,
                 )
                 self.enable_pcp_o_proj_weight_sharding = False
+
+    @property
+    def kv_cache_indexer_k_idx(self) -> int:
+        """Index of the indexer key cache in the KV cache tuple.
+
+        When sparse C8 packs the SFA KV cache into a single tensor, the indexer
+        key cache moves from slot 2 to slot 1:
+
+        ================  =========  =========  =============  ==============
+        Layout            kv_cache[0]  kv_cache[1]  kv_cache[2]  kv_cache[3]
+        ================  =========  =========  =============  ==============
+        Default           k_nope     k_pe       indexer_k      indexer_scale
+        Sparse C8         packed_kv  indexer_k  indexer_scale  (unused)
+        ================  =========  =========  =============  ==============
+        """
+        return 1 if self.enable_sparse_sfa_c8 else 2
+
+    @property
+    def kv_cache_indexer_scale_idx(self) -> int:
+        """Index of the indexer scale cache in the KV cache tuple."""
+        return 2 if self.enable_sparse_sfa_c8 else 3
 
     @property
     def uses_packed_sfa_main_cache(self) -> bool:
@@ -1695,6 +1726,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             inner_out=q_c,
         )
         return hidden_states, ql_nope, q_pe, q_c
+
+    def _prepare_indexer_metadata(self, indexer_metadata, attn_metadata) -> None:
+        """Allow an attention backend to supply indexer selection metadata."""
+        return
 
     def _select_indexer_topk(
         self, q_li, q_li_scale, q_li_shape, weights, kv_cache, attn_metadata, actual_query_lengths, actual_key_lengths

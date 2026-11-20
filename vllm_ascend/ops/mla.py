@@ -142,6 +142,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
     @skip_topk.setter
     def skip_topk(self, value: bool) -> None:
         self.__dict__["_skip_topk"] = bool(value)
+        if getattr(self, "mla_attn", None) is not None:
+            self.mla_attn.skip_topk = bool(value)
         impl = getattr(getattr(self, "mla_attn", None), "impl", None)
         if impl is not None and hasattr(impl, "skip_topk"):
             impl.skip_topk = self.__dict__["_skip_topk"]
@@ -158,6 +160,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         impl = getattr(getattr(self, "mla_attn", None), "impl", None)
         if impl is not None and hasattr(impl, "topk_indices_buffer"):
             impl.topk_indices_buffer = value
+        if getattr(self, "mla_attn", None) is not None:
+            self.mla_attn.topk_indices_buffer = value
 
     @property
     def uses_lim_topk_metadata(self) -> bool:
@@ -258,6 +262,11 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             use_mla_rope=mla_modules.rotary_emb is not None,
             layer_name=f"{prefix}.attn",
         )
+        # AscendMLAAttention (upstream MLAAttention subclass) drops skip_topk
+        # via **kwargs in vllm 0.33; forward() reads these from mla_attn to
+        # sync the impl, so they must be seeded here.
+        self.mla_attn.skip_topk = skip_topk
+        self.mla_attn.topk_indices_buffer = getattr(self.mla_attn.impl, "topk_indices_buffer", None)
 
         # Fused preprocess (mlapo/prolog_v3) owns transpose+NZ for these
         # layers, so quant methods must skip their own NZ conversion.
