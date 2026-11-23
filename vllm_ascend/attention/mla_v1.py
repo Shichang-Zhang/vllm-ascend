@@ -192,13 +192,8 @@ class AscendMLAAttention(MLAAttention):
             ),
             cache_sparse_sfa_turboquant=use_sfa_turboquant,
             cache_sparse_sfa_c8=use_sfa_c8,
-            # Draft (MTP) layers stay host-resident too: the offload
-            # manager registers store_on_host specs and MTP decode traffic
-            # offloads draft KV (mtp_layer_id). DSpark resident drafts are
-            # rewritten to store_on_host=False later by
-            # apply_dspark_resident_kv_specs.
             store_on_host=(
-                getattr(self.impl, "store_kv_cache_on_host", False)
+                not (spec.is_draft or self.is_draft_layer) and getattr(self.impl, "store_kv_cache_on_host", False)
             ),
             head_size=head_size,
             dtype=dtype,
