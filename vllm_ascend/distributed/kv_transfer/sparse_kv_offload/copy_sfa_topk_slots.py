@@ -181,12 +181,22 @@ class CopySfaRequestStates:
                 generations[row] = self._slot_generations.get(state.slot, -1)
             if computed_tokens is None:
                 continue
-            prefix = (int(computed_tokens[row]) // block_size) * block_size
+            computed = int(computed_tokens[row])
+            prefix = (computed // block_size) * block_size
             if state.last_prefix is not None and prefix < state.last_prefix:
                 if prebound_slots:
                     restore_tails = True
                 if hot_tokens and state.last_prefix >= hot_tokens > prefix:
-                    dense_fills[state.slot] = (row, int(computed_tokens[row]))
+                    dense_fills[state.slot] = (row, computed)
+            elif state.last_prefix is None and computed > 0:
+                # Colocated prefill populates the row in exec_kv and starts at
+                # computed == 0. PD connectors deliver the full prompt into the
+                # Host pool instead, so Decode needs one eager restore when it
+                # first owns the row (see prepare_copy_sfa_request_slots).
+                if computed <= hot_tokens:
+                    dense_fills[state.slot] = (row, computed)
+                else:
+                    restore_tails = True
             state.last_prefix = prefix
         return restore_tails, dense_fills, invalidated_slots
 
