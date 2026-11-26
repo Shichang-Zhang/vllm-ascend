@@ -670,7 +670,7 @@ class TestAscendConfig(TestBase):
             },
             "multistream_overlap_shared_expert": True,
             "enable_force_eplb": True,
-            "eplb_config": {"num_redundant_experts": 2},
+            "eplb_config": {"load_collection_phase": "decode"},
             "refresh": True,
             "enable_kv_nz": False,
             "xlite_graph_config": {"enabled": False, "full_mode": True},
@@ -678,7 +678,7 @@ class TestAscendConfig(TestBase):
             "mega_moe_max_tokens": 32768,
         }
         ascend_config = init_ascend_config(test_vllm_config)
-        self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
+        self.assertEqual(ascend_config.eplb_config.load_collection_phase, "decode")
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
         self.assertTrue(ascend_config.enable_force_eplb)
         self.assertEqual(ascend_config.mega_moe_max_tokens, 32768)
@@ -1384,6 +1384,25 @@ class TestSparseKVOffloadConfig(TestBase):
                 },
             )
 
+    def test_copy_sfa_rejects_keep_device_kv_cache(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=128)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            kv_transfer_config=None,
+        )
+        with self.assertRaisesRegex(ValueError, "keep_device_kv_cache"):
+            SparseKVOffloadConfig.from_additional_config(
+                vllm_config,
+                {
+                    "enabled": "true",
+                    "keep_device_kv_cache": "true",
+                },
+            )
+
     def test_mooncake_host_backend_valid_config_passes_validation(self):
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=128)),
@@ -1716,10 +1735,6 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         config._validate_preconditions(self._oproj_tp_vllm_config(max_num_seqs=300, num_speculative_tokens=1))
         self.assertEqual(config.oproj_tensor_parallel_size, 1)
         self.assertEqual(config.mlp_tensor_parallel_size, 1)
-
-    def test_eplb_config_int_field_lax(self):
-        cfg = EplbConfig(eplb_policy_type="2")
-        self.assertEqual(cfg.eplb_policy_type, 2)
 
 
 class TestUpstreamConfigCompatibility(TestBase):
@@ -2430,16 +2445,6 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         config = init_ascend_config(vc)
 
         self.assertTrue(config.enable_kv_nz)
-
-    @_clean_up
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_eplb_string_false_survives_factory(self, mock_fix):
-        vc = VllmConfig()
-        vc.additional_config = {"eplb_config": {"dynamic_eplb": "false"}}
-
-        config = init_ascend_config(vc)
-
-        self.assertFalse(config.eplb_config.dynamic_eplb)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
